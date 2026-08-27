@@ -1,0 +1,233 @@
+/*
+   Home.razor scoped styles — Recto vault home surface.
+
+   Sections (IDENTITY & ACCESS / CRYPTO TOKENS) are visually
+   distinct via accent color + a subtle left rule on the header.
+   Card bodies stay neutral so the section accent does the
+   categorical work; per-coin badges paint their own brand color
+   inside the card.
+
+   ::deep is needed for nested elements that come from the parent
+   layout's render tree (Bootstrap card overrides etc.).
+*/
+
+.rec-home {
+    text-align: center;
+    padding: 0.75rem 0 1rem 0;
+}
+
+.rec-tagline {
+    color: var(--rec-text-muted);
+    font-size: 0.95rem;
+    margin: 0 0 1.25rem 0;
+    font-weight: 400;
+}
+
+/* ---- Pending requests block ---- */
+
+.rec-pending {
+    text-align: left;
+}
+
+.rec-pending-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--rec-border);
+}
+
+.rec-pending-title {
+    font-family: var(--rec-font-mono);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--rec-text-muted);
+    font-weight: 600;
+}
+
+.rec-empty {
+    text-align: center;
+    color: var(--rec-text-muted);
+    padding: 1.25rem 0;
+    opacity: 0.85;
+}
+
+.rec-empty-mark {
+    font-size: 1.6rem;
+    line-height: 1;
+    color: var(--rec-success);
+    margin-bottom: 0.4rem;
+}
+
+.rec-empty-line {
+    font-size: 0.9rem;
+    color: var(--rec-text);
+    margin-bottom: 0.15rem;
+}
+
+.rec-empty-sub {
+    font-size: 0.78rem;
+    color: var(--rec-text-dim);
+}
+
+/* ---- Two sections: IDENTITY & ACCESS / CRYPTO TOKENS ---- */
+
+.rec-section {
+    margin-bottom: 1.1rem;
+}
+
+.rec-section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    padding: 0.35rem 0.55rem;
+    border-radius: 0.3rem;
+    border: 1px solid var(--rec-border);
+    background: var(--rec-surface);
+}
+
+.rec-section-identity .rec-section-header {
+    background: var(--rec-cat-identity-bg);
+    border-color: var(--rec-cat-identity);
+}
+
+.rec-section-tokens .rec-section-header {
+    background: var(--rec-cat-tokens-bg);
+    border-color: var(--rec-cat-tokens);
+}
+
+.rec-section-mark {
+    line-height: 1;
+    font-size: 0.85rem;
+}
+
+.rec-section-identity .rec-section-mark { color: var(--rec-cat-identity); }
+.rec-section-tokens .rec-section-mark   { color: var(--rec-cat-tokens); }
+
+.rec-section-title {
+    flex: 1;
+    font-family: var(--rec-font-mono);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-weight: 600;
+    color: var(--rec-text);
+}
+
+.rec-section-count {
+    font-family: var(--rec-font-mono);
+    font-size: 0.75rem;
+    color: var(--rec-text-muted);
+    padding: 0.05rem 0.4rem;
+    background: var(--rec-surface-lo);
+    border-radius: 0.2rem;
+    border: 1px solid var(--rec-border);
+    min-width: 1.5rem;
+    text-align: center;
+}
+
+/* ---- Per-request card ---- */
+
+.rec-pending-card {
+    margin-bottom: 0.5rem;
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.4rem;
+    overflow: hidden;
+}
+
+.rec-section-identity .rec-pending-card {
+    border-left: 3px solid var(--rec-cat-identity);
+}
+
+.rec-section-tokens .rec-pending-card {
+    border-left: 3px solid var(--rec-cat-tokens);
+}
+
+.rec-pending-card-body {
+    padding: 0.7rem 0.8rem;
+}
+
+/* ---- Per-coin badges (live inside .rec-pending-card-body) ---- */
+
+.rec-coin-badge {
+    display: inline-block;
+    font-family: var(--rec-font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    padding: 0.15rem 0.45rem;
+    border-radius: 0.2rem;
+    color: #ffffff;
+    margin-right: 0.35rem;
+    line-height: 1.2;
+    vertical-align: middle;
+}
+
+.rec-coin-badge-btc  { background: var(--rec-coin-btc); color: #ffffff; }
+.rec-coin-badge-eth  { background: var(--rec-coin-eth); color: #ffffff; }
+.rec-coin-badge-ltc  { background: var(--rec-coin-ltc); color: #ffffff; }
+.rec-coin-badge-doge { background: var(--rec-coin-doge); color: #1a1308; }
+.rec-coin-badge-bch  { background: var(--rec-coin-bch); color: #07140e; }
+.rec-coin-badge-sol  { background: var(--rec-coin-sol); color: #ffffff; }
+.rec-coin-badge-xlm  { background: var(--rec-coin-xlm); color: #06222d; }
+.rec-coin-badge-xrp  { background: var(--rec-coin-xrp); color: #ffffff; }
+.rec-coin-badge-tron { background: var(--rec-coin-tron); color: #ffffff; }
+.rec-coin-badge-cap  { background: var(--rec-coin-cap); color: #ffffff; }
+
+/* Phase 5 Wave C part 3: AppContext banner at the top of every
+   approval card. Operator-administered identity of the requesting
+   app -- shows icon + name + description so the operator knows
+   which app is asking before granting capability / signing. */
+.rec-app-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    margin: -0.6rem -0.6rem 0.6rem -0.6rem;
+    background: rgba(40, 70, 120, 0.18);
+    border-bottom: 1px solid rgba(120, 160, 200, 0.25);
+    border-top-left-radius: 0.4rem;
+    border-top-right-radius: 0.4rem;
+}
+.rec-app-banner-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    flex-shrink: 0;
+    object-fit: cover;
+}
+.rec-app-banner-text {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.rec-app-banner-name {
+    font-weight: 600;
+    font-size: 0.95rem;
+    line-height: 1.2;
+}
+.rec-app-banner-desc {
+    font-size: 0.8rem;
+    line-height: 1.25;
+    color: rgba(220, 230, 245, 0.75);
+}
+.rec-app-banner-url {
+    font-size: 0.75rem;
+    color: rgba(180, 200, 230, 0.7);
+}
+.rec-app-banner-version {
+    font-size: 0.75rem;
+    color: rgba(180, 200, 230, 0.7);
+    flex-shrink: 0;
+    align-self: flex-start;
+}
+.rec-app-banner-unknown {
+    background: rgba(180, 90, 50, 0.20);
+    border-bottom-color: rgba(220, 140, 90, 0.4);
+}
+.rec-app-banner-unknown .rec-app-banner-name {
+    color: #f0c89a;
+}

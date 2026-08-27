@@ -1,0 +1,53 @@
+# Cross-platform line-ending normalization. Without this, clones on
+# Windows + macOS + Linux fight over CRLF vs LF and `git status` shows
+# hundreds of tracked files as modified after the first text-file edit
+# on a fresh cross-platform clone. Caught during a multi-machine Recto
+# bring-up: a fresh clone on a Windows host showed ~hundreds of files
+# as ` M` modified due to autocrlf flapping vs the canonical LF state
+# pushed by the original author. Enforcing LF-in-tree resolves it.
+#
+# `text=auto eol=lf` means: detect text files automatically (vs binary),
+# and store text files with LF in the index regardless of the working-
+# tree's local convention. Working-tree files on Windows still appear
+# with CRLF when the user has core.autocrlf=true; the difference is
+# invisible because git no longer sees a delta.
+* text=auto eol=lf
+
+# Files that genuinely need CRLF in the working tree (Windows-specific
+# scripts that must work with the cmd.exe parser).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell scripts: leave at LF default. Both PS5.1 and PS7 handle
+# LF .ps1 files cleanly; we standardize on LF for cross-platform
+# script-authoring (scripts may be written on Linux and run on Windows).
+
+# Binary files — never normalize, never diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.bmp  binary
+*.ico  binary
+*.svg  text
+*.pdf  binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.zip  binary
+*.tar  binary
+*.gz   binary
+*.7z   binary
+*.dll  binary
+*.exe  binary
+*.so   binary
+*.dylib binary
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+*.bundle binary
+*.jks  binary
+*.keystore binary
+*.dpapi binary

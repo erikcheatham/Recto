@@ -1,0 +1,208 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# One-shot push scripts occasionally written at repo root by maintainer
+# tooling. Ignored so a forgotten cleanup cannot land in a commit.
+git_push.ps1
+
+# Operator-side helper scripts. These are authored per-sprint on the
+# maintainer's machine and are not part of the substrate; they stay local.
+*script_*.ps1
+*script.ps1
+# (No exceptions. Helper scripts stay local; nothing in this family is
+#  part of the published substrate.)
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
+
+# Recto runtime
+*.log
+recto-state/
+
+# Maintainer-local notes and tooling state. Never committed.
+# Both paths are ignored so that a tool which auto-creates either one
+# cannot accidentally publish its contents. Maintainer tooling config is
+# excluded per-clone via .git/info/exclude rather than named here.
+.claude/
+private/
+
+# Stray scratch files
+CLAUDE.md.tmp
+*.tmp
+pytest-cache-files-*
+
+# Operator-local bootloader launcher scratch copies (with hardcoded
+# agent tokens / pubkeys / state-dir overrides). The shipped reference
+# is at examples/run_bootloader_example.py — env-var-only, never holds
+# a secret. Operators commonly cp that to the repo root and edit in
+# real values for fast iteration; gitignore guards against accidental
+# commit of the operator-local copy.
+/run_bootloader.py
+/run_bootloader_*.py
+
+# v0.4 phone app (MAUI Blazor) — source tracked under /phone/, build
+# artifacts (bin/, obj/, .vs/, NuGet packages, Android APK staging,
+# iOS DerivedData) are not. The /phone/ folder itself stays in the
+# repo so contributors can build the app; only its compile outputs
+# are ignored.
+/phone/**/bin/
+/phone/**/obj/
+/phone/**/.vs/
+/phone/**/packages/
+/phone/**/Properties/launchSettings.json
+/phone/**/AppPackages/
+/phone/**/Resources/Raw/.gitkeep
+/phone/**/*.user
+/phone/**/*.suo
+
+# Phone-app credential ceremony artifacts. Each operator deploying
+# Recto runs their own Apple Developer Program + Firebase Console
+# ceremony per dev-tools/README.md; the resulting credential files are
+# operator-specific and never get checked in. Forkers regenerate them
+# for their own bundle ID + Firebase project. Public Recto repo carries
+# only the wire-up that READS these files; the values stay on the
+# operator's machine.
+/phone/**/dev-tools/.fcm-service-account.json
+/phone/**/dev-tools/.apns-auth-key.p8
+/phone/**/dev-tools/.credentials.md
+/phone/**/google-services.json
+# Catch-alls so future credential files of these shapes are protected
+# even if the directory layout changes:
+/phone/**/*-firebase-adminsdk-*.json
+/phone/**/*.p8
+/phone/**/AuthKey_*.p8
+/phone/**/GoogleService-Info.plist
+
+# Operator-specific launchers. Kept as a PATTERN with the shipped examples
+# allowlisted back in, rather than one line per private launcher: an ignore
+# rule naming a file that is not in the tree publishes that file's name, and
+# the name is the whole disclosure. Same shape as the docs/_config.yml
+# allowlist -- fail-closed by default, and adding a private launcher needs no
+# edit here at all.
+examples/run_bootloader_*.py
+!examples/run_bootloader_consumer.py
+!examples/run_bootloader_example.py
+
+# Code-signing artifacts (operator-local, never commit)
+*.certSigningRequest
+*.cer
+*.mobileprovision
+
+# Android signing artifacts (banked 2026-05-21 alongside the Android
+# signing PropertyGroup in Recto.csproj). The upload keystore is
+# operator-local at ~/keystores/recto-upload.keystore on MAC and
+# MUST NEVER enter any repo. AABs are build artifacts (the signed
+# upload artifact for Play Console); they're large + per-build and
+# don't belong in the tree either. PKCS12 .p12 files are the canonical
+# Android keystore extension on modern toolchains; legacy .jks (Java
+# KeyStore) likewise. Defense-in-depth: catch any of these shapes
+# anywhere in the tree, not just the keystore directory.
+*.keystore
+*.jks
+*.p12
+**/keystores/**
+*.aab
+
+# Signed binaries: 218 MB across 5 AAB/APK. Too large for git, and recoverable
+# (Play retains uploaded bundles; they rebuild from source). NEEDS AN OFF-MACHINE
+# BACKUP, not a commit.
+/build-outputs
+
+# MUST NEVER BE PUBLISHED. These were tracked for 26 minutes on 2026-08-17
+# (cabbdf8) and the commit was scrubbed from history the same day. Operator
+# ruling: store art does not ship in a public tree.
+#
+#   - It hands a cloner PIXEL-PERFECT COUNTERFEIT MATERIAL -- icon, feature
+#     graphic, and real UI shots -- which is precisely how a fake listing is
+#     made convincing.
+#   - It publishes a DEVELOPMENT TIMELINE the stores never show: V2 -> V3,
+#     Android and iPhone, dated by commit. A trail of crumbs.
+#   - Git serves ORIGINALS, in bulk, by API, forever. A store listing serves
+#     resized images behind a UI. Those are not the same exposure.
+#
+# THE ARGUMENT THAT WAS WRONG, kept because it is subtle: "already public on
+# the store listings, so tracking them discloses nothing." A listing serves ONE
+# Store-submission images and icons are maintainer artifacts, not source.
+# They are backed up outside this repository; a public tree is a
+# publication channel, not a backup.
+/app-store-screenshots
+/icons
+
+# Operator-config + runtime state that must NEVER land in the public tree.
+# Consumer-identifying values live operator-side only; this tree must read
+# like a generic project a stranger could fork and run.
+# agents.json / devices-pair-consumers.json are per-deployment registries
+# (canonical copies live in the operator's installed-state dir, not the
+# repo clone); events/ is the folder-drop event-bus output. Repo-root
+# copies exist on some hosts as legacy bind-mount sources — gitignored
+# so they are structurally uncommittable.
+# GLOB, not exact path (2026-08-16). `/agents.json` matched the live file and
+# NOTHING ELSE: an `agents.json.bak-20260815043413` sat UNTRACKED and UNIGNORED
+# in a public tree for a day, one `git add -A` away from publishing the
+# per-deployment agent tokens. The comment above claimed "structurally
+# uncommittable" — a claim the pattern did not deliver, and the file that
+# disproved it was created by a rotation ceremony that made its own backup.
+# A rule that names one filename does not cover the files a tool derives FROM
+# that filename. The trailing * is the whole fix. `examples/agents.json.example`
+# is unaffected: these patterns are root-anchored (verified, not assumed).
+/agents.json*
+/devices-pair-consumers.json*
+/events/

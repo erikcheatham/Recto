@@ -1,0 +1,112 @@
+# Recto pytest on macOS — GitHub-hosted runner.
+#
+# Public repo (Apache 2.0), so we use GitHub-hosted macos-latest
+# instead of a self-hosted runner. Self-hosted runners on PUBLIC repos
+# are a documented attack vector: any fork can submit a PR with a
+# malicious workflow that executes on your runner. Hosted macOS
+# runners are ephemeral (clean VM per job), free for public repos,
+# and unlock the same ~17 macOS-specific tests we wanted (Unix-socket
+# sign-helper, Linux/macOS Job-Object stub, "Windows only" reverse-
+# gates on CredMan + DPAPI, SO_REUSEADDR semantics on adminui)
+# because the runner IS actually macOS.
+#
+# Self-hosted on the macOS host stays in the picture for iOS device deploy
+# (Apple Developer Program ceremony + xcrun devicectl install to
+# real iPhone hardware) — that's macOS-host-local manual work, not CI.
+# See docs/macos-setup.md Part B.
+
+name: Test on macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest on macOS (GitHub-hosted)
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Recto with all extras the test suite needs
+        # `dev` brings pytest + coverage tooling.
+        # `v0_4` brings cryptography + pyjwt[crypto] which the
+        #         bootloader-sessions / enclave_stub / sign_helper
+        #         tests need (Ed25519 + JWT EdDSA verify path).
+        # `ethereum` and `bitcoin` are empty marker extras (no new
+        #         packages) so we don't install them — the modules
+        #         load by import unconditionally.
+        # `azure` brings azure-identity + azure-keyvault-secrets so the
+        #         mocked AzureKeyVaultSource unit tests run (they map
+        #         real azure.core exception types; no live vault needed
+        #         — the live arm is env-gated and skips in CI).
+        # `qr` brings qrcode + Pillow (BSD / HPND, pure Python, no system
+        #         libraries). WITHOUT IT test_qr_encode and
+        #         test_qr_multi_witness skip AT COLLECTION -- the modules
+        #         never load, which is what "collected 1585 items /
+        #         2 skipped" was reporting.
+        #         THIS EXTRA HAD NO LINE IN THIS BLOCK AT ALL. Every other
+        #         extra carries a reason, including the ones deliberately
+        #         left out, so `qr` was an omission and not a decision --
+        #         and a step named "all extras the test suite needs"
+        #         installed all but one.
+        # `postgres` is NOT installed HERE, and that is now a division of
+        #         labour rather than a gap. The PostgresStateStore arm
+        #         needs a live server (RECTO_TEST_POSTGRES_DSN); service
+        #         containers are a Linux-runner feature, so that arm runs
+        #         in .github/workflows/test-postgres.yml, which REQUIRES
+        #         zero skips. Landed 2026-08-20; first real run was 54
+        #         passed (27 file + 27 postgres).
+        #         So the 27 skips this job still reports are COVERED
+        #         ELSEWHERE, not untested. If test-postgres.yml is ever
+        #         removed, this comment is a lie and these become the
+        #         only word on that backend again.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,v0_4,azure,qr]"
+
+      - name: Show environment
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "Python: $(python --version)"
+          echo "pwd: $(pwd)"
+          python -m pytest --version
+
+      - name: Make short TMPDIR for AF_UNIX tests
+        # macOS caps AF_UNIX socket paths at 104 chars (vs 108 on
+        # Linux), and pytest's default tmp_path resolves to
+        # /var/folders/zz/.../pytest-of-runner/pytest-N/... which
+        # blows past that — sign_helper tests fail with "OSError:
+        # AF_UNIX path too long". Setting TMPDIR to a short prefix
+        # keeps the paths short. /tmp/r is plenty short and writable
+        # on every macOS runner. Created here once so subsequent
+        # pytest steps just inherit the env var.
+        run: mkdir -p /tmp/r
+
+      - name: Run full pytest suite
+        env:
+          TMPDIR: /tmp/r
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -v --tb=short | tee /tmp/pytest-full.log
+
+      - name: Surface skip count
+        if: always()
+        run: |
+          grep -E "passed|skipped|failed" /tmp/pytest-full.log | tail -3

@@ -1,0 +1,661 @@
+@page "/settings"
+@using System.Reflection
+@using System.Threading.Tasks
+@using Microsoft.AspNetCore.Components
+@using Recto.Shared.Common
+@using Recto.Shared.Models
+@using Recto.Shared.Services
+@inject NavigationManager Nav
+@inject IPairingStateService Pairing
+@inject IEnclaveKeyService EnclaveKeys
+@inject ITotpService Totp
+@inject IPinningService Pinning
+@inject IUserPreferencesService Prefs
+@inject IEthSignService EthSigner
+@inject IUnpairService Unpair
+
+<PageTitle>Settings - Recto</PageTitle>
+
+<div class="container py-3" style="max-width: 600px;">
+    <div class="d-flex align-items-center mb-3">
+        <button class="btn btn-link text-decoration-none p-0 me-3"
+                @onclick="@(() => Nav.NavigateTo("/"))"
+                aria-label="Back">
+            &larr; Back
+        </button>
+        <h1 class="h4 mb-0">Settings</h1>
+    </div>
+
+    @if (_savedFlash)
+    {
+        <div class="alert alert-success py-2" role="alert">
+            Settings saved.
+        </div>
+    }
+
+    <div class="card mb-3">
+        <div class="card-header py-2">Polling</div>
+        <div class="card-body">
+            <p class="text-muted small mb-2">
+                How often the phone checks the bootloader for pending
+                requests when no push notification has arrived. Sub-second
+                wakeup happens via push when configured; this poll is the
+                fallback for phones without push or for transient push
+                outages.
+            </p>
+            <label class="form-label">Interval</label>
+            <select class="form-select" @bind="_settings.PollingIntervalSeconds"
+                    @bind:after="OnSettingChanged">
+                <option value="2">2 seconds (most responsive, more battery)</option>
+                <option value="3">3 seconds (default)</option>
+                <option value="5">5 seconds (balanced)</option>
+                <option value="10">10 seconds (battery-friendly)</option>
+                <option value="0">Disabled (push only)</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header py-2">Audit history</div>
+        <div class="card-body">
+            <p class="text-muted small mb-2">
+                Maximum number of past approvals/denials shown in the
+                phone-side history view. Stored on the bootloader; the phone
+                fetches on demand. Larger values mean longer scrollback;
+                bootloader caps at 500 events per phone regardless.
+            </p>
+            <label class="form-label">Display limit</label>
+            <select class="form-select" @bind="_settings.AuditHistoryLimit"
+                    @bind:after="OnSettingChanged">
+                <option value="20">Last 20 events</option>
+                <option value="50">Last 50 events (default)</option>
+                <option value="200">Last 200 events</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header py-2">Theme</div>
+        <div class="card-body">
+            <label class="form-label">Appearance</label>
+            <select class="form-select" @bind="_settings.ThemePreference"
+                    @bind:after="OnSettingChanged">
+                <option value="system">Match system (default)</option>
+                <option value="light">Always light</option>
+                <option value="dark">Always dark</option>
+            </select>
+        </div>
+    </div>
+
+    @* ── Recovery phrase (Build 12, 2026-07-11) — backup + restore ──────
+       The BIP-39 mnemonic is the master secret; if the phone is lost with
+       no backup, the keys are gone. Backup is biometric-gated (a fresh
+       enclave sign fires Face ID / BiometricPrompt) then reveals the words
+       with a confirm-by-re-entry check. Restore validates a pasted phrase
+       and overwrites (destructive, confirmed). Both operate on the ETH
+       alias 'default' — the single mnemonic every coin tree derives from. *@
+    <div class="card mb-3">
+        <div class="card-header py-2">Recovery phrase</div>
+        <div class="card-body">
+
+            @if (_recoveryMode == RecoveryMode.None)
+            {
+                <p class="text-muted small mb-3">
+                    Your 24-word recovery phrase is the only way to restore your
+                    keys on a new phone. Write it down and keep it somewhere safe
+                    and private — anyone with these words controls your keys.
+                </p>
+                <div class="d-flex gap-2 flex-wrap">
+                    <button class="btn btn-outline-primary"
+                            disabled="@_recoveryBusy"
+                            @onclick="BeginBackupAsync">
+                        @(_recoveryBusy ? "Verifying…" : "Back up recovery phrase")
+                    </button>
+                    <button class="btn btn-outline-secondary"
+                            disabled="@_recoveryBusy"
+                            @onclick="@(() => { _recoveryMode = RecoveryMode.Restore; _recoveryError = null; _restoreInput = string.Empty; })">
+                        Restore from a phrase
+                    </button>
+                </div>
+                @if (!string.IsNullOrEmpty(_recoveryError))
+                {
+                    <p class="text-danger small mt-2">@_recoveryError</p>
+                }
+                @if (_recoverySavedFlash)
+                {
+                    <p class="text-success small mt-2">Recovery phrase restored ✓</p>
+                }
+            }
+            else if (_recoveryMode == RecoveryMode.Reveal)
+            {
+                <p class="fw-semibold mb-2">Write these 24 words down, in order.</p>
+                <p class="text-muted small mb-3">
+                    Never type them into a website or share them with anyone —
+                    not even Recto support. We can't recover them for you.
+                </p>
+                <ol class="rec-mnemonic-grid">
+                    @for (var i = 0; i < _revealedWords.Length; i++)
+                    {
+                        <li><span class="rec-mnemonic-word">@_revealedWords[i]</span></li>
+                    }
+                </ol>
+                <button class="btn btn-primary mt-3"
+                        @onclick="@(() => { _recoveryMode = RecoveryMode.Confirm; _recoveryError = null; _confirmInput = string.Empty; })">
+                    I've written it down
+                </button>
+            }
+            else if (_recoveryMode == RecoveryMode.Confirm)
+            {
+                <p class="fw-semibold mb-2">
+                    Confirm word #@(_confirmWordIndex + 1) of your phrase.
+                </p>
+                <p class="text-muted small mb-2">
+                    Just to be sure you saved it correctly.
+                </p>
+                <input class="form-control mb-2" placeholder="@($"word #{_confirmWordIndex + 1}")"
+                       @bind="_confirmInput" @bind:event="oninput" autocomplete="off" autocapitalize="none" />
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" @onclick="ConfirmBackup">Confirm</button>
+                    <button class="btn btn-secondary" @onclick="EndRecovery">Cancel</button>
+                </div>
+                @if (!string.IsNullOrEmpty(_recoveryError))
+                {
+                    <p class="text-danger small mt-2">@_recoveryError</p>
+                }
+            }
+            else if (_recoveryMode == RecoveryMode.Restore)
+            {
+                @if (!_confirmingRestore)
+                {
+                    <p class="text-muted small mb-2">
+                        Paste or type your 24-word recovery phrase, words separated
+                        by spaces.
+                    </p>
+                    <textarea class="form-control mb-2" rows="3"
+                              placeholder="word1 word2 word3 …"
+                              @bind="_restoreInput" @bind:event="oninput"
+                              autocomplete="off" autocapitalize="none"></textarea>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-primary"
+                                disabled="@_recoveryBusy"
+                                @onclick="@(() => { _recoveryError = null; _confirmingRestore = true; })">
+                            Restore
+                        </button>
+                        <button class="btn btn-secondary" @onclick="EndRecovery">Cancel</button>
+                    </div>
+                }
+                else
+                {
+                    <p class="fw-semibold text-danger mb-2">
+                        This replaces the keys currently on this phone.
+                    </p>
+                    <p class="text-muted small mb-2">
+                        If you haven't backed up the current phrase, those keys will
+                        be gone. Continue only if you're restoring on purpose.
+                    </p>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-danger"
+                                disabled="@_recoveryBusy"
+                                @onclick="RestoreAsync">
+                            @(_recoveryBusy ? "Restoring…" : "Yes, replace my keys")
+                        </button>
+                        <button class="btn btn-secondary"
+                                disabled="@_recoveryBusy"
+                                @onclick="@(() => _confirmingRestore = false)">
+                            Back
+                        </button>
+                    </div>
+                }
+                @if (!string.IsNullOrEmpty(_recoveryError))
+                {
+                    <p class="text-danger small mt-2">@_recoveryError</p>
+                }
+            }
+        </div>
+    </div>
+
+    @* Per-bootloader unpair (Build 14, 2026-07-25). Born from a live
+       outage: the CF edge cert rotated under the phone's TOFU pin and
+       the ONLY recovery was the full danger-zone wipe — TOTP secrets
+       and the enclave key held hostage by a stale pairing. This is the
+       surgical version: pairing record + that host's TLS pin only; the
+       vault, TOTP secrets, and enclave identity stay. Re-pairing with
+       the same enclave key is the designed path (the bootloader sees
+       the same public key on pair-back). Resurfaces the orphaned
+       HandleUnpairClick semantics removed from the Home screen
+       2026-05-18 — Settings is the right home per that same feedback. *@
+    @if (_pairedUrl is not null)
+    {
+        <div class="card mb-3 border-warning">
+            <div class="card-header py-2 text-warning">Bootloader pairing</div>
+            <div class="card-body">
+                <p class="text-muted small mb-3">
+                    Unpairs from <code>@_pairedUrl</code> and forgets that
+                    host's TLS pin — your services, TOTP secrets, and this
+                    phone's identity key are kept. Use this to re-pair after
+                    a bootloader moves or its certificate rotates. The
+                    bootloader-side phone entry becomes orphaned; revoke it
+                    from the bootloader's operator UI.
+                </p>
+                @if (!_confirmingBootUnpair)
+                {
+                    <button class="btn btn-outline-warning"
+                            @onclick="@(() => _confirmingBootUnpair = true)">
+                        Unpair bootloader (keep vault)
+                    </button>
+                }
+                else
+                {
+                    <p class="fw-semibold text-warning mb-2">Unpair from this bootloader? Your vault stays intact.</p>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-warning"
+                                disabled="@_bootUnpairing"
+                                @onclick="UnpairBootloaderAsync">
+                            @(_bootUnpairing ? "Unpairing..." : "Yes, unpair")
+                        </button>
+                        <button class="btn btn-secondary"
+                                disabled="@_bootUnpairing"
+                                @onclick="@(() => _confirmingBootUnpair = false)">
+                            Cancel
+                        </button>
+                    </div>
+                    @if (!string.IsNullOrEmpty(_bootUnpairError))
+                    {
+                        <p class="text-danger small mt-2">@_bootUnpairError</p>
+                    }
+                }
+            </div>
+        </div>
+    }
+
+    <div class="card mb-3 border-danger">
+        <div class="card-header py-2 text-danger">Danger zone</div>
+        <div class="card-body">
+            <p class="text-muted small mb-3">
+                Wipes every paired bootloader, every TOTP secret, and the
+                phone-side enclave key. After this, you'll need to re-pair
+                from scratch with each bootloader. The bootloader-side
+                phone entries become orphaned; revoke them from another
+                paired phone or via the bootloader's operator UI.
+            </p>
+            <p class="text-muted small mb-3">
+                On a genesis-member phone this action is disabled — a
+                member key helps constitute the trust root. Retiring a
+                member goes through the recovery ceremony (restore from
+                the recovery phrase, then re-enrol) instead.
+            </p>
+            @if (!_confirmingUnpair)
+            {
+                <button class="btn btn-outline-danger"
+                        @onclick="@(() => _confirmingUnpair = true)">
+                    Unpair all bootloaders
+                </button>
+            }
+            else
+            {
+                <p class="fw-semibold text-danger mb-2">Are you sure? This cannot be undone.</p>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-danger"
+                            disabled="@_unpairing"
+                            @onclick="UnpairAllAsync">
+                        @(_unpairing ? "Wiping..." : "Yes, wipe everything")
+                    </button>
+                    <button class="btn btn-secondary"
+                            disabled="@_unpairing"
+                            @onclick="@(() => _confirmingUnpair = false)">
+                        Cancel
+                    </button>
+                </div>
+            }
+            @* THE REFUSAL MUST OUTLIVE THE CONFIRM SECTION (2026-08-23).
+               This block used to live INSIDE the confirming branch, and the
+               handler collapses that branch after every attempt — so a
+               genesis-member refusal was set and instantly unrendered. The
+               vanishing danger-UI read as "completed", which trained the
+               operator to click again; on a NON-member phone that second
+               click is the wipe. Measured live during the R7 ceremony: the
+               guard refused twice and was visible once. A refusal a user
+               cannot see is a refusal that teaches retry. *@
+            @if (!string.IsNullOrEmpty(_unpairError))
+            {
+                <p class="text-danger small mt-2">@_unpairError</p>
+            }
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header py-2">About</div>
+        <div class="card-body">
+            <dl class="row mb-0 small">
+                <dt class="col-sm-4">Recto version</dt>
+                <dd class="col-sm-8">@_appVersionDisplay</dd>
+                <dt class="col-sm-4">Protocol version</dt>
+                <dd class="col-sm-8">@Recto.Shared.Protocol.V04.V04Protocol.Version (v0.4)</dd>
+                <dt class="col-sm-4">Algorithm</dt>
+                <dd class="col-sm-8"><code>@EnclaveKeys.Algorithm</code></dd>
+                <dt class="col-sm-4">License</dt>
+                <dd class="col-sm-8">Apache 2.0</dd>
+            </dl>
+        </div>
+    </div>
+</div>
+
+@code {
+    private UserPreferences _settings = new();
+    private bool _savedFlash = false;
+    private bool _confirmingUnpair = false;
+    private bool _unpairing = false;
+    private string? _unpairError;
+    private const string KeyAlias = "recto.phone.identity";
+
+    // ── Recovery-phrase ceremony (Build 12, 2026-07-11) ───────────────────
+    // The ETH alias 'default' is the single mnemonic every coin tree derives
+    // from (see MauiEthSignService); m/44'/60'/0'/0/0 is the canonical path.
+    private const string EthMnemonicAlias = "default";
+    private const string EthDefaultPath = "m/44'/60'/0'/0/0";
+
+    private enum RecoveryMode { None, Reveal, Confirm, Restore }
+    private RecoveryMode _recoveryMode = RecoveryMode.None;
+    private bool _recoveryBusy;
+    private string? _recoveryError;
+    private bool _recoverySavedFlash;
+    private string[] _revealedWords = System.Array.Empty<string>();
+    private int _confirmWordIndex;
+    private string _confirmInput = string.Empty;
+    private string _restoreInput = string.Empty;
+    private bool _confirmingRestore;
+
+    /// <summary>
+    /// Backup entry: fire the biometric gate (a fresh enclave sign triggers
+    /// Face ID / BiometricPrompt via the identity key's BiometryCurrentSet
+    /// ACL), and ONLY on success read + reveal the phrase. A failed / declined
+    /// biometric never reveals the words — the gate is the whole security of
+    /// this flow (interface SECURITY note).
+    /// </summary>
+    private async Task BeginBackupAsync()
+    {
+        _recoveryError = null;
+        _recoverySavedFlash = false;
+        _recoveryBusy = true;
+        try
+        {
+            // Sign a throwaway challenge purely to force the biometric prompt.
+            var challenge = System.Text.Encoding.ASCII.GetBytes(
+                "recto.backup." + System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            var gate = await EnclaveKeys.SignAsync(KeyAlias, challenge, CancellationToken.None);
+            if (gate.IsFailure)
+            {
+                _recoveryError = "Couldn't verify it's you — " + gate.Error.Message;
+                return;
+            }
+
+            var export = await EthSigner.ExportMnemonicAsync(EthMnemonicAlias, CancellationToken.None);
+            if (export.IsFailure)
+            {
+                _recoveryError = export.Error.Message;
+                return;
+            }
+
+            _revealedWords = export.Value.Split(' ', System.StringSplitOptions.RemoveEmptyEntries);
+            if (_revealedWords.Length == 0)
+            {
+                _recoveryError = "The recovery phrase is empty.";
+                return;
+            }
+            _confirmWordIndex = System.Random.Shared.Next(_revealedWords.Length);
+            _confirmInput = string.Empty;
+            _recoveryMode = RecoveryMode.Reveal;
+        }
+        catch (System.Exception ex)
+        {
+            _recoveryError = $"Backup failed: {ex.Message}";
+        }
+        finally
+        {
+            _recoveryBusy = false;
+        }
+    }
+
+    private void ConfirmBackup()
+    {
+        var expected = _confirmWordIndex < _revealedWords.Length
+            ? _revealedWords[_confirmWordIndex] : null;
+        if (expected is not null
+            && string.Equals(_confirmInput.Trim(), expected, System.StringComparison.OrdinalIgnoreCase))
+        {
+            EndRecovery();
+            _recoverySavedFlash = true;
+        }
+        else
+        {
+            _recoveryError = "That doesn't match — check your written-down copy and try again.";
+        }
+    }
+
+    private async Task RestoreAsync()
+    {
+        _recoveryError = null;
+        _recoveryBusy = true;
+        try
+        {
+            var result = await EthSigner.ImportMnemonicAsync(
+                EthMnemonicAlias, _restoreInput, EthDefaultPath, CancellationToken.None);
+            if (result.IsFailure)
+            {
+                _recoveryError = result.Error.Message;
+                _confirmingRestore = false; // back to the input so they can fix it
+                return;
+            }
+            EndRecovery();
+            _recoverySavedFlash = true;
+        }
+        catch (System.Exception ex)
+        {
+            _recoveryError = $"Restore failed: {ex.Message}";
+            _confirmingRestore = false;
+        }
+        finally
+        {
+            _recoveryBusy = false;
+        }
+    }
+
+    /// <summary>Reset the ceremony to the resting state. Clears the revealed
+    /// words from memory (they were only ever a UI-lifetime copy).</summary>
+    private void EndRecovery()
+    {
+        _recoveryMode = RecoveryMode.None;
+        _revealedWords = System.Array.Empty<string>();
+        _confirmInput = string.Empty;
+        _restoreInput = string.Empty;
+        _confirmingRestore = false;
+        _recoveryError = null;
+    }
+
+    // Recto app version surfaced in the About card. Read from the
+    // entry assembly's metadata at field-init time so every build
+    // automatically displays the correct ApplicationDisplayVersion +
+    // ApplicationVersion from Recto.csproj (e.g. "v1.0 (3)" for build
+    // 3 of v1.0). Previously hardcoded to "v0.4.1" which drifted out
+    // of sync the moment we started shipping App Store builds.
+    //
+    // Uses System.Reflection (NOT MAUI's AppInfo) because Recto.Shared
+    // is a class library that doesn't reference Microsoft.Maui.Essentials
+    // — keeping the version readout host-agnostic so this works in
+    // unit-test contexts too. MAUI maps csproj version fields to
+    // assembly metadata as:
+    //   <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    //     -> AssemblyInformationalVersion = "1.0"
+    //   <ApplicationVersion>3</ApplicationVersion>
+    //     -> AssemblyFileVersion = "1.0.0.3" (last segment is the build)
+    // Try/catch falls back to "unknown" if the entry assembly's
+    // metadata is unreadable for any reason.
+    private static readonly string _appVersionDisplay = ResolveAppVersion();
+    private static string ResolveAppVersion()
+    {
+        try
+        {
+            // Look up the main Recto.dll assembly by name. We can't use
+            // Assembly.GetEntryAssembly() because in MAUI Blazor, Razor
+            // components compile into the assembly that DEFINES them —
+            // Settings.razor lives in Recto.Shared, so GetEntryAssembly()
+            // returns Recto.Shared.dll (default version 1.0.0.0) instead
+            // of Recto.dll (where ApplicationVersion propagates via
+            // <ApplicationVersion>N</ApplicationVersion> in csproj).
+            // Caught 2026-05-22 — Settings rendered "v1.0 (0)" instead
+            // of "v1.0 (N)" because the Shared assembly's version was
+            // read instead of the app assembly's. Falls back to
+            // GetEntryAssembly() if the named lookup fails (host-agnostic
+            // for future MAUI / Blazor Server / WASM reuse).
+            System.Reflection.Assembly? asm = null;
+            foreach (var candidate in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var name = candidate.GetName().Name;
+                if (string.Equals(name, "Recto", System.StringComparison.Ordinal))
+                {
+                    asm = candidate;
+                    break;
+                }
+            }
+            asm ??= System.Reflection.Assembly.GetEntryAssembly();
+            if (asm is null) return "unknown";
+
+            var info = asm.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>();
+            var displayVer = info?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(displayVer))
+            {
+                var plus = displayVer.IndexOf('+');
+                if (plus > 0) displayVer = displayVer.Substring(0, plus);
+            }
+
+            var fileVer = asm.GetCustomAttribute<System.Reflection.AssemblyFileVersionAttribute>()?.Version;
+            string? build = null;
+            if (!string.IsNullOrWhiteSpace(fileVer))
+            {
+                // Take the LAST segment regardless of segment count.
+                // Build 9 fix (2026-06-03 night): the prior "parts[3] when
+                // length>=4 else parts[last]" branch silently broke once
+                // the csproj's FileVersion template (which was wired for
+                // 2-segment ApplicationDisplayVersion → "1.0.0.N") started
+                // receiving 3-segment ApplicationDisplayVersion ("1.0.5.0.N",
+                // 5 segments). parts[3] became the synthetic ".0." filler
+                // instead of the real build number at parts[4], so About
+                // rendered "v1.0.5 (0)" instead of "v1.0.5 (N)" across
+                // Builds 4..8. Canonical csproj fix dropped the ".0."
+                // filler so FileVersion is always 4 segments now; this
+                // parser change is defense-in-depth so any future template
+                // drift can't reintroduce the regression.
+                var parts = fileVer.Split('.');
+                if (parts.Length > 0) build = parts[parts.Length - 1];
+            }
+
+            if (!string.IsNullOrWhiteSpace(displayVer) && !string.IsNullOrWhiteSpace(build))
+                return $"v{displayVer} ({build})";
+            if (!string.IsNullOrWhiteSpace(displayVer))
+                return $"v{displayVer}";
+            if (!string.IsNullOrWhiteSpace(fileVer))
+                return $"v{fileVer}";
+            return "unknown";
+        }
+        catch
+        {
+            return "unknown";
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _settings = await Prefs.LoadAsync(CancellationToken.None);
+
+        // Per-bootloader unpair card (Build 14): surface only when paired.
+        try
+        {
+            var current = await Pairing.GetCurrentAsync(CancellationToken.None);
+            if (current.IsSuccess && current.Value is not null)
+            {
+                _pairedUrl = current.Value.BootloaderUrl;
+            }
+        }
+        catch { /* card just stays hidden */ }
+    }
+
+    // ── Per-bootloader unpair (Build 14, 2026-07-25) ──────────────────
+    private string? _pairedUrl;
+    private bool _confirmingBootUnpair;
+    private bool _bootUnpairing;
+    private string? _bootUnpairError;
+
+    /// <summary>
+    /// Surgical unpair: pairing record + this host's TLS pin ONLY.
+    /// Vault, TOTP secrets, and the enclave identity key survive — the
+    /// designed re-pair path presents the SAME public key to the next
+    /// bootloader (or the same one on a new hostname/cert). Sister of
+    /// Home.HandleUnpairClick (the orphaned 2026-05-18 handler), homed
+    /// in Settings per that same operator feedback.
+    /// </summary>
+    private async Task UnpairBootloaderAsync()
+    {
+        _bootUnpairing = true;
+        _bootUnpairError = null;
+        StateHasChanged();
+        try
+        {
+            if (_pairedUrl is not null)
+            {
+                try { Pinning.ClearPin(new Uri(_pairedUrl).Host); }
+                catch { /* bad stored URL — pin store rebuilds on next pair anyway */ }
+            }
+            var clear = await Pairing.ClearAsync(CancellationToken.None);
+            if (!clear.IsSuccess)
+            {
+                _bootUnpairError = "Could not clear the pairing record.";
+                _bootUnpairing = false;
+                _confirmingBootUnpair = false;
+                StateHasChanged();
+                return;
+            }
+            Nav.NavigateTo("/", forceLoad: true);
+        }
+        catch (Exception ex)
+        {
+            _bootUnpairError = $"{ex.GetType().Name}: {ex.Message}";
+            _bootUnpairing = false;
+            _confirmingBootUnpair = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task OnSettingChanged()
+    {
+        await Prefs.SaveAsync(_settings, CancellationToken.None);
+        _savedFlash = true;
+        StateHasChanged();
+        await Task.Delay(1500);
+        _savedFlash = false;
+        StateHasChanged();
+    }
+
+    private async Task UnpairAllAsync()
+    {
+        _unpairing = true;
+        _unpairError = null;
+        StateHasChanged();
+        // The wipe sequence (pairing → TOTP → enclave key, order preserved)
+        // moved into IUnpairService so the genesis guard sits ahead of the
+        // first destructive call on EVERY path that can destroy the key —
+        // a genesis member gets a refusal that names the recovery ceremony
+        // instead of a one-tap trust-root reduction.
+        // (Pin store note carried over: no public ClearAll on
+        // IPinningService — per-circuit memory, rebuilds on next pair.)
+        var result = await Unpair.UnpairAllAsync(KeyAlias, CancellationToken.None);
+        if (result.Status == UnpairAllStatus.Completed)
+        {
+            Nav.NavigateTo("/", forceLoad: true);
+            return;
+        }
+        _unpairError = result.Message;
+        _unpairing = false;
+        _confirmingUnpair = false;
+        StateHasChanged();
+    }
+}

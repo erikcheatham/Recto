@@ -1,0 +1,164 @@
+# The PostgresStateStore contract arm, against a real server.
+#
+# WHAT THIS CLOSES. `tests/test_state_postgres.py` is ONE contract suite
+# parametrized over both StateStoreBase backends -- `file` and
+# `postgres`. The file arm has always run. The postgres arm skips unless
+# RECTO_TEST_POSTGRES_DSN points at a live database, and no CI job ever
+# set it, so **27 tests had never executed anywhere**. The macOS
+# workflow says so in a comment and even tracks the number as it grows
+# (24 -> 27 when GATE 5c-b added three genesis-member methods). An
+# untested surface that is honestly labelled is still an untested
+# surface: the label is the reason to close it, not a substitute.
+#
+# Measured 2026-08-20 against a real server before this file was
+# written: 54 passed (27 file + 27 postgres). Without the DSN the same
+# file reports "27 passed, 27 skipped" -- which is the state this job
+# exists to make impossible to return to silently.
+#
+# THE ASSERTION THAT MATTERS IS THE SKIP COUNT, NOT THE EXIT CODE.
+# `pytest` exits 0 on a run that skipped everything, so a job that only
+# checked its exit status would go green having proved precisely
+# nothing -- and would keep going green if the service container
+# vanished, the DSN were misspelled, or the extra stopped installing.
+# That is the exact failure this suite already had, reproduced in CI. So
+# the run is required to skip NOTHING.
+#
+# LINUX, NOT macOS. The macOS job stays the full-suite runner; this one
+# is deliberately narrow -- a service container is a Linux-runner
+# feature, and widening this job to the whole suite would put a second
+# unproven platform arm in front of every push. If a full Linux suite is
+# wanted it is its own job, added after it has been watched go green.
+
+name: Test Postgres arm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'recto/bootloader/state.py'
+      - 'recto/bootloader/state_postgres.py'
+      - 'tests/test_state_postgres.py'
+      - 'pyproject.toml'
+      - '.github/workflows/test-postgres.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A FLOOR, not an equality. 27 is the count on 2026-08-20; the point of
+  # the check is to catch "the fixture was renamed and nothing ran", not
+  # to make every added test edit this file. Raise it when the contract
+  # grows -- never lower it to make a build green.
+  MIN_POSTGRES_TESTS: 27
+
+jobs:
+  postgres:
+    name: StateStoreBase contract (file + postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: recto_test
+        ports:
+          - 5432:5432
+        # Without a health check the job races the container and fails
+        # as a connection error, which reads as a code fault rather than
+        # a timing one.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Recto with the postgres extra
+        # `postgres` is the one this job exists for -- psycopg[binary,pool].
+        # `dev` brings pytest. `v0_4` brings cryptography + pyjwt, which
+        # recto.bootloader.state imports transitively.
+        # Deliberately NOT installed: `qr`, `azure`, `push` -- nothing in
+        # this file touches them, and an extra installed "just in case"
+        # is an extra nobody can later remove with confidence.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,v0_4,postgres]"
+
+      - name: Show environment
+        run: |
+          python --version
+          python -c "import psycopg; print('psycopg', psycopg.__version__)"
+          pg_isready -h localhost -p 5432 -U postgres || true
+
+      - name: Run the contract suite against both backends
+        env:
+          RECTO_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/recto_test
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_state_postgres.py -v --tb=short \
+            | tee /tmp/pg.log
+
+      - name: The postgres arm must have RUN, not skipped
+        # Three independent facts, each able to fail on its own:
+        #   1. nothing was skipped -- the whole point;
+        #   2. at least MIN_POSTGRES_TESTS postgres-parametrized tests
+        #      passed, so a renamed or deleted fixture cannot pass by
+        #      running zero tests;
+        #   3. the file arm still ran too, so the two backends are still
+        #      being held to one contract rather than the postgres arm
+        #      quietly becoming the only one.
+        run: |
+          set -euo pipefail
+          summary="$(grep -E '^\S*[0-9]+ (passed|failed)' /tmp/pg.log | tail -1 || true)"
+          echo "summary: ${summary:-<none>}"
+
+          # Anchored to the per-test result lines. An unanchored `grep -c
+          # SKIPPED` double-counts, because pytest -v prints each skip
+          # once as a result and again in the short summary -- measured
+          # 54 for 27 skips. The check would still have failed, but the
+          # NUMBER IT REPORTED WOULD HAVE BEEN WRONG, and a message that
+          # misstates the count is how someone goes looking for 54 tests
+          # that do not exist.
+          skipped="$(grep -cE '^tests/.*SKIPPED' /tmp/pg.log || true)"
+          if [ "${skipped:-0}" -ne 0 ]; then
+            echo "::error::${skipped} test(s) SKIPPED. The postgres arm skips when"
+            echo "RECTO_TEST_POSTGRES_DSN is unset or psycopg is missing -- a green"
+            echo "run that skipped is the exact condition this job exists to catch."
+            grep -E '^tests/.*SKIPPED' /tmp/pg.log | head -20
+            exit 1
+          fi
+
+          pg_passed="$(grep -c '\[postgres\].*PASSED' /tmp/pg.log || true)"
+          file_passed="$(grep -c '\[file\].*PASSED' /tmp/pg.log || true)"
+          echo "postgres arm passed: ${pg_passed}   file arm passed: ${file_passed}"
+
+          if [ "${pg_passed:-0}" -lt "${MIN_POSTGRES_TESTS}" ]; then
+            echo "::error::only ${pg_passed} postgres test(s) passed; expected at least ${MIN_POSTGRES_TESTS}."
+            echo "Either the parametrized fixture stopped producing a postgres arm,"
+            echo "or tests were removed. Do not lower MIN_POSTGRES_TESTS to fix this."
+            exit 1
+          fi
+
+          if [ "${file_passed:-0}" -lt "${MIN_POSTGRES_TESTS}" ]; then
+            echo "::error::the file arm ran ${file_passed} test(s). Both backends are"
+            echo "held to ONE contract; an arm running alone means they can drift."
+            exit 1
+          fi
+
+          echo "postgres arm executed against a real server -- 0 skipped"

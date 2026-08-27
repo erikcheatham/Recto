@@ -1,0 +1,566 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+	<PropertyGroup>
+		<TargetFrameworks>net10.0-android;net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+		<!-- Windows TFM is Windows-host-only so macOS / Linux restore doesn't trip
+		     on NETSDK1100 ('To build a project targeting Windows on this OS, set
+		     EnableWindowsTargeting=true'). the dev workstation picks it up via the conditional;
+		     the macOS build host (this is the box deploying iOS to the test iPhone)
+		     stays at the cross-platform 3 TFMs. -->
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+		<!-- Note for MacCatalyst:
+      The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.
+      When specifying both architectures, use the plural <RuntimeIdentifiers> instead of the singular <RuntimeIdentifier>.
+      The Mac App Store will NOT accept apps with ONLY maccatalyst-arm64 indicated;
+      either BOTH runtimes must be indicated or ONLY macatalyst-x64. -->
+		<!-- For example: <RuntimeIdentifiers>maccatalyst-x64;maccatalyst-arm64</RuntimeIdentifiers> -->
+		<OutputType>Exe</OutputType>
+		<RootNamespace>Recto</RootNamespace>
+		<UseMaui>true</UseMaui>
+		<SingleProject>true</SingleProject>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<EnableDefaultCssItems>false</EnableDefaultCssItems>
+		<Nullable>enable</Nullable>
+		<!-- Enable XAML source generation for faster build times. -->
+		<MauiXamlInflator>SourceGen</MauiXamlInflator>
+		<!-- Display name -->
+		<!--
+		  Rebranded 2026-05-25 night: "Recto" -> "Recto Agentic" for v1.0.1
+		  to match the renamed App Store Connect listing (Apple v1.0.1
+		  metadata-review pending; "Recto Agentic" name + "Phone signing
+		  vault for agents" subtitle). MAUI picks this up as both the iOS
+		  home-screen label (no CFBundleDisplayName override in Info.plist —
+		  ApplicationTitle is canonical) and the Android home-screen label
+		  (auto-bound to android:label without explicit AndroidManifest
+		  override). Apple's original "Recto" alone was already taken on
+		  the App Store; "Recto Agentic" disambiguates while preserving
+		  the broader Recto ecosystem brand consistency (recto-core SDK,
+		  recto-client packages, integrator bootloaders). Bundle ID
+		  app.recto.phone stays PERMANENT regardless of display-name swaps
+		  per Apple + Google's package-ID-is-the-identity rule.
+		-->
+		<ApplicationTitle>Recto Agentic</ApplicationTitle>
+		<!-- App Identifier -->
+		<ApplicationId>app.recto.phone</ApplicationId>
+		<!-- Versions -->
+		<!-- 1.0.7 -> 1.0.8 (2026-07-25): Build 14 — per-bootloader unpair
+		     (keep vault) in Settings, born from the CF cert-rotation-vs-
+		     TOFU-pin outage. New store version string required (1.0.7
+		     shipped as Build 12); Version + FileVersion derive. -->
+		<ApplicationDisplayVersion>1.0.8</ApplicationDisplayVersion>
+		<!-- Build 5 (2026-06-02): explicit Version pin to fix NU1105.
+		     MAUI auto-derives PackageVersion from ApplicationDisplayVersion
+		     on some TFMs but leaves the default 1.0.0 on others, producing:
+		       NU1105 Unable to read project information for 'Recto':
+		         The property PackageVersion was expected to have a single
+		         value across all target frameworks, but instead had the
+		         following values: 1.0.0, 1.0.2
+		     Setting Version explicitly forces consistency across all four
+		     TFMs (net10.0-android / -ios / -maccatalyst / -windows10.0.19041.0).
+		     2026-07-25: the "keep in lock-step on every bump" manual rule
+		     failed exactly as manual rules do — the 1.0.7 bump missed this
+		     pin and NU1105 returned (1.0.6 vs 1.0.7 across TFMs; only VS's
+		     all-TFM restore trips it, single-TFM Mac publishes never did).
+		     Now derived from ApplicationDisplayVersion so it CANNOT drift
+		     A rule the build enforces mechanically supersedes the rule
+		     nobody remembers to follow. -->
+		<Version>$(ApplicationDisplayVersion)</Version>
+		<!-- Build number monotonically increments per Transporter upload.
+		     Apple rejects same-build-number re-uploads for the same version.
+		     Build 1 = 2026-05-20 19:09 (universal iPhone+iPad, blocked by
+		     missing iPad screenshots).
+		     Build 2 = 2026-05-20 ~19:30 (iPhone-only per Info.plist
+		     UIDeviceFamily fix, App Store-ready). Submitted to Apple;
+		     rejected 2026-05-22 under Guideline 2.1(a) — reviewer
+		     couldn't pair without a real bootloader URL.
+		     Build 3 = 2026-05-22 (App Review demo-mode landed in
+		     Home.razor: pairing code "000000" + sentinel URL
+		     "demo://recto-app-review" short-circuit the HTTP pairing
+		     handshake. Real biometric + real Secure Enclave signing
+		     still fire so the reviewer sees the full UX). This build
+		     is ALSO the first Android AAB to ship with the demo-mode
+		     change, so the Google Play closed-test cohort gets the
+		     same offline-pairing capability for free.
+		     Build 4 = 2026-05-25 night (v1.0.1 rebrand build: phone
+		     home-screen label flip "Recto" -> "Recto Agentic" matching
+		     the Apple App Store Connect v1.0.1 metadata rename + the
+		     Google Play Console Main store listing rename to "Recto
+		     Agentic". Bundled with the rename: ApplicationDisplayVersion
+		     1.0 -> 1.0.1 (first user-visible content version bump since
+		     v1.0 launched 2026-05-25 morning), ApplicationVersion 3 -> 4
+		     (monotonic ascending). This build ships to BOTH stores in
+		     one push: replaces the metadata-only v1.0.1 path on Apple's
+		     App Store Connect (now becomes a full build replacement
+		     attached to v1.0.1) AND satisfies the Google Play Closed
+		     Testing 14-day window's "Release at Least One App Update
+		     During the 14 Days" recommendation (PrimeTestLab guidance:
+		     "Google looks for active engagement from the developer
+		     during the closed testing period"). Closed-testing tester
+		     pool + 14-day clock continue uninterrupted; the new AAB
+		     just gets delivered to the existing 12 testers
+		     automatically via Play Store update path. Screenshots
+		     captured for v1.0 (build 3) stay valid for v1.0.1 — the
+		     UX is unchanged; only the home-screen label + version
+		     string differ.
+		     ApplicationDisplayVersion bumps to 1.0.1 BECAUSE the
+		     phone home-screen label change is a user-visible content
+		     change worthy of a SemVer patch bump per the
+		     "user-visible version bumps when content changes" rule
+		     banked in the Build 3 docstring above.
+		     Android VersionCode shares this ApplicationVersion field
+		     by default, so Play Console will see VersionCode=4 too. -->
+		<!-- Build 5 = 2026-06-02 (Apple App Store rejection recovery
+		     for 1.0.1 (4) under Guideline 2.1(a) — reviewer's
+		     "error message still displays" was the raw Secure Enclave
+		     OSStatus surfacing when biometric not enrolled). Build 5
+		     ships SEVEN hardening fixes:
+		       1. EnclaveErrors helper translates raw OSStatus / LAError /
+		          Android KeyStore exceptions to actionable user messages.
+		       2. IBiometricsAvailability pre-flight check via
+		          LAContext.canEvaluatePolicy / BiometricManager.canAuthenticate
+		          so we detect "Face ID not enrolled" BEFORE keygen attempt.
+		       3. Demo banner hoisted + restyled (App Store reviewer
+		          paragraph FIRST + prominent cyan card before any other
+		          prose). Reviewer cannot miss the "000000" instruction.
+		       4. Bootloader URL field auto-collapses when "000000" typed
+		          (visual confirmation the demo path is the right input).
+		       5. "Start fresh" button on paired demo banner so reviewer
+		          can re-enter pairing flow without going through Settings.
+		       6. Native QR scanner replacing ZXing.Net.Maui v0.4.0
+		          (iOS AVFoundation + Android CameraX 1.5+ + ML Kit;
+		          ZXing crashed on both iOS first-permission-grant and
+		          Android 16 16KB-page-alignment).
+		       7. App Review Notes refreshed operator-side after build
+		          (clears Build 4's misleading Notes content per IM
+		          banking).
+		     ApplicationDisplayVersion 1.0.1 -> 1.0.2 (SemVer patch bump
+		     because user-visible UX changed: demo banner + Start fresh
+		     button + biometric pre-flight messages are visible to all
+		     users, not just reviewers). -->
+		<!-- Build 6 = 2026-06-02 (post-Build-5-rejection hardening +
+		     pivot). Apple App Store 1.0.1 (4) rejection cycle exposed
+		     two distinct gaps that Build 5's native QR scanner didn't
+		     fix (and in one case made worse): (a) warm-start
+		     consumer gap — recto:// URLs tapped from OS Camera while
+		     Recto Agentic was already foregrounded silently dropped
+		     because OnInitializedAsync only fires once per page
+		     mount; (b) Android 16 ZXing crash + iOS first-permission-
+		     grant trap both got worse on the reviewer's specific
+		     test device because the in-app camera path is structurally
+		     bigger than the OS Camera off-app + recto:// deep-link
+		     path. Build 6 ships FIVE changes:
+		       1. PayloadArrived event on IPairDeepLinkState closes
+		          the warm-start gap. Home.razor subscribes in
+		          OnInitializedAsync, unsubscribes in DisposeAsync,
+		          shares routing logic with cold-launch via
+		          ProcessPairDeepLinkPayloadAsync helper.
+		       2. In-app QR scanner FULLY RETIRED. IQrScannerService
+		          interface + IosQrScannerService + AndroidQrScannerService
+		          + NullQrScannerService + QrScannerActivity +
+		          AndroidCameraXBridge all deleted. CameraX + ML Kit
+		          BarcodeScanning + AndroidX.Camera package refs
+		          dropped from this csproj. CAMERA permission + camera
+		          hardware feature dropped from AndroidManifest.xml.
+		          NSCameraUsageDescription dropped from Info.plist.
+		          OS Camera + recto:// URL-scheme deep-link is the
+		          canonical scan path on both platforms.
+		       3. Per-service unpair UI added to Connected Services
+		          panel. Tap a service row -> Open detail card ->
+		          "Unpair this service" button -> inline two-step
+		          confirm -> Registry.UnpairAsync removes local entry.
+		          v1 LOCAL-only (consumer-side master pubkey binding
+		          not revoked); v1.x ships server-side
+		          devices:pairing_revoke endpoint per architectural
+		          commitment #9.
+		       4. Demo mode integrated as a Connected Services entry.
+		          When demo mode activates, the Demo Service row
+		          appears in the list with the canonical sentinel
+		          AppId "demo-service". Tapping it surfaces the same
+		          per-service unpair UI which routes to
+		          HandleStartFreshClick — the canonical demo-mode
+		          exit ceremony. The "Start fresh" button in the demo
+		          banner stays as a parallel UX path.
+		       5. App Review Notes refreshed operator-side after
+		          build (clears Build 5's misleading Notes per IM
+		          banking).
+		     ApplicationDisplayVersion 1.0.2 -> 1.0.3 (SemVer patch
+		     bump because user-visible UX changed: per-service unpair
+		     UI is visible to all paired users, not just reviewers).
+		     ApplicationVersion 5 -> 6 (monotonic ascending per
+		     Apple's same-build-rejection rule). -->
+		<!-- Build 7 = 2026-06-02 night (end-user first-pair UX —
+		     LAUNCH-BLOCKING for the first downstream-consumer public
+		     launch). Build 6
+		     closed the App Store rejection cycle and shipped per-
+		     service unpair + demo-mode-as-Connected-Service. But
+		     the closing sprint surfaced an architectural gap: end
+		     users have no path to pair from a fresh install because
+		     today's pairing flow assumes the operator already knows
+		     a bootloader URL. Real users don't know what a
+		     "bootloader" is and shouldn't have to.
+		     Build 7 ships THREE substrate-side changes:
+		       1. PairDeepLinkPayload extended with optional
+		          BootstrapBootloaderUrl + BootstrapPairCode fields.
+		          PairDeepLinkParser extracts them from
+		          bootstrap_bootloader= + bootstrap_pair_code= query
+		          params on Service-kind QRs. Validation: 6-digit
+		          numeric bootstrap_pair_code; silently dropped on
+		          shape-fail; ignored on Bootloader-kind QRs.
+		       2. Home.razor's ProcessPairDeepLinkPayloadAsync gains
+		          a first-pair branch: when the QR is Service-kind +
+		          phone has no bootloader paired + bootstrap fields
+		          present, pre-fill the bootloader form + stash the
+		          Service-pair code + render a green confirmation
+		          banner above the unpaired pair card. HandlePairClick's
+		          post-success path detects the pending Service-pair
+		          code and auto-fires HandlePairServiceClick after the
+		          bootloader pair lands. Single tap covers both phases.
+		       3. Vault Home empty-state copy refreshed for end-user
+		          discoverability: explicit "Open a service on the
+		          web -> tap Pair my phone -> scan the QR" path.
+		     Server-side coordination (the consumer's account-settings
+		     Pair phone surface emitting the bootstrap QR via the
+		     bootloader's challenge-mint + Phase H pairing/start
+		     stitch) ships in lockstep on the consumer side. Both
+		     deploy together; the substrate is a no-op until consumers
+		     emit the new field shape.
+		     ApplicationDisplayVersion 1.0.3 -> 1.0.4 (SemVer patch
+		     bump because user-visible UX changed: first-pair
+		     ceremony + updated empty-state copy are visible to all
+		     unpaired users).
+		     ApplicationVersion 6 -> 7 (monotonic ascending per
+		     Apple's same-build-rejection rule).
+		     Build 8 (2026-06-03 night, Pixel warm-start deep-link
+		     fix): Android MainActivity LaunchMode upgrade SingleTop
+		     -> SingleTask resolves the "Recto opens on top of its
+		     own app" bug Erik hit on Pixel — Google Camera fires
+		     the deep-link intent with Intent.FLAG_ACTIVITY_NEW_TASK
+		     and SingleTop's "reuse only if at top of task" semantic
+		     fails when the Recto task is buried in recents, so
+		     Android spawns a NEW MainActivity in a NEW task rather
+		     than reusing the backgrounded one. SingleTask is
+		     stricter: ONE MainActivity exists system-wide; new
+		     intents ALWAYS route via OnNewIntent. ApplicationDisplay
+		     Version 1.0.4 -> 1.0.5 (SemVer patch — bug fix, no UX
+		     change). ApplicationVersion 7 -> 8 (monotonic per
+		     Apple's same-build-rejection rule + Android versionCode
+		     bump invalidates the MAUI BlazorWebView resource cache
+		     so sideload reinstalls pick up the new bytecode without
+		     requiring an uninstall+reinstall cycle — banked gotcha
+		     in Recto/CLAUDE.md).
+		     Build 9 (2026-06-03 night, About-card build-number
+		     cosmetic fix): the FileVersion template below got
+		     authored for 2-segment ApplicationDisplayVersion ("1.0"
+		     -> "1.0.0.N" / parts[3]=N) and silently broke once we
+		     bumped to 3-segment patch versions ("1.0.5" produces
+		     "1.0.5.0.N" — 5 segments — and parts[3] is the synthetic
+		     ".0." filler not the build number). Builds 4..8 all
+		     rendered "(0)" in the Settings About card instead of
+		     the real build number. Fixed by dropping the ".0."
+		     filler from the FileVersion template AND defensively
+		     making the parser take the LAST segment regardless of
+		     length. ApplicationVersion 8 -> 9 to monotonic-increment
+		     per Apple + iOS CFBundleVersion rule + sister to the
+		     Build 8 sideload-cache invalidation pattern.
+		     Build 10 (2026-06-04, App Review -25293 graceful-degrade):
+		     Apple App Store 1.0.1 (4) rejection cycle ended with the
+		     reviewer's iPad screenshot 2026-06-01 showing the raw
+		     OSStatus -25293 / "Failed to generate keypair" error on
+		     the demo-mode Pair button. Root cause confirmed by code
+		     audit: RunDemoPairFlowAsync called EnclaveKeys.GenerateAsync
+		     unconditionally, and on iOS that routes through
+		     IosSecureEnclaveKeyService which requires
+		     BiometryCurrentSet | PrivateKeyUsage. Apple's test devices
+		     don't enroll Face ID or set a passcode, so the keygen
+		     returned errSecAuthFailed (-25293) and demo mode aborted
+		     mid-flow with a raw OSStatus error message. Build 5's
+		     biometric pre-flight check surfaced a friendlier message
+		     in the banner area but didn't unblock the actual demo
+		     completion. Build 10 makes demo-mode keygen + sign
+		     graceful-degrade: try the real Secure Enclave path first
+		     (real users with biometric enrolled — no behavior
+		     change), fall through to a synthetic 64-zero-byte
+		     ecdsa-p256 publicKey + skip SignAsync if keygen fails
+		     (-25293 or anything else). Demo mode never transmits the
+		     key, so cryptographic validity is irrelevant for the
+		     "Paired with demo://recto-app-review" end state. App
+		     Review reviewers and any first-launch user without
+		     biometric now complete demo mode end-to-end. Replied to
+		     Apple's June 1 follow-up message in App Store Connect
+		     2026-06-04 ("fixed in Build 10"). ApplicationDisplay
+		     Version stays at 1.0.5 (no marketing-version bump — bug
+		     fix in a code path that's only reached by users without
+		     biometric enrolled, which is < 1% of the install base).
+		     ApplicationVersion 9 -> 10 per Apple's same-build-
+		     rejection rule.
+		     Build 11 (2026-07-11, production-substrate store update):
+		     rides the server-side production-scale trilogy (Postgres
+		     state backend + Azure Key Vault SecretSource + silent-push
+		     wake senders). Phone-side slice 1 ships TWO changes:
+		       1. Challenge-signing convention fix: the pairing + revoke
+		          flows now sign the LITERAL ASCII bytes of the base64url
+		          challenge string (was base64url-DECODING first). This
+		          matches the bootloader's canonical verifier; the
+		          server's temporary decode-fallback leniency is retired
+		          once this build saturates the rollout.
+		       2. Remote per-service unpair: HandleConfirmUnpairServiceAsync
+		          now mints a devices:pairing_revoke JWS and relays it
+		          through /v0.4/devices/unpair to the consumer's
+		          /api/v1/devices/pairing/revoke BEFORE local removal
+		          (remote-first, fail-loud). Closes the local-only gap
+		          Build 6 left — the consumer NULLs the master-pubkey
+		          binding so re-pair works without a manual DB edit.
+		     ApplicationDisplayVersion 1.0.5 -> 1.0.6 (user-visible
+		     behavior change: the crypto handshake + real unpair). Version
+		     pin realigned to 1.0.6 (was drifted at 1.0.4).
+		     ApplicationVersion 10 -> 11 per Apple's same-build rule.
+
+		     Build 12 (2026-07-11): slice 2 lands as its own store build —
+		     (1) multi-URL failover (parse+persist bootloader_urls, rotate on
+		     connection failure), (2) mnemonic backup/import ceremony
+		     (biometric-gated reveal + confirm-by-re-entry + destructive
+		     restore), (3) silent-push wake receive (APNs/FCM handlers raise
+		     IPushWakeSignal -> immediate pending-fetch; polling stays the
+		     fallback, e2e-gated on Phase-2 push-cred provisioning).
+		     ApplicationDisplayVersion 1.0.6 -> 1.0.7,
+		     ApplicationVersion 11 -> 12 per Apple's same-build rule.
+		     12 -> 13 (2026-07-25): staging sideload against the rebuilt
+		     bootloader (user-vault substrate, bd7cb73) — the sideload
+		     house rule bumps versionCode every cycle so the BlazorWebView
+		     resource cache invalidates (Build 8 gotcha).
+		     13 -> 14 (2026-07-25): per-bootloader unpair ships; 13 was
+		     sideload-only (never uploaded), so 14 stays monotonic for
+		     both store lanes AND invalidates the WebView cache over the
+		     operator's sideloaded 13. -->
+		<ApplicationVersion>14</ApplicationVersion>
+		<!-- Mirror ApplicationDisplayVersion + ApplicationVersion into the
+		     .NET assembly metadata so System.Reflection at runtime can
+		     read the build number. MAUI's <ApplicationVersion> ONLY
+		     propagates to iOS CFBundleVersion + Android VersionCode;
+		     it does NOT touch AssemblyFileVersion or
+		     AssemblyInformationalVersion, which default to "1.0.0.0"
+		     and "1.0.0" respectively unless overridden here. Without
+		     these overrides, Settings.razor's ResolveAppVersion()
+		     reads "1.0.0.0" from AssemblyFileVersion + reports
+		     "v1.0 (0)" instead of "v1.0 (4)". Banked 2026-05-22
+		     evening after the iPhone 17 Pro Max simulator capture
+		     surfaced the stale build number on the Settings About
+		     page.
+
+		     Build 9 update (2026-06-03 night): the prior template
+		     "$(ApplicationDisplayVersion).0.$(ApplicationVersion)"
+		     produced "1.0.0.N" (4 segments, build in parts[3]) ONLY
+		     when ApplicationDisplayVersion was 2-segment ("1.0").
+		     The moment patch-version bumps landed (1.0.2, 1.0.3,
+		     1.0.4, 1.0.5), the template produced "1.0.5.0.N" — 5
+		     segments — and Settings.razor's ResolveAppVersion()
+		     parser read parts[3] = the ".0." filler ("0"), NOT the
+		     real build number at parts[4]. Builds 4..8 silently
+		     rendered "v1.0.5 (0)" in the About card instead of
+		     "v1.0.5 (N)". Caught 2026-06-03 night via iPhone Build
+		     8 sideload smoke. Canonical fix: drop the ".0." filler
+		     so the template produces 4-segment FileVersion regardless
+		     of how many segments ApplicationDisplayVersion has.
+		     Sister parser fix in Settings.razor takes the LAST
+		     segment instead of parts[3] as defense-in-depth against
+		     future template drift. -->
+		<FileVersion>$(ApplicationDisplayVersion).$(ApplicationVersion)</FileVersion>
+		<InformationalVersion>$(ApplicationDisplayVersion)</InformationalVersion>
+		<!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
+		<WindowsPackageType>None</WindowsPackageType>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
+		<!-- Suppress NETSDK1082 for client RIDs in preview, plus WMC1006 and CS1591 for clean output -->
+		<NoWarn>$(NoWarn);NETSDK1082;WMC1006;CS1591</NoWarn>
+	</PropertyGroup>
+	<!-- iOS device build: wire APNs entitlement + keep full code signing
+	     (real Apple Development cert + provisioning profile required).
+
+	     Entitlements file is configuration-conditional because the
+	     aps-environment value differs by signing posture:
+
+	       Debug   -> Entitlements.plist          (aps-environment=development;
+	                                                 Apple Development profile,
+	                                                 sandbox push gateway)
+	       Release -> Entitlements.Release.plist  (aps-environment=production;
+	                                                 Apple Distribution profile,
+	                                                 live push gateway)
+
+	     Without this split, Release builds against the Recto Phone App Store
+	     provisioning profile emit MT7137 (entitlement/profile mismatch),
+	     AND Apple's automated upload validator rejects the .ipa. Banked
+	     2026-05-20 evening during the App Store submission build. -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-ios')) AND '$(RuntimeIdentifier)' == 'ios-arm64'">
+		<CodesignEntitlements Condition="'$(Configuration)' == 'Release'">Platforms/iOS/Entitlements.Release.plist</CodesignEntitlements>
+		<CodesignEntitlements Condition="'$(Configuration)' != 'Release'">Platforms/iOS/Entitlements.plist</CodesignEntitlements>
+	</PropertyGroup>
+	<!-- iOS AOT workaround: .NET SDK 10.0.203 + the current dependency
+	     graph (FluentValidation reflection scan, Scrutor assembly-scan,
+	     Microsoft.Extensions.DependencyInjection's AOT-fragile open-
+	     generic registrations from AddValidatorsFromAssembly, etc.)
+	     SIGABRT inside the Mono runtime at app launch when each is
+	     full-AOT compiled. Switching the entire iOS build to the Mono
+	     interpreter sidesteps the AOT loader entirely. The interpreter
+	     is permitted by Apple for development-signed builds (which we
+	     are: Apple Development cert + provisioning profile). App is
+	     measurably slower at startup but signing / pairing / coin
+	     approvals all work. Once the upstream package(s) ship clean
+	     AOT modules under SDK 10.0.203 the interpreter switch can flip
+	     back to selective MtouchInterpreter or full AOT. -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-ios'))">
+		<UseInterpreter>true</UseInterpreter>
+	</PropertyGroup>
+	<!-- iOS Simulator build: signing must stay ON (modern iOS Simulator
+	     refuses to launch unsigned binaries; crashes with
+	     "Namespace CODESIGNING, Code 2, Invalid Page" in the termination
+	     reason and the bundle gets denylisted by SpringBoard). What we
+	     need is signing-without-a-provisioning-profile: ad-hoc signing
+	     (CodesignKey='-' tells codesign to sign with a self-attested
+	     identity that simulator accepts) plus suppressing the
+	     provisioning-profile requirement that the _DetectSigningIdentity
+	     MSBuild target enforces by default. No entitlements applied
+	     (simulator doesn't have APNs anyway). -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-ios')) AND ('$(RuntimeIdentifier)' == 'iossimulator-arm64' OR '$(RuntimeIdentifier)' == 'iossimulator-x64' OR '$(RuntimeIdentifier)' == '')">
+		<CodesignKey>-</CodesignKey>
+		<CodesignRequireProvisioningProfile>false</CodesignRequireProvisioningProfile>
+	</PropertyGroup>
+	<!-- Android Release signing for Google Play Console upload (banked 2026-05-21).
+	     Sister of the iOS Configuration-conditional Entitlements pattern above.
+
+	     Configuration-conditional because Debug builds use MAUI's default
+	     debug keystore (auto-generated, useful for adb sideload to Pixel
+	     during development) and Release builds use the upload keystore
+	     bound to the Play Console listing.
+
+	     Why the upload keystore is sacred:
+	       - Play Console binds each app to ONE upload key fingerprint at
+	         first AAB upload. Subsequent uploads must be signed with the
+	         SAME key or Play Console rejects them.
+	       - Losing the upload keystore = can't ship updates. Recovery
+	         requires Google's upload-key-reset flow (~1 week turnaround,
+	         operator must prove identity).
+	       - Play App Signing (default for new accounts) means Google
+	         re-signs the AAB with the production app-signing key before
+	         delivery to devices. The upload key is just for proving "this
+	         is the same developer" between uploads.
+
+	     Keystore location, alias, and passwords are operator-supplied:
+	       AndroidSigningKeyStore path uses $(HOME) which resolves to
+	         the build host's home directory regardless of OS. The actual
+	         file lives at ~/keystores/recto-upload.keystore on the build
+	         host and is gitignored.
+	       AndroidSigningKeyAlias = "upload" (operator-chosen, stable name
+	         used in every Play Console submission).
+
+	     Passwords MUST NEVER be embedded in this csproj — they get passed
+	     via the build command as MSBuild properties:
+	         dotnet publish -f net10.0-android -c Release \
+	           -p:AndroidSigningKeyPass=$KEYSTORE_PASS \
+	           -p:AndroidSigningStorePass=$KEYSTORE_PASS
+	     The env-var $KEYSTORE_PASS gets sourced from the operator's
+	     ~/.zprofile (out-of-tree, never committed). See DEPLOY.md for
+	     the canonical AAB build recipe.
+
+	     AndroidPackageFormat=aab emits the App Bundle format Play Console
+	     requires (APK is deprecated for new submissions since 2021). -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-android')) AND '$(Configuration)' == 'Release'">
+		<AndroidKeyStore>true</AndroidKeyStore>
+		<AndroidSigningKeyStore>$(HOME)/keystores/recto-upload.keystore</AndroidSigningKeyStore>
+		<AndroidSigningKeyAlias>upload</AndroidSigningKeyAlias>
+		<AndroidPackageFormat>aab</AndroidPackageFormat>
+	</PropertyGroup>
+	<ItemGroup>
+		<!-- App Icon -->
+		<MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#1E1B4B" />
+		<!-- Splash Screen -->
+		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#1E1B4B" BaseSize="128,128" />
+		<!-- Images -->
+		<MauiImage Include="Resources\Images\*" />
+		<MauiImage Update="Resources\Images\dotnet_bot.svg" BaseSize="168,208" />
+		<!-- Custom Fonts -->
+		<MauiFont Include="Resources\Fonts\*" />
+		<!-- Raw Assets (also remove the "Resources\Raw" prefix) -->
+		<MauiAsset Include="Resources\Raw\**" LogicalName="%(RecursiveDir)%(Filename)%(Extension)" />
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+		<PackageReference Include="Microsoft.Extensions.Http" />
+		<PackageReference Include="Microsoft.Maui.Controls" />
+		<PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Debug" />
+		<PackageReference Include="Microsoft.Maui.Controls.Compatibility" />
+		<!-- ZXing.Net.Maui RETIRED 2026-06-02 (Build 5 sprint).
+		     Both `ZXing.Net.Maui` and `ZXing.Net.Maui.Controls` crashed:
+		       - iOS: AVFoundation permission-flow race / SIGTRAP on
+		         first camera-permission grant (regression in v0.4.0).
+		       - Android 16: 16KB-page-alignment crash in
+		         libimage_processing_util_jni.so + libdatastore_shared_
+		         counter.so (the .so files were built against legacy
+		         4KB page size; Android 16 mandates 16KB-aligned natives).
+		     Replaced with platform-native bindings per Recto Hard Rule:
+		     MAUI hardware surfaces use platform-native bindings, NOT
+		     community MAUI-abstraction libraries. See Build 5 IM banking
+		     for the architectural commitment.
+		     New bindings (Android-only ItemGroup below):
+		       - Xamarin.AndroidX.Camera.Camera2 (CameraX 1.5+;
+		         16KB page-aligned natives)
+		       - Xamarin.AndroidX.Camera.Lifecycle
+		       - Xamarin.AndroidX.Camera.View
+		       - Xamarin.Google.MLKit.BarcodeScanning
+		     iOS uses AVFoundation directly (no NuGet package needed). -->
+		<!-- <PackageReference Include="ZXing.Net.Maui" /> -->
+		<!-- <PackageReference Include="ZXing.Net.Maui.Controls" /> -->
+		<!-- BouncyCastle dropped from Recto/ wave 4 — the crypto classes
+		     (EthSigningOps, Bip39, Bip32, Bip39Wordlist) moved to
+		     Recto.Shared so they're reachable from Recto.Shared.Tests.
+		     The package reference + embedded wordlist resource live
+		     there. MauiEthSignService stays here because it depends on
+		     Microsoft.Maui.Storage. -->
+	</ItemGroup>
+	<!-- Apple Privacy Manifest (PrivacyInfo.xcprivacy) — required by
+	     Apple for App Store submissions since May 2024. Per-platform
+	     copies because Apple requires the file at the iOS / Mac Catalyst
+	     app-bundle roots independently. Content kept byte-for-byte
+	     identical between the two — any revision updates BOTH in the
+	     same edit. See Recto/docs/app-store/submission-packet.md for
+	     the canonical rationale (zero data collected, zero tracking,
+	     four Required Reason API declarations covering common .NET
+	     runtime + MAUI framework code paths). -->
+	<ItemGroup Condition="$(TargetFramework.Contains('-ios'))">
+		<BundleResource Include="Platforms\iOS\PrivacyInfo.xcprivacy" LogicalName="PrivacyInfo.xcprivacy" />
+	</ItemGroup>
+	<ItemGroup Condition="$(TargetFramework.Contains('-maccatalyst'))">
+		<BundleResource Include="Platforms\MacCatalyst\PrivacyInfo.xcprivacy" LogicalName="PrivacyInfo.xcprivacy" />
+	</ItemGroup>
+	<ItemGroup Condition="$(TargetFramework.Contains('-android'))">
+		<PackageReference Include="Xamarin.AndroidX.Biometric" />
+		<PackageReference Include="Xamarin.Firebase.Messaging" />
+		<!-- Build 6 (2026-06-02): CameraX 1.5+ + ML Kit BarcodeScanning
+		     package refs retired alongside the in-app QR scanner
+		     (Build 5's solution to the ZXing.Net.Maui crashes). The
+		     OS Camera handles the QR-scan UX off-app; recto:// URL
+		     scheme deep-link picks the payload back up via
+		     MainActivity.OnNewIntent. Net result: smaller .apk size,
+		     no native-binding maintenance burden, and the canonical
+		     "scan QR with OS Camera, tap banner" UX every user
+		     already knows from every QR-using context. -->
+		<!-- <PackageReference Include="Xamarin.AndroidX.Camera.Camera2" /> -->
+		<!-- <PackageReference Include="Xamarin.AndroidX.Camera.Lifecycle" /> -->
+		<!-- <PackageReference Include="Xamarin.AndroidX.Camera.View" /> -->
+		<!-- <PackageReference Include="Xamarin.Google.MLKit.BarcodeScanning" /> -->
+		<!-- Picked up by the Xamarin.Firebase.Messaging build target. The
+		     file is dropped into Platforms/Android/ during the Firebase
+		     Console ceremony (see dev-tools/README.md Track A) and is
+		     gitignored as part of the entire phone/ tree. The conditional
+		     Exists() guard avoids the build failing when the file isn't
+		     yet present, e.g. when building the iOS / Mac Catalyst /
+		     Windows targets only. -->
+		<GoogleServicesJson Include="Platforms\Android\google-services.json"
+		                    Condition="Exists('Platforms\Android\google-services.json')" />
+	</ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\Recto.Shared\Recto.Shared.csproj" />
+	</ItemGroup>
+</Project>

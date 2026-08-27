@@ -1,0 +1,218 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recto-core"
+# PACKAGING.md → "PyPI package name: recto-core". The historical name
+# "recto" in this file's prior versions was a placeholder; canonical
+# distribution name at v1.0 is recto-core (the Substrate tier).
+# The Python import name remains `recto` (per repo layout); PyPI users
+# install via `pip install recto-core` and import as `import recto`.
+version = "1.0.0"
+description = "Phone-enclave-rooted capability authorization substrate for autonomous agents. Cross-platform service supervision, vault-backed secrets, capability JWS verification."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{name = "Erik Cheatham"}]
+keywords = ["capability-authorization", "service-manager", "credentials", "devops", "ai-agents", "biometric-signing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "types-PyYAML>=6.0",
+]
+aws = ["boto3>=1.34"]
+vault = ["hvac>=2.0"]
+azure = [
+    "azure-identity>=1.17",         # DefaultAzureCredential (Managed Identity chain)
+    "azure-keyvault-secrets>=4.8",  # SecretClient
+]  # `pip install recto[azure]` enables the azure-keyvault SecretSource
+   # (recto.secrets.azure_keyvault.AzureKeyVaultSource) -- the production
+   # cloud vault for load-balanced deployments where dpapi-machine's
+   # Windows-machine-bound blobs can't roam. One shared Key Vault +
+   # Managed Identity; see docs/production-scale-brief.md.
+keychain = []  # macOS uses /usr/bin/security CLI (stdlib only)
+secret-service = ["secretstorage>=3.3"]
+postgres = [
+    "psycopg[binary,pool]>=3.1",  # PostgresStateStore -- shared-state backend
+]
+push = [
+    "httpx[http2]>=0.27",  # APNs is HTTP/2-only; FCM rides the same client
+]  # `pip install recto[push]` enables the bootloader's silent-push wake
+   # senders (recto.bootloader.push): APNs + FCM send-side so queued
+   # requests wake the target phone instead of relying on tight polling.
+   # JWT minting for provider auth uses pyjwt[crypto] from recto[v0_4].  # `pip install recto[postgres]` enables the production multi-instance
+   # state backend (recto.bootloader.state_postgres.PostgresStateStore):
+   # N bootloader instances behind a load balancer sharing one Postgres
+   # database. The file-backed StateStore stays the zero-setup default;
+   # this extra is opt-in production config. See
+   # docs/production-scale-brief.md for the deployment shape.
+otel = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+]  # `pip install recto[otel]` to enable spec.telemetry tracing
+v0_4 = [
+    "cryptography>=42",     # Ed25519 sign/verify via the cryptography backend
+    "pyjwt[crypto]>=2.8",   # JWT EdDSA encode/verify (pulls cryptography too)
+]  # `pip install recto[v0_4]` to enable phone-resident vault
+   # (recto.bootloader, recto v0.4 register/revoke CLI). The phone app
+   # itself is a separate MAUI Blazor project under /phone; this extra
+   # only covers the Recto-side dependencies for the bootloader. (The
+   # in-process test signer moved to tests/enclave_stub.py 2026-08-05
+   # and no longer ships in the package; the test suite still needs
+   # this extra for its Ed25519 primitives.)
+ethereum = []
+   # `pip install recto[ethereum]` enables the eth_sign credential kind
+   # (recto.ethereum module: Keccak-256, EIP-191 / EIP-712 hashing,
+   # secp256k1 ECDSA verify + public-key recovery, EIP-55 checksum
+   # addresses). The implementation is pure Python stdlib — int /
+   # hashlib / no native dependencies — so this extra adds NO new
+   # packages to the dep tree. The empty list is intentional: the
+   # extra exists purely to gate the import path so consumers without
+   # ETH-credential needs can ignore the module. Sign-side primitives
+   # (BIP39 mnemonic, BIP32/BIP44 derivation, secp256k1 sign with
+   # v-recovery) live phone-side in the MAUI Blazor project, NOT in
+   # this Python module — private keys never touch the launcher tier.
+bitcoin = []
+   # `pip install recto[bitcoin]` enables the btc_sign credential kind
+   # (recto.bitcoin module: RIPEMD-160 + HASH160, double-SHA-256,
+   # bech32 / bech32m encoding per BIP-173 / BIP-350, BIP-137 signed-
+   # message hashing, P2WPKH / P2PKH / P2SH-P2WPKH address derivation,
+   # BIP-137 compact signature parse + recover). Same posture as the
+   # ethereum extra: pure Python stdlib + a delegation to recto.ethereum
+   # for the secp256k1 verify primitive (same curve). No new packages.
+   # Empty list is intentional. Sign-side primitives live phone-side in
+   # MAUI Blazor under the SAME BIP-39 mnemonic the eth_sign service
+   # uses — one mnemonic, two BIP-44 trees (m/44'/60' for ETH,
+   # m/84'/0' for BTC native SegWit).
+ed25519 = []
+   # `pip install recto[ed25519]` enables the ed_sign credential kind
+   # (recto.solana / recto.stellar / recto.ripple modules: base58 + base32
+   # StrKey + Ripple-flavored base58 address encodings, CRC16-XMODEM,
+   # XRP HASH160 with 0xED ed25519 prefix, per-chain message hashing).
+   # Address encoding and message hashing are pure Python stdlib (the
+   # XRP module borrows recto.bitcoin.ripemd160 for HASH160, also
+   # pure-stdlib). Empty list is intentional — no new packages added.
+   # Signature verification (the optional verify_signature path on each
+   # chain module) requires `cryptography>=42` to be installed; this is
+   # pulled in transitively via `recto[v0_4]` when the bootloader is
+   # active. Stand-alone verifier callers should `pip install recto[v0_4]`
+   # to get cryptography. Sign-side primitives (BIP-39 → SLIP-0010
+   # ed25519 derivation, ed25519 sign with the chain-specific message
+   # hash) live phone-side in the MAUI Blazor project — same BIP-39
+   # mnemonic as eth_sign and btc_sign, three new SLIP-10 trees:
+   # m/44'/501'/N'/0' (SOL), m/44'/148'/N' (XLM), m/44'/144'/0'/0'/N'
+   # (XRP-ed25519, all hardened). One mnemonic, five chain-coin trees.
+tron = []
+   # `pip install recto[tron]` enables the tron_sign credential kind
+   # (recto.tron module: TIP-191 message hashing, base58check address
+   # encoding with version byte 0x41, secp256k1 ECDSA recovery).
+   # Empty list is intentional -- no new packages added beyond the
+   # ethereum extra: pure Python stdlib + delegation to
+   # recto.ethereum for keccak256 + secp256k1 recovery. The phone-side
+   # service reuses the same BIP-39 mnemonic as eth_sign / btc_sign at
+   # SLIP-0044 coin-type 195: m/44'/195'/0'/0/N (standard secp256k1
+   # BIP-32 path; SLIP-0010 ed25519 doesn't apply here -- TRON is
+   # secp256k1, not ed25519). One mnemonic, six chain-coin trees.
+qr = [
+    "qrcode>=7.4",  # BSD-licensed, mainline Python QR encoder
+    "Pillow>=10.0", # HPND-licensed, required by qrcode for PNG output
+]
+   # `pip install recto[qr]` enables the QR-as-visual-transport
+   # substrate primitive (recto.qr module: encode signed JWS payloads
+   # or structured QRPayloadV1 envelopes as QR PNG/SVG images;
+   # multi-witness contract operations for chain-of-trust artifacts
+   # that grow as witnesses sign). Phase 1 of the artifact-as-
+   # canonical-record canonical pivot banked 2026-05-20 morning per
+   # Recto/CLAUDE.md "QR-as-visual-transport" section + Hard Rule
+   # #13. v1 ships ENCODE-only (PNG + SVG output via qrcode + Pillow);
+   # decode (QR image -> JWS string) is deferred to v2 because Recto
+   # Phone has its own native QR scanner via MAUI Blazor and Python
+   # decode would require pyzbar/zxing-cpp (native deps). Canonical
+   # consumers: Recto Phone v1.1 TLS pin disclosure (Phase 4 polish
+   # via the recto/qr/ substrate); consumer citation receipts; THRU
+   # transaction receipts; Creator's Corner v2 agent leases;
+   # chat-tier civic-office model promotion certificates; Hard Rule
+   # #24 manumission ceremony multi-witness contracts. SVG output
+   # available via qrcode's built-in SVG factory (no Pillow dep for
+   # that path). See recto/qr/SPEC.md for the wire-format spec.
+
+[project.urls]
+Homepage = "https://github.com/erikcheatham/Recto"
+Repository = "https://github.com/erikcheatham/Recto"
+Issues = "https://github.com/erikcheatham/Recto/issues"
+Documentation = "https://github.com/erikcheatham/Recto/blob/main/README.md"
+Changelog = "https://github.com/erikcheatham/Recto/blob/main/CHANGELOG.md"
+
+[project.scripts]
+recto = "recto.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["recto*"]
+exclude = ["tests*", "examples*", "scripts*", "phone*"]
+
+[tool.setuptools.package-data]
+# Non-Python files that ship as part of the wheel. The capability
+# action manifest is loaded at runtime by the bootloader's verifier
+# (recto.capability.manifest) and MUST be present in the installed
+# package — otherwise `recto-core[v0_4]` consumers get a FileNotFoundError
+# at first capability verification.
+"recto.capability" = ["manifest_v1.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["recto"]
+# `_launcher_part2.py` was a transitional stub from v0.1; exclude in
+# case it ever resurfaces in a stale checkout.
+omit = ["recto/_launcher_part2.py"]
+
+[tool.coverage.report]
+# The Win32 ctypes blocks in joblimit.py + secrets/credman.py and the
+# OTel-SDK-installed path in telemetry.py are marked `# pragma: no
+# cover` inline -- they only execute on Windows (or with the [otel]
+# extra installed). The cross-platform Linux suite covers everything
+# else; Darwin's smoke run exercises the platform-specific paths.
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

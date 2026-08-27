@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Recto Phone — Apple Privacy Manifest (PrivacyInfo.xcprivacy)
+        Required by Apple for all iOS app submissions since May 2024.
+
+        Recto Phone's privacy posture (canonical reference at
+        Recto/docs/app-store/submission-packet.md):
+
+          - Tracking: NONE.
+          - Data collected: NONE. Pairing keys stay in Secure Enclave;
+            paired bootloader URLs stay on-device; signing-request
+            history stays on-device. Biometric verification is
+            hardware-bound and never leaves the device.
+          - Data shared with third parties: NONE.
+
+        The Required Reason API declarations below cover the system
+        APIs that the .NET MAUI runtime + iOS framework code paths
+        commonly touch, with reason codes appropriate for an app
+        whose use is entirely internal to its own container. These
+        are the canonical Apple-published codes (last verified
+        against Apple's developer docs 2026-05-18).
+    -->
+
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <!--
+            File timestamp APIs (NSFileManager attributesOfItemAtPath,
+            stat(2), etc.). Touched by the .NET runtime when reading
+            SecureStorage backing files + Blazor WebView assets. Use
+            is entirely inside the app's own container.
+
+            Reason C617.1: "Access info about timestamps of files
+            inside an app container, app group container, or CloudKit
+            container."
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+
+        <!--
+            System boot time APIs (mach_absolute_time, etc.). Touched
+            by the .NET / Mono runtime for clock primitives, by Recto
+            for capability_request expiry timing + polling cadence.
+
+            Reason 35F9.1: "Measure time elapsed between events that
+            occur within the app."
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
+            </array>
+        </dict>
+
+        <!--
+            Disk space APIs (NSFileManager attributesOfFileSystem,
+            statfs(2)). Touched by the .NET runtime when writing
+            SecureStorage backing files to verify available capacity
+            before write.
+
+            Reason E174.1: "Determine if disk space is sufficient
+            to write files within the app's container."
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>E174.1</string>
+            </array>
+        </dict>
+
+        <!--
+            UserDefaults APIs (NSUserDefaults). Touched by MAUI's
+            Preferences API which Recto uses for app-bound
+            preferences (paired bootloader URL list, last-used
+            pairing identifier, etc.). All UserDefaults usage is
+            app-bound (not shared via app group with any other
+            process).
+
+            Reason 1C8F.1: "Access UserDefaults to read or write
+            information that is only accessible to the app itself
+            (app-bound, not shared via app group)."
+        -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>1C8F.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

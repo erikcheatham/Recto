@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Release / App Store build entitlements.
+
+      Differs from Entitlements.plist by exactly ONE key: aps-environment.
+
+        Debug   (Entitlements.plist)        -> "development"
+        Release (Entitlements.Release.plist) -> "production"
+
+      Why two files: the Apple Development provisioning profile (used for
+      Xcode device builds + simulator) grants aps-environment for the
+      sandbox push gateway (api.sandbox.push.apple.com). The Apple
+      Distribution / App Store provisioning profile (used for TestFlight
+      + App Store) grants it ONLY for the production gateway
+      (api.push.apple.com). If the entitlement and the profile disagree,
+      MAUI emits warning MT7137 at build time AND Apple's automated
+      validation rejects the .ipa upload AND push notifications would
+      silently fail in production.
+
+      The Release variant is auto-selected when Configuration=Release
+      (see Recto.csproj's CodesignEntitlements conditional). Banked
+      2026-05-20 evening during the App Store submission build —
+      first Release build surfaced MT7137 because the original
+      single-file entitlements was development-only.
+
+      Keychain access group stays explicit on the team-prefixed
+      bundle id (same as the Debug file). TEAMID = JVR35HAKZK; if it
+      ever changes, BOTH plist files must track it.
+    -->
+    <key>aps-environment</key>
+    <string>production</string>
+
+    <key>keychain-access-groups</key>
+    <array>
+        <string>JVR35HAKZK.app.recto.phone</string>
+    </array>
+</dict>
+</plist>

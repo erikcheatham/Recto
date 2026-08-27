@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      APNs environment. "development" builds against the sandbox push
+      gateway (api.sandbox.push.apple.com); "production" goes to the live
+      gateway (api.push.apple.com). Xcode auto-flips this based on the
+      build configuration; for MAUI we set it explicitly. Bumping to
+      "production" requires the matching production push cert / .p8 key
+      registered with the bootloader.
+    -->
+    <key>aps-environment</key>
+    <string>development</string>
+
+    <!--
+      Keychain access group, explicit. On real iPhone with a provisioning
+      profile, iOS derives the implicit access group from the
+      `application-identifier` entitlement that the profile injects
+      (= TEAMID.bundleid = JVR35HAKZK.app.recto.phone). Without an explicit
+      keychain-access-groups entitlement, MAUI's SecureStorage works fine on
+      real hardware because the implicit group covers it.
+
+      On iOS Simulator with `dotnet build` (no provisioning profile, no
+      signing), there's no `application-identifier` to derive from, so the
+      implicit access group is absent and SecureStorage's first Keychain
+      operation fails with `errSecMissingEntitlement` (-34018). The
+      Recto pairing flow's `GetOrCreatePhoneIdAsync` is the first call
+      site that hits this; pairing aborts before the bootloader request
+      fires.
+
+      Adding the team-prefixed bundle id here makes the access group
+      explicit in the entitlement. Backward compatible on real hardware
+      (it matches what was already the implicit default) AND unblocks
+      simulator pairing (the entitlement is honored even without a
+      provisioning profile). If TEAMID ever changes, this string MUST
+      track it.
+    -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>JVR35HAKZK.app.recto.phone</string>
+    </array>
+</dict>
+</plist>

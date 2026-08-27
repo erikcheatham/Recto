@@ -1,0 +1,1149 @@
+/*
+   Recto vault — global design tokens + theming overrides.
+
+   Recto is infrastructure tooling that holds your most-sensitive
+   secrets (BIP-39 mnemonics, capability JWTs, TOTP seeds, PGP keys).
+   The visual language reflects that: deep slate backgrounds, copper/
+   gold accent reserved for the primary trust path, monospace brand
+   mark, sober color use. Two semantic axes are surfaced as separate
+   accent families:
+
+     --rec-accent        copper-gold; primary brand + Home pill
+     --rec-cat-tokens    crypto-token category accent (Bitcoin orange)
+     --rec-cat-identity  identity-and-access category accent (steel)
+
+   Per-coin badge colors live in their own variables so an LTC card
+   can paint LTC blue, a DOGE card paints DOGE gold, etc., without
+   the design system having to enumerate them in one global place.
+*/
+
+:root {
+    color-scheme: dark;
+
+    /* ---- Surfaces ---- */
+    --rec-bg:           #0d1117;
+    --rec-bg-deep:      #07090d;
+    --rec-surface:      #161b22;
+    --rec-surface-hi:   #21262d;
+    --rec-surface-lo:   #0f141b;
+    --rec-border:       #30363d;
+    --rec-border-hi:    #424a55;
+
+    /* ---- Text ---- */
+    --rec-text:         #e6edf3;
+    --rec-text-muted:   #8b949e;
+    --rec-text-dim:     #6e7681;
+
+    /* ---- Brand + status ---- */
+    --rec-accent:       #d4a554;  /* vault gold */
+    --rec-accent-hi:    #e8b96a;
+    --rec-accent-bg:    #2a2218;
+    --rec-success:      #3fb950;
+    --rec-success-bg:   #142d1c;
+    --rec-warning:      #d29922;
+    --rec-warning-bg:   #2a230f;
+    --rec-danger:       #f85149;
+    --rec-danger-bg:    #2d1416;
+    --rec-info:         #58a6ff;
+    --rec-info-bg:      #0e1f3a;
+
+    /* ---- Category accents ---- */
+    --rec-cat-tokens:   #f7931a;  /* Bitcoin orange — family signifier */
+    --rec-cat-tokens-bg:#2a1d0f;
+    --rec-cat-identity: #7d8590;  /* steel grey */
+    --rec-cat-identity-bg:#1a1e25;
+
+    /* ---- Per-coin badge colors ---- */
+    --rec-coin-btc:     #f7931a;
+    --rec-coin-eth:     #627eea;
+    --rec-coin-ltc:     #345d9d;
+    --rec-coin-doge:    #c2a633;
+    --rec-coin-bch:     #0ac18e;
+    /* Wave-8 ed25519 chains. SOL purple = Phantom brand, XLM blue =
+       Stellar's brand light blue, XRP green = Ripple's brand teal. */
+    --rec-coin-sol:     #9945ff;
+    --rec-coin-xlm:     #14b6e7;
+    --rec-coin-xrp:     #23292f;
+    /* Wave 9: TRON. Tronix red = Tron Foundation brand color
+       (#ff060a as published; we use a slightly desaturated form
+       so it sits comfortably alongside the indigo vault chrome). */
+    --rec-coin-tron:    #ec0a1e;
+    /* Phase 5 Wave B: capability_request. Cyan-teal — distinct
+       from every per-coin color above. Capability requests are
+       NOT crypto-token signing (they're permission grants, sit in
+       Identity & Access section), but they share the per-pill
+       badge styling so a single operator can scan a mixed list of
+       requests at a glance. The tone signals "authority" rather
+       than "tokens". */
+    --rec-coin-cap:     #14a085;
+
+    /* ---- Typography ---- */
+    --rec-font-sans:    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --rec-font-mono:    "JetBrains Mono", "Cascadia Mono", "Cascadia Code", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+html, body {
+    background: var(--rec-bg);
+    color: var(--rec-text);
+    font-family: var(--rec-font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+a, .btn-link {
+    color: var(--rec-accent);
+    text-decoration: none;
+}
+
+a:hover, .btn-link:hover { color: var(--rec-accent-hi); }
+
+code {
+    font-family: var(--rec-font-mono);
+    color: var(--rec-text);
+    background: var(--rec-surface-lo);
+    padding: 0.05rem 0.3rem;
+    border-radius: 0.2rem;
+    font-size: 0.85em;
+}
+
+pre {
+    font-family: var(--rec-font-mono);
+    color: var(--rec-text);
+    background: var(--rec-surface-lo);
+    padding: 0.6rem 0.8rem;
+    border-radius: 0.35rem;
+    border: 1px solid var(--rec-border);
+}
+
+hr {
+    border: 0;
+    border-top: 1px solid var(--rec-border);
+    opacity: 1;
+    margin: 1rem 0;
+}
+
+/* ---- Bootstrap overrides — keep existing markup compatible ---- */
+
+.card {
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    color: var(--rec-text);
+}
+
+.card.shadow-sm { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }
+
+.text-muted { color: var(--rec-text-muted) !important; }
+.text-success { color: var(--rec-success) !important; }
+.text-warning { color: var(--rec-warning) !important; }
+.text-danger  { color: var(--rec-danger) !important; }
+.text-info    { color: var(--rec-info) !important; }
+
+.btn { font-family: var(--rec-font-sans); }
+
+.btn-primary {
+    color: var(--rec-bg-deep);
+    background: var(--rec-accent);
+    border-color: var(--rec-accent);
+}
+.btn-primary:hover, .btn-primary:focus {
+    color: var(--rec-bg-deep);
+    background: var(--rec-accent-hi);
+    border-color: var(--rec-accent-hi);
+}
+.btn-primary:disabled { background: var(--rec-accent); border-color: var(--rec-accent); opacity: 0.5; }
+
+.btn-success { background: var(--rec-success); border-color: var(--rec-success); color: #0a1410; }
+.btn-success:hover, .btn-success:focus { background: #4cc961; border-color: #4cc961; color: #0a1410; }
+
+.btn-outline-secondary {
+    color: var(--rec-text-muted);
+    border-color: var(--rec-border);
+    background: transparent;
+}
+.btn-outline-secondary:hover, .btn-outline-secondary:focus {
+    color: var(--rec-text);
+    background: var(--rec-surface-hi);
+    border-color: var(--rec-border-hi);
+}
+
+.btn-outline-primary {
+    color: var(--rec-accent);
+    border-color: var(--rec-accent);
+    background: transparent;
+}
+.btn-outline-primary:hover, .btn-outline-primary:focus {
+    color: var(--rec-bg-deep);
+    background: var(--rec-accent);
+    border-color: var(--rec-accent);
+}
+
+.btn:focus, .btn:active:focus, .form-control:focus, .form-check-input:focus {
+    box-shadow: 0 0 0 0.15rem rgba(212, 165, 84, 0.35);
+    outline: none;
+}
+
+.btn-close {
+    filter: invert(1) grayscale(100%) brightness(1.5);
+}
+
+.alert {
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    color: var(--rec-text);
+}
+.alert-info    { background: var(--rec-info-bg);    border-color: var(--rec-info); }
+.alert-warning { background: var(--rec-warning-bg); border-color: var(--rec-warning); }
+.alert-danger  { background: var(--rec-danger-bg);  border-color: var(--rec-danger); }
+.alert-success { background: var(--rec-success-bg); border-color: var(--rec-success); }
+
+/* Badge overrides — color is `!important` because Bootstrap's
+   .text-dark / .text-light utility classes carry !important and would
+   otherwise win the cascade against our dark-mode-aware tinting.
+   Several existing badges in Home.razor use markup like
+   `<span class="badge bg-warning text-dark">TOTP</span>` (the
+   text-dark was Bootstrap's contrast for a light-mode warning
+   yellow); under the vault dark theme we want light/colored text
+   on a dark-tinted background, so the override needs to neutralize
+   text-dark explicitly. The compound selectors `.badge.bg-X.text-dark`
+   below ratchet specificity to (0,3,0) so they beat .text-dark's
+   (0,1,0) +!important, matching our (0,3,0) +!important. */
+.badge { font-family: var(--rec-font-mono); font-weight: 600; letter-spacing: 0.04em; }
+.badge.bg-secondary,
+.badge.bg-secondary.text-dark,
+.badge.bg-secondary.text-light { background: var(--rec-surface-hi) !important; color: var(--rec-text) !important; border: 1px solid var(--rec-border); }
+.badge.bg-warning,
+.badge.bg-warning.text-dark,
+.badge.bg-warning.text-light { background: var(--rec-warning-bg) !important; color: var(--rec-warning) !important; border: 1px solid var(--rec-warning); }
+.badge.bg-info,
+.badge.bg-info.text-dark,
+.badge.bg-info.text-light { background: var(--rec-info-bg) !important; color: var(--rec-info) !important; border: 1px solid var(--rec-info); }
+.badge.bg-success,
+.badge.bg-success.text-dark,
+.badge.bg-success.text-light { background: var(--rec-success-bg) !important; color: var(--rec-success) !important; border: 1px solid var(--rec-success); }
+.badge.bg-primary,
+.badge.bg-primary.text-dark,
+.badge.bg-primary.text-light { background: var(--rec-accent-bg) !important; color: var(--rec-accent) !important; border: 1px solid var(--rec-accent); }
+.badge.bg-dark,
+.badge.bg-dark.text-light { background: var(--rec-surface-lo) !important; color: var(--rec-text) !important; border: 1px solid var(--rec-border-hi); }
+
+.form-control, .form-select {
+    background: var(--rec-surface-lo);
+    border: 1px solid var(--rec-border);
+    color: var(--rec-text);
+}
+.form-control:focus, .form-select:focus {
+    background: var(--rec-surface-lo);
+    color: var(--rec-text);
+    border-color: var(--rec-accent);
+}
+.form-control::placeholder { color: var(--rec-text-dim); }
+
+.spinner-border { color: var(--rec-accent); }
+
+/* ---- Validation states ---- */
+
+.valid.modified:not([type=checkbox]) { outline: 1px solid var(--rec-success); }
+.invalid { outline: 1px solid var(--rec-danger); }
+.validation-message { color: var(--rec-danger); }
+
+h1:focus { outline: none; }
+
+.blazor-error-boundary {
+    background: var(--rec-danger-bg);
+    color: var(--rec-text);
+    padding: 1rem;
+    border: 1px solid var(--rec-danger);
+    border-radius: 0.4rem;
+}
+.blazor-error-boundary::after { content: "An error has occurred."; }
+
+
+/* ================================================================
+   v1 PRODUCT POLISH RECIPES (banked 2026-05-18 night)
+
+   Canonical component vocabulary for the vault home + approval
+   surfaces. All recipes use explicit dimensions (no Bootstrap
+   defaults) so iOS WebKit + Android WebView render byte-identical.
+   These supersede ad-hoc Bootstrap class compositions for the
+   surfaces being polished in the v1 ship; older surfaces (TOTP
+   fresh-code display) keep their Bootstrap-class usage until
+   they're touched.
+
+   Naming convention: .rec-<category>-<part>. New classes never
+   collide with Bootstrap's namespace, so existing markup keeps
+   working until refactored intentionally.
+   ================================================================ */
+
+/* ---- Cross-platform render normalizers ----
+   Remove iOS WebKit tap-flash + ensure box-sizing parity across
+   both WebViews. */
+.rec-card,
+.rec-card *,
+.rec-btn,
+.rec-btn *,
+.rec-service-row,
+.rec-service-row *,
+.rec-disclosure,
+.rec-disclosure *,
+.rec-pairing-summary,
+.rec-pairing-summary * {
+    -webkit-tap-highlight-color: transparent;
+    box-sizing: border-box;
+}
+
+
+/* ---- BUTTONS ----
+   Canonical action button — Approve and Deny are ALWAYS the same
+   size. Fixed min-width + min-height so two siblings always measure
+   identical on both platforms regardless of label text length.
+   This recipe replaces ad-hoc .btn .btn-sm sizing in approval
+   surfaces — the equal-weight pairing is non-negotiable per the
+   v1 polish brief. */
+.rec-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 7.5rem;
+    min-height: 2.875rem;       /* 46px @ 16px base — clears Apple's 44pt min */
+    padding: 0.65rem 1.25rem;
+    font-family: var(--rec-font-sans);
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.2;
+    border: 1px solid transparent;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: filter 0.12s ease, transform 0.06s ease;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.rec-btn:active:not(:disabled) { transform: scale(0.98); }
+.rec-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.rec-btn-approve {
+    background: var(--rec-success);
+    color: #0a1410;
+    border-color: var(--rec-success);
+}
+.rec-btn-approve:hover:not(:disabled) { filter: brightness(1.08); }
+
+.rec-btn-deny {
+    background: var(--rec-danger);
+    color: #ffffff;
+    border-color: var(--rec-danger);
+}
+.rec-btn-deny:hover:not(:disabled) { filter: brightness(1.08); }
+
+/* Ghost / outline secondary — same geometry as Approve/Deny so
+   vertical rhythm holds when mixed with action buttons. Used for
+   Retry on error banners, Refresh on lists, etc. */
+.rec-btn-ghost {
+    background: transparent;
+    color: var(--rec-text);
+    border-color: var(--rec-border);
+}
+.rec-btn-ghost:hover:not(:disabled) {
+    background: var(--rec-surface-hi);
+    border-color: var(--rec-border-hi);
+}
+
+/* Danger ghost — outline for reversible-destructive actions (Revoke
+   a paired phone, Unpair from bootloader). Border in danger color
+   signals destruction without the full-fill weight of Deny. */
+.rec-btn-danger-ghost {
+    background: transparent;
+    color: var(--rec-danger);
+    border-color: var(--rec-danger);
+}
+.rec-btn-danger-ghost:hover:not(:disabled) {
+    background: var(--rec-danger-bg);
+}
+
+/* Button row — Approve + Deny side-by-side; each flex-1 below the
+   min-width floor so the row distributes evenly on narrow screens. */
+.rec-btn-row {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 1rem;
+    width: 100%;
+}
+.rec-btn-row > .rec-btn { flex: 1 1 0; }
+
+
+/* ---- CARDS ----
+   Canonical request card — wraps each pending-request entry.
+   Border + background match the global token palette; padding +
+   corner-radius locked identically across iOS and Android. */
+.rec-card {
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+    color: var(--rec-text);
+}
+
+/* AppContext header strip — sits at the top of each approval card
+   when the request carries AppContext metadata. Visually distinct
+   from the card body (info-tinted surface + bottom border) so the
+   consumer's brand anchors as the dominant visual at approval-time.
+   This is the canonical multi-tenant marketing surface inside the
+   app. */
+.rec-card-app-context {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 0.85rem;
+    margin: -1rem -1rem 0.85rem -1rem;       /* extend to card edges */
+    background: var(--rec-info-bg);
+    border-bottom: 1px solid var(--rec-border);
+    border-top-left-radius: 0.55rem;
+    border-top-right-radius: 0.55rem;
+}
+.rec-card-app-context-icon {
+    flex: 0 0 auto;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 0.4rem;
+    background: var(--rec-surface-lo);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--rec-text-muted);
+    font-size: 1.1rem;
+    overflow: hidden;
+}
+.rec-card-app-context-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.rec-card-app-context-meta {
+    flex: 1 1 auto;
+    min-width: 0;       /* allow shrink + text truncation */
+}
+.rec-card-app-context-name {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--rec-text);
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rec-card-app-context-description {
+    font-size: 0.82rem;
+    color: var(--rec-text-muted);
+    line-height: 1.25;
+    margin-top: 0.1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rec-card-app-context-url {
+    font-family: var(--rec-font-mono);
+    font-size: 0.78rem;
+    color: var(--rec-text-dim);
+    background: var(--rec-surface-lo);
+    padding: 0.1rem 0.4rem;
+    border-radius: 0.25rem;
+    margin-top: 0.3rem;
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* "Unknown app" warning — when a request arrives without a registered
+   AppContext. Operator should notice rather than silently approve. */
+.rec-card-app-context-unknown {
+    background: var(--rec-warning-bg);
+    color: var(--rec-warning);
+    border-bottom-color: var(--rec-warning);
+}
+.rec-card-app-context-unknown .rec-card-app-context-name {
+    color: var(--rec-warning);
+}
+
+/* Request body — action description with optional kind-badge to its
+   left (CAP / TOTP / WebAuthn / etc.). */
+.rec-card-action {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+}
+.rec-card-action-badge {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.5rem;
+    font-family: var(--rec-font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    border-radius: 0.3rem;
+    color: var(--rec-bg-deep);
+    background: var(--rec-coin-cap);
+}
+.rec-card-action-title {
+    flex: 1 1 auto;
+    font-size: 0.98rem;
+    font-weight: 600;
+    color: var(--rec-text);
+    line-height: 1.35;
+}
+
+
+/* ---- DISCLOSURE / COLLAPSE PATTERN ----
+   Native HTML <details> + <summary> for the "tap to view audit
+   details" affordance. Works identically on iOS WebKit + Android
+   WebView, no JavaScript needed, accessibility comes free.
+   Per the v1 polish brief: structured fields (Agent/Issuer/Audience/
+   Tier/Expires/Requesting agent) COLLAPSE BY DEFAULT on capability
+   requests; tap "Audit details" to reveal. Tap-affordance is the
+   chevron + muted text — intuitive without instruction. */
+.rec-disclosure {
+    border-top: 1px solid var(--rec-border);
+    padding-top: 0.6rem;
+    margin-top: 0.4rem;
+}
+.rec-disclosure > summary {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--rec-text-muted);
+    user-select: none;
+    -webkit-user-select: none;
+    list-style: none;
+    padding: 0.25rem 0;
+}
+.rec-disclosure > summary::-webkit-details-marker { display: none; }
+.rec-disclosure > summary::before {
+    content: "▸";
+    display: inline-block;
+    font-size: 0.75rem;
+    color: var(--rec-text-dim);
+    transition: transform 0.15s ease;
+    width: 0.85rem;
+    text-align: center;
+}
+.rec-disclosure[open] > summary::before {
+    transform: rotate(90deg);
+}
+.rec-disclosure > summary:hover {
+    color: var(--rec-text);
+}
+.rec-disclosure-body {
+    padding-top: 0.6rem;
+    padding-left: 1.25rem;       /* indent to align with summary content */
+}
+
+/* Force long mono identifiers (hashes, base64 payloads, public-key hex,
+   request ids, etc.) to wrap cleanly inside audit-detail disclosure
+   bodies. Without this, a 44-char base64 SHA-256 overflows the right
+   edge of the disclosure container on phone widths. word-break +
+   overflow-wrap together handle both natural-word-boundary breaks AND
+   no-boundary forced breaks. Sister of the v1.1 TLS pin disclosure
+   commitment ("show the entire trust artifact inline; never truncate
+   with ellipsis"). Banked 2026-05-22 evening after the iPhone 17 Pro
+   Max simulator capture showed Hash overflowing in the demo card. */
+.rec-disclosure-body code {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+
+/* ---- DETAIL LIST (structured field rows) ----
+   For Agent / Issuer / Audience / Tier / Expires / Requesting agent.
+   Grid-based so labels align cleanly across rows; mono identifiers
+   distinct from prose labels. */
+.rec-detail-list {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.4rem 0.75rem;
+    margin: 0;
+    font-size: 0.85rem;
+}
+.rec-detail-list dt {
+    color: var(--rec-text-muted);
+    font-weight: 500;
+    grid-column: 1;
+}
+.rec-detail-list dd {
+    color: var(--rec-text);
+    margin: 0;
+    grid-column: 2;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.rec-detail-list dd code,
+.rec-detail-list dd .rec-mono {
+    font-family: var(--rec-font-mono);
+    font-size: 0.82rem;
+    background: var(--rec-surface-lo);
+    padding: 0.08rem 0.35rem;
+    border-radius: 0.25rem;
+    color: var(--rec-text);
+}
+
+
+/* ---- VAULT HOME — Connected Services list ----
+   The Authy-analog list view. Each row represents one consumer
+   service the phone has been authorized to receive requests from.
+   Tap a row → opens per-service info panel (v1 scope decision b). */
+.rec-vault-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 1rem 1rem 0.85rem 1rem;
+    margin-bottom: 0.75rem;
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+}
+.rec-vault-header-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--rec-text-muted);
+}
+.rec-vault-header-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--rec-success);
+}
+.rec-vault-header-status::before {
+    content: "●";
+    color: var(--rec-success);
+    font-size: 0.7rem;
+}
+
+/* Section heading — used between the vault header, services list,
+   pending requests, and pairing details. */
+.rec-section-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 1.25rem 0 0.5rem 0;
+    padding: 0 0.1rem;
+}
+.rec-section-header-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--rec-text-muted);
+}
+.rec-section-header-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.4rem;
+    height: 1.4rem;
+    padding: 0 0.4rem;
+    font-size: 0.75rem;
+    font-weight: 700;
+    border-radius: 0.7rem;
+    background: var(--rec-surface-hi);
+    color: var(--rec-text);
+}
+
+/* Connected service row — Authy-style. Icon + name/description on
+   left, last-activity timestamp + chevron on right. Same height
+   across all rows for predictable scan rhythm. */
+.rec-service-row {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.85rem 1rem;
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+    margin-bottom: 0.5rem;
+    cursor: pointer;
+    color: var(--rec-text);
+    text-decoration: none;
+    transition: border-color 0.12s ease, background 0.12s ease;
+    /* Reset <button> defaults so <button class="rec-service-row"> renders
+       identically to <a class="rec-service-row">. */
+    font: inherit;
+    text-align: left;
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+}
+.rec-service-row:hover,
+.rec-service-row:focus-visible {
+    border-color: var(--rec-border-hi);
+    background: var(--rec-surface-hi);
+    color: var(--rec-text);
+    text-decoration: none;
+}
+.rec-service-row-icon {
+    flex: 0 0 auto;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 0.5rem;
+    background: var(--rec-surface-lo);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--rec-text-muted);
+}
+.rec-service-row-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.rec-service-row-icon-placeholder {
+    font-family: var(--rec-font-mono);
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--rec-text-muted);
+}
+.rec-service-row-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.rec-service-row-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--rec-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rec-service-row-description {
+    font-size: 0.8rem;
+    color: var(--rec-text-muted);
+    margin-top: 0.1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rec-service-row-activity {
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    color: var(--rec-text-dim);
+    text-align: right;
+}
+.rec-service-row-chevron {
+    flex: 0 0 auto;
+    color: var(--rec-text-dim);
+    font-size: 0.9rem;
+    margin-left: 0.25rem;
+}
+
+/* Phase H (2026-05-19 night) — transient highlight for a newly-paired
+   service in the Connected Services list. Set on a single row by
+   Home.razor's HandlePairServiceClick after a successful pair; the
+   .rec-service-row-highlighted class drives a single 3.5-second pulse
+   (border-glow + subtle accent-tinted background → fade back to the
+   neutral row) so the operator's eye lands on the new entry without
+   the row otherwise behaving differently from the rest. Sister of the
+   chat-tier "social-chat pill" one-time-glow banked in the consumer's
+   Phase D IM entry; same architectural shape (transient ambient cue,
+   not a permanent UI state). The animation fires once on class apply;
+   removing + re-adding the class re-triggers it (Blazor handles this
+   for us when the orchestrator reassigns _pairServiceHighlightedAppId). */
+.rec-service-row-highlighted {
+    animation: rec-service-row-pulse 3.5s ease-out 1;
+    border-color: var(--rec-accent);
+}
+@keyframes rec-service-row-pulse {
+    0% {
+        background: var(--rec-accent-bg);
+        box-shadow: 0 0 0 2px var(--rec-accent), 0 0 12px var(--rec-accent);
+    }
+    35% {
+        background: var(--rec-accent-bg);
+        box-shadow: 0 0 0 1px var(--rec-accent), 0 0 6px var(--rec-accent);
+    }
+    100% {
+        background: var(--rec-surface);
+        box-shadow: 0 0 0 0 transparent;
+    }
+}
+
+/* Empty state — no services have ever sent a request. */
+.rec-vault-empty {
+    padding: 2rem 1.25rem;
+    text-align: center;
+    background: var(--rec-surface-lo);
+    border: 1px dashed var(--rec-border);
+    border-radius: 0.6rem;
+    color: var(--rec-text-muted);
+}
+.rec-vault-empty-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--rec-text);
+    margin-bottom: 0.35rem;
+}
+.rec-vault-empty-body {
+    font-size: 0.85rem;
+    line-height: 1.4;
+}
+
+
+/* ---- PER-SERVICE INFO PANEL (v1 scope b — full AppContext +
+   paired-since + total requests) ----
+   Opens when a service row is tapped. Modal-style overlay with the
+   service's full metadata, paired-since timestamp, total request
+   count. v1.1 polish: link to the per-service request history. */
+.rec-service-panel {
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+    padding: 1.25rem;
+    margin: 0.5rem 0;
+}
+.rec-service-panel-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.85rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.85rem;
+    border-bottom: 1px solid var(--rec-border);
+}
+.rec-service-panel-icon {
+    flex: 0 0 auto;
+    width: 3.5rem;
+    height: 3.5rem;
+    border-radius: 0.6rem;
+    background: var(--rec-surface-lo);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--rec-text-muted);
+}
+.rec-service-panel-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.rec-service-panel-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.rec-service-panel-name {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--rec-text);
+    line-height: 1.25;
+}
+.rec-service-panel-description {
+    font-size: 0.88rem;
+    color: var(--rec-text-muted);
+    margin-top: 0.2rem;
+    line-height: 1.35;
+}
+.rec-service-panel-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem 1rem;
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+}
+.rec-service-panel-stat-label {
+    color: var(--rec-text-muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.rec-service-panel-stat-value {
+    color: var(--rec-text);
+    font-weight: 600;
+    margin-top: 0.1rem;
+}
+.rec-service-panel-close {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+    color: var(--rec-text-muted);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 0.4rem 0;
+}
+.rec-service-panel-close:hover { color: var(--rec-text); }
+
+/* Build 6 (2026-06-02) — per-service unpair inline confirm row. Sits
+   between the stats grid and the Close button. Tap the outer "Unpair"
+   button to arm; that toggles the confirm row in place with explicit
+   Cancel + Confirm buttons. Tap Cancel (or any other service row, or
+   the Close button) to disarm. */
+.rec-service-panel-unpair-confirm {
+    background: var(--rec-card-bg-elevated, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--rec-border-strong, rgba(255, 102, 102, 0.35));
+    border-radius: 0.5rem;
+    padding: 0.65rem 0.75rem;
+    margin-bottom: 0.5rem;
+}
+.rec-service-panel-unpair-confirm-text {
+    color: var(--rec-text);
+    font-size: 0.85rem;
+    line-height: 1.4;
+    margin-bottom: 0.6rem;
+}
+.rec-service-panel-unpair-confirm-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+}
+.rec-service-panel-unpair-confirm-actions .btn {
+    min-width: 6rem;
+}
+
+
+/* ---- PAIRING DETAILS COLLAPSIBLE ----
+   Wraps the bootloader URL / phone-id / algorithm / TLS-pin /
+   paired-at + managed secrets rows behind a "Pairing details"
+   summary. Reduces vault-home visual density; details are still
+   one tap away. Registered Phones + Unpair MOVE to Settings.razor
+   per the v1 polish brief (they're operator-info, not user-info). */
+.rec-pairing-details {
+    margin-bottom: 0.75rem;
+}
+.rec-pairing-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+    cursor: pointer;
+    color: var(--rec-text);
+    list-style: none;
+}
+.rec-pairing-summary::-webkit-details-marker { display: none; }
+.rec-pairing-summary-label {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--rec-text-muted);
+}
+.rec-pairing-summary-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--rec-text-dim);
+}
+.rec-pairing-summary-hint::after {
+    content: "▸";
+    display: inline-block;
+    font-size: 0.75rem;
+    transition: transform 0.15s ease;
+}
+.rec-pairing-details[open] > .rec-pairing-summary .rec-pairing-summary-hint::after {
+    transform: rotate(90deg);
+}
+.rec-pairing-body {
+    margin-top: 0.5rem;
+    padding: 1rem;
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.6rem;
+}
+
+/* Long-string trust artifacts inside Pairing details (TLS pin, Phone id,
+   Bootloader id, future master-pubkey when exposed) — use
+   overflow-wrap: anywhere ALONE so the renderer prefers natural break
+   points (`/`, `.`, `-`, `:`) before falling back to mid-character breaks.
+   Banked 2026-05-20 night after the v1 fix (word-break: break-all +
+   overflow-wrap: anywhere as belt-and-suspenders) shipped to address
+   TLS pin overflow on iPhone narrow viewport, then surfaced a polish
+   regression: the bootloader URL was breaking at `ht/tps://...` because
+   word-break: break-all is too aggressive — it ignores natural breaks
+   and chops at any character. overflow-wrap: anywhere alone preserves
+   the natural-break-first behavior (URL wraps at `/`, `.`, `-` first;
+   TLS pin's pure base64 still force-breaks at character boundaries
+   because there are no natural breaks to prefer). Best of both:
+   readable URL wrapping AND force-break for opaque tokens. */
+.rec-pairing-body code {
+    overflow-wrap: anywhere;
+}
+
+/* Recto Phone v1.1 Phase 4 polish (banked 2026-05-20): Copy-button row
+   sits BELOW the full-inline trust-artifact value (TLS pin, Phone id,
+   Bootloader id), giving each value its own "move to another device"
+   affordance. Inline-flex so the button hugs its content (not full
+   width); small top margin separates it visually from the value above
+   without crowding. Per the App Store screenshot impact rationale in
+   CLAUDE.md's Phase 4 entry, full-transparency-by-default + standard
+   mobile-UX affordances is what App Review tends to reward. The QR-
+   code button is a v1.2 follow-up that depends on the recto/qr/
+   substrate primitive (Phase 1 of the new 5-phase queue). */
+.rec-artifact-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.35rem;
+}
+.rec-artifact-copy {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 0.3rem;
+    line-height: 1.2;
+    /* Override Bootstrap's btn-outline-secondary defaults so the button
+       blends with the vault aesthetic — copper accent on hover, never
+       the Bootstrap blue. */
+    color: var(--rec-text-muted) !important;
+    border-color: var(--rec-border) !important;
+    background: transparent !important;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+.rec-artifact-copy:hover,
+.rec-artifact-copy:focus {
+    color: var(--rec-accent) !important;
+    border-color: var(--rec-accent) !important;
+    background: var(--rec-surface-hi) !important;
+}
+
+/* Recto Phone v1.1 Phase 2.C — [QR] button next to each [Copy] button
+   on Pairing-details disclosure. Same size + treatment as [Copy] so
+   the two read as a pair; tap opens the QR modal below. Sister recipe
+   of .rec-artifact-copy. */
+.rec-artifact-qr {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 0.3rem;
+    line-height: 1.2;
+    color: var(--rec-text-muted) !important;
+    border-color: var(--rec-border) !important;
+    background: transparent !important;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+.rec-artifact-qr:hover,
+.rec-artifact-qr:focus {
+    color: var(--rec-accent) !important;
+    border-color: var(--rec-accent) !important;
+    background: var(--rec-surface-hi) !important;
+}
+
+/* Recto Phone v1.1 Phase 2.C — QR-rendering modal overlay.
+   Full-viewport semi-transparent backdrop, centered card with the
+   PNG-as-data-URI image + the plaintext value below for visual
+   cross-reference. Tap on overlay (outside card) closes via
+   @onclick="CloseQrModal"; the card itself stops propagation so
+   tapping the QR doesn't dismiss. Card is sized for phone screens
+   (max-width 22rem) so the QR renders large enough to scan with
+   a second device's camera at typical hand-held distance. */
+.rec-qr-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.72);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1050;
+    padding: 1rem;
+}
+.rec-qr-modal {
+    background: var(--rec-surface);
+    border: 1px solid var(--rec-border);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    max-width: 22rem;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.5);
+}
+.rec-qr-modal-label {
+    color: var(--rec-text-muted);
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 0 0 0.75rem 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.rec-qr-modal-image {
+    width: 100%;
+    max-width: 18rem;
+    height: auto;
+    background: #ffffff; /* QR contrast — white quiet-zone bg matters */
+    border-radius: 0.25rem;
+    margin: 0 auto 0.75rem auto;
+    display: block;
+}
+.rec-qr-modal-value {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--rec-text);
+    word-break: break-all;
+    margin-bottom: 0.75rem;
+    padding: 0.4rem 0.5rem;
+    background: var(--rec-surface-hi);
+    border-radius: 0.25rem;
+    text-align: left;
+}
+.rec-qr-modal-close {
+    color: var(--rec-text-muted) !important;
+    border-color: var(--rec-border) !important;
+    background: transparent !important;
+}
+.rec-qr-modal-close:hover,
+.rec-qr-modal-close:focus {
+    color: var(--rec-accent) !important;
+    border-color: var(--rec-accent) !important;
+    background: var(--rec-surface-hi) !important;
+}
+
+/* ── Recovery-phrase reveal grid (Build 12, 2026-07-11) ─────────────────
+   Two-column numbered word list for the mnemonic backup ceremony. The
+   ordered-list counters give each word its position number (BIP-39 order
+   is load-bearing on restore). Monospace so visually-similar words read
+   distinctly. */
+.rec-mnemonic-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 16px;
+    margin: 0;
+    padding: 0 0 0 2.2em;
+    counter-reset: mnemonic;
+}
+.rec-mnemonic-grid li {
+    counter-increment: mnemonic;
+    list-style: none;
+    position: relative;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--rec-border, rgba(255, 255, 255, 0.08));
+}
+.rec-mnemonic-grid li::before {
+    content: counter(mnemonic);
+    position: absolute;
+    left: -2.2em;
+    width: 1.8em;
+    text-align: right;
+    color: var(--rec-text-dim, #8a8f98);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.82rem;
+    line-height: 1.6;
+}
+.rec-mnemonic-word {
+    font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    letter-spacing: 0.02em;
+    user-select: all;
+}
