@@ -3168,75 +3168,30 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _handle_devices_pair(self, body: dict[str, Any]) -> None:
-        """Relay an end-user device-pairing request to a consumer.
-
-        Phase H end-user pairing surface. The bootloader is a THIN RELAY
-        between the user's Recto Phone app and the consumer's
-        ``/api/v1/devices/pairing/complete`` endpoint:
-
-          1. User opens the Recto Phone app, chooses "Pair a new
-             service", enters the consumer's URL + the 8-char pairing
-             code displayed on the consumer's web UI.
-          2. Phone enclave signs a JWS with the user's secp256k1 master
-             key. JWS payload has ``cap.allow_actions = ["devices:pair"]``
-             and ``cap.scope.pairing_code = "<typed code>"`` so the
-             signature commits to that exact pairing code.
-          3. Phone POSTs ``/v0.4/devices/pair`` to this bootloader with
-             ``{consumer_base_url, pairing_code, user_pubkey_hex,
-             user_jws}`` — no auth on the incoming request (the JWS IS
-             the user-side auth).
-          4. Bootloader looks up the consumer's webhook token in
-             ``cfg.devices_pair_consumer_webhook_tokens`` (operator
-             registered the (URL, token) pair at deploy time).
-          5. Bootloader POSTs to ``{consumer_base_url}/api/v1/devices/pairing/complete``
-             with ``X-Openclaw-Token: <looked-up token>`` and body
-             ``{code: pairing_code, masterPubkeyHex: user_pubkey_hex,
-             capabilityJws: user_jws}``.
-          6. Bootloader returns the consumer's response (status + body)
-             verbatim to the phone.
-
-        **Trust model:** the X-Openclaw-Token gate on the consumer's
-        side proves "the request came through THIS authorized
-        bootloader." The user's JWS self-attestation (verified at the
-        consumer's side via the caller-supplied pubkey) proves "the
-        phone signing this attestation holds the master pubkey it
-        claims." Together they form the trust chain that lets an
-        end-user safely bind their phone to their consumer account
-        without the operator's bootloader being able to silently
-        substitute its own pubkey.
-
-        **Auth on the incoming request:** none. The phone's identity
-        is established by the JWS the phone forwarded; the bootloader
-        doesn't authenticate the caller because the JWS IS the
-        authentication primitive (and the consumer verifies it).
-        Rate-limiting and abuse defense are out of scope at v0; future
-        iteration may add per-phone-id or per-IP rate limits if the
-        endpoint surface starts getting probed.
-
-        **Endpoint disabled** when
-        ``cfg.devices_pair_consumer_webhook_tokens`` is empty — returns
-        404 ``unknown_endpoint``. Bootloaders that don't broker
-        end-user device pairing for any consumer have zero attack
-        surface on this path.
+        """Verify a device-pairing record + grant, then relay to the consumer.
 
         Body:
-          ``consumer_base_url``: full URL of the target consumer
-            (e.g. ``"https://consumer.example.com"``). MUST match a
-            key in ``cfg.devices_pair_consumer_webhook_tokens``.
-          ``pairing_code``: 8-char code the user typed (consumer
-            generated it via ``POST /api/v1/devices/pairing/start``).
-          ``user_pubkey_hex``: 128-hex secp256k1 master pubkey
-            (X||Y, no 0x04 prefix). The signature on ``user_jws``
-            must recover to this value.
-          ``user_jws``: full 3-part JWS string the phone enclave
-            signed.
+          ``consumer_base_url``: target consumer; must be a key in
+            ``cfg.devices_pair_consumer_webhook_tokens``.
+          ``record``: ``{bootloader_id, user_id, phone_pubkey, code,
+            not_after}`` — see ``recto.capability.pair_record``.
+          ``user_jws``: the phone's ES256K grant. Must recover to
+            ``record.phone_pubkey``, name this bootloader in ``aud``,
+            allow ``devices:pair``, and carry
+            ``cap.scope.payload_sha256`` == the record's fingerprint.
 
-        Response: ``{status: int, body: <consumer's JSON>}`` —
-        relays the consumer's HTTP status + body verbatim so the
-        caller can surface specific error reasons
-        (``pubkey_already_bound``, ``user_already_paired``,
-        ``capability_invalid``, etc.) without the bootloader
-        re-interpreting them.
+        Refusals are by name (400 for shape, 403 for the grant):
+        ``record_required``, the ``record_*`` / ``grant_*`` names from
+        ``pair_record``, ``record_bootloader_mismatch``,
+        ``grant_signature_invalid``, ``grant_replayed``. A grant is
+        spent on admission (its jti joins the revocation list until exp).
+
+        On admission the bootloader POSTs
+        ``{code, masterPubkeyHex, capabilityJws, record, fingerprint}``
+        to ``{consumer}/api/v1/devices/pairing/complete`` with the
+        consumer's registered webhook token and relays the response
+        verbatim. No auth on the incoming request: the grant is the auth.
+        Disabled (404) when no consumer is registered.
         """
         cfg = self.config
         if not cfg.devices_pair_consumer_webhook_tokens:
@@ -3244,20 +3199,87 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
             return
 
-        # Body shape validation
+        # Body shape validation. The request carries the pairing RECORD
+        # and the grant that names it; the code alone admits nothing.
         consumer_base_url = body.get("consumer_base_url")
-        pairing_code = body.get("pairing_code")
-        user_pubkey_hex = body.get("user_pubkey_hex")
+        record_raw = body.get("record")
         user_jws = body.get("user_jws")
 
         if not isinstance(consumer_base_url, str) or not consumer_base_url.strip():
             raise BootloaderError("consumer_base_url is required")
-        if not isinstance(pairing_code, str) or not pairing_code.strip():
-            raise BootloaderError("pairing_code is required")
-        if not isinstance(user_pubkey_hex, str) or not user_pubkey_hex.strip():
-            raise BootloaderError("user_pubkey_hex is required")
         if not isinstance(user_jws, str) or not user_jws.strip():
             raise BootloaderError("user_jws is required")
+        if not isinstance(record_raw, dict):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "record_required",
+                 "detail": "body.record {bootloader_id, user_id, phone_pubkey, code, not_after} is required"},
+            )
+            return
+
+        from recto.capability.jwt import verify_jws as _verify_jws
+        from recto.capability.pair_record import (
+            PairRecord,
+            PairRefused,
+            verify_pair_grant,
+        )
+
+        try:
+            record = PairRecord.from_dict(record_raw)
+        except PairRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+
+        if record.bootloader_id != cfg.bootloader_id:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "record_bootloader_mismatch",
+                 "detail": "the record names another bootloader"},
+            )
+            return
+
+        try:
+            claims = _verify_jws(
+                user_jws,
+                expected_pubkey=bytes.fromhex(record.phone_pubkey),
+                expected_aud=cfg.bootloader_id,
+            )
+        except ValueError as e:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "grant_signature_invalid", "detail": str(e)},
+            )
+            return
+
+        if cfg.state.is_revoked(claims.jti):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "grant_replayed", "detail": "jti already spent or revoked"},
+            )
+            return
+
+        now = int(time.time())
+        try:
+            fingerprint = verify_pair_grant(
+                claims, record,
+                signer_pubkey_hex=record.phone_pubkey,
+                bootloader_id=cfg.bootloader_id,
+                now=now,
+            )
+        except PairRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+
+        # Single use: spend the jti before anything leaves this body.
+        cfg.state.add_revocation(RevocationEntry(
+            jti=claims.jti,
+            revoked_at_unix=now,
+            original_exp_unix=int(claims.exp),
+            reason="spent: devices:pair",
+        ))
+
+        pairing_code = record.code
+        user_pubkey_hex = record.phone_pubkey
 
         # Strip trailing slash for canonical-lookup parity (operator
         # may have registered the URL with or without trailing slash).
@@ -3303,6 +3325,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             "code": pairing_code,
             "masterPubkeyHex": user_pubkey_hex,
             "capabilityJws": user_jws,
+            "record": record.to_dict(),
+            "fingerprint": fingerprint,
         }).encode("utf-8")
 
         request = urllib.request.Request(

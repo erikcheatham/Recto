@@ -1,27 +1,15 @@
-"""Tests for ``recto/capability/pair_record.py``.
-
-1. The record: canonical bytes, fingerprint, named refusals.
-2. ``POST /v0.4/devices/pair`` must refuse a grant whose scope names the
-   code but not the fingerprint. Fails today (the relay does not read the
-   grant); ``xfail(strict=True)`` until it does.
-"""
+"""Tests for ``recto/capability/pair_record.py``: canonical bytes,
+fingerprint, named refusals. The bootloader's use of the record is
+covered in ``test_bootloader_devices_pair.py``."""
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
-import threading
-import time
 from pathlib import Path
-from urllib import request as urlrequest
-from urllib.error import HTTPError
 
 import pytest
 
-from recto.bootloader.server import ChallengeStore, create_server
-from recto.bootloader.state import StateStore
-from recto.capability.jwt import build_signing_input
 from recto.capability.pair_record import (
     GRANT_ACTION_NOT_PAIR,
     GRANT_AUDIENCE_NOT_BOOTLOADER,
@@ -98,7 +86,7 @@ def _claims(
 
 
 # ---------------------------------------------------------------------------
-# 1. The record
+# The record
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +148,7 @@ def test_malformed_record_is_refused_by_name(overrides, name):
 
 
 # ---------------------------------------------------------------------------
-# 1b. The verifier — one refusal per name
+# The verifier — one refusal per name
 # ---------------------------------------------------------------------------
 
 
@@ -237,107 +225,3 @@ def test_window_at_the_ceiling_is_admitted():
         _claims(fingerprint=r.fingerprint(), window=PAIR_WINDOW_CEILING_SECONDS), r,
         signer_pubkey_hex=_PHONE, bootloader_id=_BOOTLOADER, now=_NOW,
     )
-
-
-# ---------------------------------------------------------------------------
-# 2. The relay must read the grant (fails until it does)
-# ---------------------------------------------------------------------------
-
-
-def _b64u(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-
-
-def _mint(claims: CapabilityClaims, priv_int: int) -> str:
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec, utils
-
-    digest, header_b64, payload_b64 = build_signing_input(claims)
-    priv = ec.derive_private_key(priv_int, ec.SECP256K1(), default_backend())
-    r, s = utils.decode_dss_signature(priv.sign(digest, ec.ECDSA(utils.Prehashed(hashes.SHA256()))))
-    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    if s > n // 2:
-        s = n - s
-    return f"{header_b64}.{payload_b64}.{_b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
-
-
-@pytest.fixture
-def phone_keypair():
-    pytest.importorskip("cryptography")
-    from cryptography.hazmat.backends import default_backend
-    from cryptography.hazmat.primitives.asymmetric import ec
-
-    priv = ec.generate_private_key(ec.SECP256K1(), default_backend())
-    nums = priv.public_key().public_numbers()
-    return priv.private_numbers().private_value, (nums.x.to_bytes(32, "big") + nums.y.to_bytes(32, "big")).hex()
-
-
-@pytest.fixture
-def relay_server(tmp_path: Path):
-    """Bootloader with one registered consumer nothing listens on."""
-    server = create_server(
-        bind_host="127.0.0.1",
-        bind_port=0,
-        state=StateStore(state_dir=tmp_path),
-        bootloader_id=_BOOTLOADER,
-        challenges=ChallengeStore(),
-        ssl_context=None,
-        devices_pair_consumer_webhook_tokens={"http://127.0.0.1:9": "consumer-token-fixture"},
-        devices_pair_consumer_timeout_seconds=1.0,
-    )
-    host, port = server.server_address
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5.0)
-
-
-def _post(url: str, body: dict) -> tuple[int, dict]:
-    req = urlrequest.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=5.0) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
-        try:
-            return e.code, json.loads(raw)
-        except json.JSONDecodeError:
-            return e.code, {"_raw_body": raw}
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="the relay does not yet verify the grant against the pairing record",
-)
-def test_relay_refuses_a_grant_that_names_the_code_but_not_the_act(relay_server, phone_keypair):
-    priv_int, pubkey_hex = phone_keypair
-    now = int(time.time())
-    claims = CapabilityClaims(
-        iss="phone:user:enclave", sub="user:user-1", aud=[_BOOTLOADER],
-        iat=now, nbf=now, exp=now + 300, jti="jti-relay-1",
-        cap=CapabilityClause(
-            tier=0, registry_version=_MANIFEST_VERSION,
-            scope=CapabilityScope(pairing_code="A1B2C3D4"),
-            allow_actions=[PAIR_ACTION],
-        ),
-        purpose="pair", max_uses=1,
-    )
-    status, body = _post(
-        f"{relay_server}/v0.4/devices/pair",
-        {
-            "consumer_base_url": "http://127.0.0.1:9",
-            "pairing_code": "A1B2C3D4",
-            "user_pubkey_hex": pubkey_hex,
-            "user_jws": _mint(claims, priv_int),
-        },
-    )
-    assert status == 403
-    assert body.get("error") == GRANT_SCOPE_MISSING_FINGERPRINT
