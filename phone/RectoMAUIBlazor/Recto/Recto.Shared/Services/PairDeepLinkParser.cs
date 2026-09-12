@@ -278,12 +278,27 @@ public static class PairDeepLinkParser
             bootstrapPairCodeForPayload = null;
         }
 
+        // Record fields (Service-kind only). Both or neither: a half record signs nothing.
+        string? userIdForPayload = null;
+        long? notAfterForPayload = null;
+        if (kind == PairDeepLinkKind.Service
+            && queryDict.TryGetValue(PairDeepLinkConstants.UserIdParamName, out var uidVal)
+            && queryDict.TryGetValue(PairDeepLinkConstants.NotAfterParamName, out var naVal)
+            && !string.IsNullOrWhiteSpace(uidVal)
+            && long.TryParse(naVal.Trim(), out var notAfter) && notAfter > 0)
+        {
+            userIdForPayload = uidVal.Trim();
+            notAfterForPayload = notAfter;
+        }
+
         return new PairDeepLinkPayload(
             code,
             bootloaderForPayload,
             kind,
             bootstrapBootloaderForPayload,
-            bootstrapPairCodeForPayload);
+            bootstrapPairCodeForPayload,
+            userIdForPayload,
+            notAfterForPayload);
     }
 
     // Small manual query parser. The URL.Query property includes the

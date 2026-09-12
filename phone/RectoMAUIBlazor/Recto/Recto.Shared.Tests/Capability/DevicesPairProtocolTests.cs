@@ -37,28 +37,32 @@ public class DevicesPairProtocolTests
     // DevicesPairRequest — POST /v0.4/devices/pair body shape
     // -----------------------------------------------------------------
 
+    private static readonly string Phone = string.Concat(Enumerable.Repeat("ab", 64));
+
+    private static DevicesPairRecord Record() =>
+        new("bl-test", "user-1", Phone, "A1B2C3D4", 1800000600);
+
     [Fact]
     public void DevicesPairRequest_Serializes_With_Snake_Case_Wire_Keys()
     {
         // The bootloader's body validation reads these EXACT keys.
-        // Any case-folding or rename here would land the phone POSTing
-        // a body the bootloader rejects with "consumer_base_url is
-        // required" / etc. validation errors.
         var req = new DevicesPairRequest(
             ConsumerBaseUrl: "https://staging.allthruit.com",
-            PairingCode: "ABCD1234",
-            UserPubkeyHex: "deadbeef" + new string('0', 120),
+            Record: Record(),
             UserJws: "header.payload.signature");
 
         var json = JsonSerializer.Serialize(req);
 
         Assert.Contains("\"consumer_base_url\":", json);
-        Assert.Contains("\"pairing_code\":", json);
-        Assert.Contains("\"user_pubkey_hex\":", json);
+        Assert.Contains("\"record\":", json);
+        Assert.Contains("\"bootloader_id\":", json);
+        Assert.Contains("\"user_id\":", json);
+        Assert.Contains("\"phone_pubkey\":", json);
+        Assert.Contains("\"code\":", json);
+        Assert.Contains("\"not_after\":", json);
         Assert.Contains("\"user_jws\":", json);
-        // Defense: snake_case-only — NO PascalCase keys leaking through.
         Assert.DoesNotContain("\"ConsumerBaseUrl\":", json);
-        Assert.DoesNotContain("\"PairingCode\":", json);
+        Assert.DoesNotContain("\"PhonePubkey\":", json);
     }
 
     [Fact]
@@ -66,8 +70,7 @@ public class DevicesPairProtocolTests
     {
         var original = new DevicesPairRequest(
             ConsumerBaseUrl: "https://staging.allthruit.com",
-            PairingCode: "R5J5JYMG",
-            UserPubkeyHex: "2b29338bdce6fa59f120d3972ae4b4300d4f43b88387efed0dff43e2a068c669e8a815fafe8639a2e225b01fe380369f1ddda6ea17a943bb7730e6dc5c4112d1",
+            Record: Record(),
             UserJws: "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJ1c2VyIn0.signature");
 
         var json = JsonSerializer.Serialize(original);
@@ -75,9 +78,40 @@ public class DevicesPairProtocolTests
 
         Assert.NotNull(restored);
         Assert.Equal(original.ConsumerBaseUrl, restored.ConsumerBaseUrl);
-        Assert.Equal(original.PairingCode, restored.PairingCode);
-        Assert.Equal(original.UserPubkeyHex, restored.UserPubkeyHex);
+        Assert.Equal(original.Record, restored.Record);
         Assert.Equal(original.UserJws, restored.UserJws);
+    }
+
+    [Fact]
+    public void DevicesPairRecord_Fingerprint_Matches_The_Bootloaders_Pin()
+    {
+        // The same tuple the bootloader's suite pins (tests/test_capability_pair_record.py):
+        // canonical bytes are sorted keys, no whitespace; the fingerprint is their SHA-256.
+        var expectedBytes = "{\"bootloader_id\":\"bl-test\",\"code\":\"A1B2C3D4\",\"not_after\":1800000600," +
+                            "\"phone_pubkey\":\"" + Phone + "\",\"user_id\":\"user-1\"}";
+        var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(expectedBytes))).ToLowerInvariant();
+        Assert.Equal(expected, Record().Fingerprint());
+    }
+
+    [Theory]
+    [InlineData("bootloader_id")]
+    [InlineData("user_id")]
+    [InlineData("phone_pubkey")]
+    [InlineData("code")]
+    [InlineData("not_after")]
+    public void DevicesPairRecord_EveryField_MovesTheFingerprint(string field)
+    {
+        var r = Record();
+        var changed = field switch
+        {
+            "bootloader_id" => r with { BootloaderId = "bl-other" },
+            "user_id" => r with { UserId = "user-2" },
+            "phone_pubkey" => r with { PhonePubkey = string.Concat(Enumerable.Repeat("cd", 64)) },
+            "code" => r with { Code = "Z9Y8X7W6" },
+            _ => r with { NotAfter = r.NotAfter + 1 },
+        };
+        Assert.NotEqual(r.Fingerprint(), changed.Fingerprint());
     }
 
     // -----------------------------------------------------------------

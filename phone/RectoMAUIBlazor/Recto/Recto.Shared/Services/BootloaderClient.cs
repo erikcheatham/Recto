@@ -229,15 +229,15 @@ public sealed class BootloaderClient : IBootloaderClient
             return Task.FromResult(Result.Failure<DevicesPairResponse>(
                 Error.Validation([new ValidationErrors("ConsumerBaseUrl", "Consumer base URL is required.")])));
         }
-        if (string.IsNullOrWhiteSpace(request.PairingCode))
+        if (request.Record is null
+            || string.IsNullOrWhiteSpace(request.Record.Code)
+            || string.IsNullOrWhiteSpace(request.Record.PhonePubkey)
+            || string.IsNullOrWhiteSpace(request.Record.UserId)
+            || string.IsNullOrWhiteSpace(request.Record.BootloaderId)
+            || request.Record.NotAfter <= 0)
         {
             return Task.FromResult(Result.Failure<DevicesPairResponse>(
-                Error.Validation([new ValidationErrors("PairingCode", "Pairing code is required.")])));
-        }
-        if (string.IsNullOrWhiteSpace(request.UserPubkeyHex))
-        {
-            return Task.FromResult(Result.Failure<DevicesPairResponse>(
-                Error.Validation([new ValidationErrors("UserPubkeyHex", "Master pubkey hex is required.")])));
+                Error.Validation([new ValidationErrors("Record", "A complete pairing record is required.")])));
         }
         if (string.IsNullOrWhiteSpace(request.UserJws))
         {

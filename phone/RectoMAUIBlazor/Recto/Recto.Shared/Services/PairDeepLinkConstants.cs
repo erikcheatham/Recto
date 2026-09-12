@@ -179,6 +179,12 @@ public static class PairDeepLinkConstants
     /// </summary>
     public const string BootstrapPairCodeParamName = "bootstrap_pair_code";
 
+    /// <summary>The pairing record's consumer-owned fields (Service-kind only): the user being
+    /// bound and the code's expiry (unix seconds). With these the phone signs the whole act —
+    /// bootloader, user, key, code, expiry — not just the code.</summary>
+    public const string UserIdParamName = "user_id";
+    public const string NotAfterParamName = "not_after";
+
     /// <summary>
     /// Canonical wire value for <see cref="PairDeepLinkKind.Service"/>
     /// in the <c>kind=</c> query param. Lowercase by convention.

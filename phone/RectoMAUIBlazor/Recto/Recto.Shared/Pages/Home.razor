@@ -2119,7 +2119,19 @@
     private const string PairServiceManifestVersion = "2026-05-19";
 
     private string _pairServiceCode = string.Empty;
+    // The pairing record's consumer-owned fields, carried by the QR. The phone signs the act
+    // (bootloader, user, key, code, expiry); a typed code without them cannot pair.
+    private string? _pairServiceRecordCode;
+    private string? _pairServiceUserId;
+    private long? _pairServiceNotAfter;
     private bool _pairServiceBusy;
+
+    private void StashPairRecordFields(PairDeepLinkPayload deepLink)
+    {
+        _pairServiceRecordCode = deepLink.HasRecord ? deepLink.Code : null;
+        _pairServiceUserId = deepLink.HasRecord ? deepLink.UserId : null;
+        _pairServiceNotAfter = deepLink.HasRecord ? deepLink.NotAfter : null;
+    }
     private string _pairServiceBusyText = string.Empty;
     private string? _pairServiceError;
     private string? _pairServiceSuccessMessage;
@@ -2427,6 +2439,7 @@
                 _bootloaderUrl = deepLink.BootstrapBootloaderUrl!;
                 _pairingCode = deepLink.BootstrapPairCode!;
                 _pendingServicePairCodeAfterFirstPair = deepLink.Code.ToUpperInvariant();
+                StashPairRecordFields(deepLink);
                 _firstPairCeremonyActive = true;
                 _errorMessage = null;
                 StateHasChanged();
@@ -2441,6 +2454,7 @@
             if (_paired is not null && !IsDemoMode)
             {
                 _pairServiceCode = deepLink.Code.ToUpperInvariant();
+                StashPairRecordFields(deepLink);
                 _pairServiceError = null;
                 _pairServiceSuccessMessage = null;
                 // Auto-open the "Pair a service" <details> accordion
@@ -3129,10 +3143,29 @@
                 return;
             }
 
-            // 2) Build the CapabilityClaims dict manually. C# CapabilityScope
-            //    record doesn't carry scope-extension fields today (Phase E /
-            //    F / G all use partial-canonical-JSON + manual injection at
-            //    signing time). Same pattern here for pairing_code.
+            // 2) The pairing record: what the phone signs is the whole act, not the
+            //    code. The consumer's QR carried user_id + not_after; the bootloader
+            //    id and the key are the phone's own.
+            if (string.IsNullOrEmpty(_pairServiceUserId) || _pairServiceNotAfter is null
+                || string.IsNullOrEmpty(_pairServiceRecordCode)
+                || !string.Equals(_pairServiceRecordCode, _pairServiceCode, StringComparison.OrdinalIgnoreCase))
+            {
+                _pairServiceError = "Scan the pairing QR code — a typed code alone cannot be signed.";
+                return;
+            }
+            if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= _pairServiceNotAfter.Value)
+            {
+                _pairServiceError = "This pairing code has expired. Start a new pairing and scan again.";
+                return;
+            }
+            var record = new DevicesPairRecord(
+                BootloaderId: _paired!.BootloaderId,
+                UserId: _pairServiceUserId!,
+                PhonePubkey: masterPubkeyHex,
+                Code: _pairServiceRecordCode!,
+                NotAfter: _pairServiceNotAfter.Value);
+            var fingerprint = record.Fingerprint();
+
             _pairServiceBusyText = "Building JWS payload...";
             StateHasChanged();
             await Task.Yield();
@@ -3147,7 +3180,8 @@
                 ["env"] = new List<object?>(),
                 ["services"] = new List<object?>(),
                 ["repos"] = new List<object?>(),
-                ["pairing_code"] = _pairServiceCode,
+                ["pairing_code"] = record.Code,
+                ["payload_sha256"] = fingerprint,
             };
             var capDict = new Dictionary<string, object?>(StringComparer.Ordinal)
             {
@@ -3168,7 +3202,7 @@
             {
                 ["iss"] = $"phone:user:{_paired!.PhoneId}",
                 ["sub"] = $"user:{pubkeyPrefix}",
-                ["aud"] = new List<object?> { DefaultConsumerAud },
+                ["aud"] = new List<object?> { _paired!.BootloaderId, DefaultConsumerAud },
                 ["iat"] = now,
                 ["nbf"] = now,
                 ["exp"] = exp,
@@ -3214,17 +3248,16 @@
             }
 
             // 5) Assemble the 3-part JWS: header.payload.signature, all
-            //    base64url-encoded. The bootloader treats the JWS as an
-            //    opaque string and relays it verbatim to the consumer.
+            //    base64url-encoded.
             var jws = $"{headerB64}.{payloadB64}.{Base64UrlEncode(signature)}";
 
-            // 6) POST to the bootloader's /v0.4/devices/pair relay.
+            // 6) POST the record + grant to the bootloader; it verifies both,
+            //    spends the grant, and relays to the consumer.
             _pairServiceBusyText = "Pairing...";
             StateHasChanged();
             var pairReq = new DevicesPairRequest(
                 ConsumerBaseUrl: DefaultConsumerBaseUrl,
-                PairingCode: _pairServiceCode,
-                UserPubkeyHex: masterPubkeyHex,
+                Record: record,
                 UserJws: jws);
             var pairResp = await BootloaderClient.PairDeviceAsync(
                 ActiveBootloaderUrl, pairReq, CancellationToken.None);
@@ -3278,6 +3311,9 @@
                 $"Your master pubkey is now bound to your {DefaultConsumerAppName} account. " +
                 $"You can sign in to {DefaultConsumerAppName} on any browser; this device is the signer.";
             _pairServiceCode = string.Empty;
+            _pairServiceRecordCode = null;
+            _pairServiceUserId = null;
+            _pairServiceNotAfter = null;
         }
         catch (Exception ex)
         {
