@@ -1439,6 +1439,24 @@ def main() -> int:
     # baked into the image.
     capability_manifest_path = os.environ.get("RECTO_CAPABILITY_MANIFEST_FILE") or None
 
+    # RECTO_DEVICES_PAIR_SIGNING_KEY_FILE: a file holding the bootloader's
+    # 32-byte secp256k1 signing key as 64 hex chars. When set, every admitted
+    # pairing is relayed with a signed result; /v0.4/health shows the pubkey.
+    devices_pair_signing_key: bytes | None = None
+    signing_key_path = os.environ.get("RECTO_DEVICES_PAIR_SIGNING_KEY_FILE") or None
+    if signing_key_path:
+        try:
+            devices_pair_signing_key = bytes.fromhex(
+                pathlib.Path(signing_key_path).read_text(encoding="utf-8").strip()
+            )
+        except (OSError, ValueError) as exc:
+            print(
+                f"ERROR: RECTO_DEVICES_PAIR_SIGNING_KEY_FILE={signing_key_path!r} unreadable "
+                f"or not 64 hex chars: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     server = create_server(
         bind_host=bind_host,
         bind_port=bind_port,
@@ -1452,6 +1470,7 @@ def main() -> int:
         principal_apps=principal_apps,
         devices_pair_consumer_webhook_tokens=devices_pair_consumer_webhook_tokens,
         devices_pair_consumer_relay_urls=devices_pair_consumer_relay_urls,
+        devices_pair_signing_key=devices_pair_signing_key,
         connections_path=connections_path,
         connections_agent_services=connections_agent_services,
         connections_agent_keys=connections_agent_keys,

@@ -209,9 +209,12 @@ def fake_consumer():
         thread.join(timeout=5.0)
 
 
+_BOOTLOADER_KEY = bytes.fromhex("7" * 64)
+
+
 @pytest.fixture
 def bootloader(tmp_path: Path):
-    def _make(consumer_tokens: dict[str, str] | None = None):
+    def _make(consumer_tokens: dict[str, str] | None = None, signing_key: bytes | None = None):
         server = create_server(
             bind_host="127.0.0.1",
             bind_port=0,
@@ -220,6 +223,7 @@ def bootloader(tmp_path: Path):
             challenges=ChallengeStore(),
             ssl_context=None,
             devices_pair_consumer_webhook_tokens=consumer_tokens,
+            devices_pair_signing_key=signing_key,
         )
         host, port = server.server_address
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -396,6 +400,56 @@ class TestDevicesPairHappyPath:
         ctx = bootloader(consumer_tokens={url + "/": "tok"})
         status, _ = _http_post_json(_pair_url(ctx), _body(url, phone))
         assert status == HTTPStatus.OK
+
+
+class TestDevicesPairSignedResult:
+    """A bootloader with a signing key attests the act it admitted."""
+
+    def test_unsigned_bootloader_forwards_no_result(self, bootloader, fake_consumer, phone):
+        url = fake_consumer["base_url"]
+        ctx = bootloader(consumer_tokens={url: "tok"})
+        status, _ = _http_post_json(_pair_url(ctx), _body(url, phone))
+        assert status == HTTPStatus.OK
+        assert fake_consumer["received"][0]["body"]["bootloaderJws"] is None
+
+    def test_signing_bootloader_forwards_a_result_that_verifies_and_pins_the_act(self, bootloader, fake_consumer, phone):
+        from recto.capability.jwt import verify_jws
+        from recto.capability.pair_record import PAIR_RESULT_ACTION
+        from recto.capability.signing import public_key_hex
+
+        url = fake_consumer["base_url"]
+        ctx = bootloader(consumer_tokens={url: "tok"}, signing_key=_BOOTLOADER_KEY)
+        rec = _record(phone)
+        status, _ = _http_post_json(_pair_url(ctx), _body(url, phone, rec))
+        assert status == HTTPStatus.OK
+
+        result_jws = fake_consumer["received"][0]["body"]["bootloaderJws"]
+        assert isinstance(result_jws, str)
+        claims = verify_jws(result_jws, expected_pubkey=bytes.fromhex(public_key_hex(_BOOTLOADER_KEY)),
+                            expected_aud="consumer")
+        assert claims.iss == f"bootloader:{_BOOTLOADER_ID}"
+        assert claims.cap.scope.payload_sha256 == rec.fingerprint()
+        assert claims.cap.scope.pairing_code == rec.code
+        assert claims.cap.allow_actions == [PAIR_RESULT_ACTION]
+        assert _BOOTLOADER_ID not in claims.aud
+        assert claims.exp - claims.nbf == 300
+
+    def test_signing_bootloader_publishes_its_pubkey_on_health(self, bootloader):
+        from recto.capability.signing import public_key_hex
+
+        ctx = bootloader(consumer_tokens={"https://x.com": "tok"}, signing_key=_BOOTLOADER_KEY)
+        with urlrequest.urlopen(f"{ctx['base_url']}/v0.4/health", timeout=5.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["devices_pair_pubkey"] == public_key_hex(_BOOTLOADER_KEY)
+
+    def test_a_short_key_is_refused_at_startup(self, tmp_path):
+        with pytest.raises(ValueError, match="32 bytes"):
+            create_server(
+                bind_host="127.0.0.1", bind_port=0, state=StateStore(state_dir=tmp_path),
+                bootloader_id=_BOOTLOADER_ID, challenges=ChallengeStore(), ssl_context=None,
+                devices_pair_consumer_webhook_tokens={"https://x.com": "tok"},
+                devices_pair_signing_key=b"\x07" * 31,
+            )
 
 
 class TestDevicesPairConsumerErrors:

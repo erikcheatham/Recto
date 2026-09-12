@@ -473,6 +473,11 @@ class BootloaderConfig:
     # .ai agent-zone hostname to bypass the WAF.
     devices_pair_consumer_relay_urls: dict[str, str] = {}
 
+    # The bootloader's own secp256k1 key (32 bytes) for signing its pairing
+    # RESULT; consumers pin the matching public key. None = no signed result.
+    devices_pair_signing_key: bytes | None = None
+    devices_pair_signing_pubkey_hex: str | None = None
+
     # Phase H optional: per-call timeout (seconds) for the bootloader's
     # outbound request to the consumer's /complete endpoint. 15s is
     # generous for a single DB write + JWS verify; bumps if a future
@@ -920,11 +925,15 @@ class BootloaderHandler(BaseHTTPRequestHandler):
 
     def _handle_health(self) -> None:
         cfg = self.config
-        self._send_json(HTTPStatus.OK, {
+        body: dict[str, Any] = {
             "ok": True,
             "bootloader_id": cfg.bootloader_id,
             "v0_4_protocol": PROTOCOL_VERSION,
-        })
+        }
+        if cfg.devices_pair_signing_pubkey_hex:
+            # Public by nature; consumers pin it out of band, never from here.
+            body["devices_pair_pubkey"] = cfg.devices_pair_signing_pubkey_hex
+        self._send_json(HTTPStatus.OK, body)
 
     # ------------------------------------------------------------------
     # GET /v0.4/version  -- GATE 3 prerequisite #2
@@ -3187,11 +3196,15 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         spent on admission (its jti joins the revocation list until exp).
 
         On admission the bootloader POSTs
-        ``{code, masterPubkeyHex, capabilityJws, record, fingerprint}``
-        to ``{consumer}/api/v1/devices/pairing/complete`` with the
-        consumer's registered webhook token and relays the response
-        verbatim. No auth on the incoming request: the grant is the auth.
-        Disabled (404) when no consumer is registered.
+        ``{code, masterPubkeyHex, capabilityJws, record, fingerprint,
+        bootloaderJws}`` to ``{consumer}/api/v1/devices/pairing/complete``
+        with the consumer's registered webhook token and relays the
+        response verbatim. ``bootloaderJws`` is this bootloader's signed
+        attestation of the act (``devices:pair_result``, the fingerprint
+        in scope, 300 s, single-use) when a signing key is configured;
+        consumers that pin the key need no webhook token. No auth on the
+        incoming request: the grant is the auth. Disabled (404) when no
+        consumer is registered.
         """
         cfg = self.config
         if not cfg.devices_pair_consumer_webhook_tokens:
@@ -3219,6 +3232,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
 
         from recto.capability.jwt import verify_jws as _verify_jws
         from recto.capability.pair_record import (
+            PAIR_RESULT_ACTION,
             PairRecord,
             PairRefused,
             verify_pair_grant,
@@ -3278,6 +3292,37 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             reason="spent: devices:pair",
         ))
 
+        # The signed result: this bootloader attests it verified THIS act.
+        # aud = the consumer audiences the phone named (everything but us);
+        # scope.payload_sha256 = the fingerprint; single-use jti; 300 s.
+        bootloader_jws: str | None = None
+        if cfg.devices_pair_signing_key is not None:
+            from recto.capability.signing import mint_jws
+            from recto.capability.types import (
+                CapabilityClaims,
+                CapabilityClause,
+                CapabilityScope,
+            )
+
+            result_claims = CapabilityClaims(
+                iss=f"bootloader:{cfg.bootloader_id}",
+                sub=f"user:{record.user_id}",
+                aud=[a for a in claims.aud if a != cfg.bootloader_id] or [consumer_base_url.rstrip("/")],
+                iat=now,
+                nbf=now,
+                exp=now + 300,
+                jti=f"pair-result-{uuid.uuid4().hex}",
+                cap=CapabilityClause(
+                    tier=0,
+                    registry_version=claims.cap.registry_version,
+                    scope=CapabilityScope(pairing_code=record.code, payload_sha256=fingerprint),
+                    allow_actions=[PAIR_RESULT_ACTION],
+                ),
+                purpose="devices:pair result",
+                max_uses=1,
+            )
+            bootloader_jws = mint_jws(result_claims, cfg.devices_pair_signing_key)
+
         pairing_code = record.code
         user_pubkey_hex = record.phone_pubkey
 
@@ -3327,6 +3372,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             "capabilityJws": user_jws,
             "record": record.to_dict(),
             "fingerprint": fingerprint,
+            "bootloaderJws": bootloader_jws,
         }).encode("utf-8")
 
         request = urllib.request.Request(
@@ -6085,6 +6131,7 @@ def create_server(
     devices_pair_consumer_webhook_tokens: dict[str, str] | None = None,
     devices_pair_consumer_relay_urls: dict[str, str] | None = None,
     devices_pair_consumer_timeout_seconds: float = 15.0,
+    devices_pair_signing_key: bytes | None = None,
     connections_path: str | None = None,
     connections_agent_services: dict[str, str] | None = None,
     connections_agent_keys: dict[str, list[str]] | None = None,
@@ -6451,6 +6498,21 @@ def create_server(
     BootloaderHandler.config.devices_pair_consumer_timeout_seconds = (
         devices_pair_consumer_timeout_seconds
     )
+    # The pairing-result signing key: refused at startup if the signer
+    # cannot run, so a misconfigured bootloader never relays unsigned.
+    if devices_pair_signing_key is not None:
+        if len(devices_pair_signing_key) != 32:
+            raise ValueError(
+                f"devices_pair_signing_key must be 32 bytes, got {len(devices_pair_signing_key)}"
+            )
+        from recto.capability.signing import public_key_hex, require_signing
+
+        require_signing()
+        BootloaderHandler.config.devices_pair_signing_key = bytes(devices_pair_signing_key)
+        BootloaderHandler.config.devices_pair_signing_pubkey_hex = public_key_hex(devices_pair_signing_key)
+    else:
+        BootloaderHandler.config.devices_pair_signing_key = None
+        BootloaderHandler.config.devices_pair_signing_pubkey_hex = None
     # Recto Connections Substrate (2026-06-13). Empty/None connections_path
     # leaves all /v0.4/connections/* endpoints disabled (404). The agent->
     # service read map and the operator write token (capability_operator_token,

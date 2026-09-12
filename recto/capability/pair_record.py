@@ -22,6 +22,8 @@ from recto.capability.types import CapabilityClaims
 
 PAIR_ACTION = "devices:pair"
 UNPAIR_ACTION = "devices:unpair"
+# The bootloader's own attestation that it verified a pairing act.
+PAIR_RESULT_ACTION = "devices:pair_result"
 
 # The signed window may never exceed this many seconds (nbf..exp).
 PAIR_WINDOW_CEILING_SECONDS = 3600
