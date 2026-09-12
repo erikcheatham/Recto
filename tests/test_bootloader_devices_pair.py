@@ -232,8 +232,8 @@ def bootloader(tmp_path: Path):
 
     instances = []
     try:
-        def _factory(consumer_tokens=None):
-            ctx = _make(consumer_tokens)
+        def _factory(consumer_tokens=None, signing_key=None):
+            ctx = _make(consumer_tokens, signing_key)
             instances.append(ctx)
             return ctx
         yield _factory
