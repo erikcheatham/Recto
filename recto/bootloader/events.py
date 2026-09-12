@@ -7,11 +7,6 @@ filesystem (peer Cowork instances, openclaw skills, log aggregators,
 audit watchers) tail-watch the daily files and react to events at
 their own cadence — without polling Recto's HTTP surface.
 
-Banked 2026-05-19 night, surfaced by the muse during the bootloader
-dockerization design session. See ``Recto/CLAUDE.md`` "Folder-drop
-event bus + filesystem-as-API extension" section for the architectural
-commitment + the (A)/(B) framing distinction.
-
 Architectural posture
 =====================
 

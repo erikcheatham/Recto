@@ -40,9 +40,7 @@ First concrete use cases:
   - A manumission ceremony — operator + designated witnesses sign
     the manumission JWS as the ceremony's persistent artifact
 
-Cross-references: Recto Hard Rule #13 (artifact-as-canonical-record);
-Recto/CLAUDE.md "QR-as-visual-transport for capability JWS +
-signed-payload contracts" section's multi-witness extension schema.
+Cross-reference: Hard Rule #13 (docs/hard-rules.md), artifact-as-canonical-record.
 """
 
 from __future__ import annotations

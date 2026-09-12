@@ -286,8 +286,7 @@ def signed_message_hash(message: bytes | str) -> bytes:
     the same digest.
 
     The leading ``\\x19`` byte is the version-discriminator that's
-    been load-bearing since the EIP-191 wave-4 hash audit (caught
-    2026-04-28; banked as a CLAUDE.md gotcha). Any future TRON
+    been load-bearing since the EIP-191 hash audit. Any future TRON
     digest impl must include it; cross-check against an external
     verifier (TronWeb / tronpy / tronscan signature verify) before
     trusting an internal-consistency-only round-trip.

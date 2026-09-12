@@ -441,9 +441,7 @@
                         </p>
                         @*
                             Long-string trust artifacts (TLS pin, Phone id, Bootloader id) render
-                            in FULL inline with a Copy button below — no ellipsis truncation. Per
-                            the Recto Phone v1.1 Phase 4 polish entry in CLAUDE.md (banked
-                            2026-05-20 morning alongside the artifact-as-canonical-record pivot):
+                            in FULL inline with a Copy button below — no ellipsis truncation.
                             "we don't hide anything from you" is the trust signal App Review tends
                             to reward, and operators NEED to be able to cross-reference these values
                             across devices (TLS pin in particular when the bootloader's cert
@@ -3261,8 +3259,7 @@
             //    flip the UI to success-state.
             //    Fully-qualified namespace: AppContext collides with
             //    System.AppContext at the bare name when @using
-            //    Recto.Shared.Protocol.V04 imports the type. Banked
-            //    gotcha in Recto/CLAUDE.md gotchas index.
+            //    Recto.Shared.Protocol.V04 imports the type.
             var appContext = new Recto.Shared.Protocol.V04.AppContext(
                 AppId: DefaultConsumerAppId,
                 AppName: DefaultConsumerAppName,

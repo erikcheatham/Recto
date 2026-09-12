@@ -33,8 +33,8 @@ Hard rules in this module
 -------------------------
 
 - stdlib HTTP only (``http.server.ThreadingHTTPServer`` +
-  ``BaseHTTPRequestHandler``). No Flask/FastAPI/Starlette. Per CLAUDE.md
-  hard rule: the launcher path runs from a default ``pip install
+  ``BaseHTTPRequestHandler``). No Flask/FastAPI/Starlette. Per the
+  hard rule (docs/hard-rules.md): the launcher path runs from a default ``pip install
   recto`` with no extra ceremony.
 - Soft-fail on bind. If port 5050 is taken or bind raises, log a
   warning and skip the admin UI -- the supervised child must keep

@@ -192,9 +192,8 @@ if ! dotnet publish Recto.csproj \
     echo "ABORT: dotnet publish failed." >&2
     echo "       Common causes:" >&2
     echo "       (a) errSecInternalComponent during codesign — keychain ACL" >&2
-    echo "           layer 2 (per-key Allow-all) needs Parsec GUI ceremony." >&2
-    echo "           See Recto/CLAUDE.md gotchas index 'codesign returns" >&2
-    echo "           errSecInternalComponent'." >&2
+    echo "           layer 2 (per-key Allow-all) must be set in the GUI" >&2
+    echo "           Keychain Access session, not over ssh." >&2
     echo "       (b) MT7137 entitlements/profile mismatch — verify the App" >&2
     echo "           Store profile (not Dev) has aps-environment=production." >&2
     echo "       (c) cert/profile chain broken — re-verify via 'security" >&2

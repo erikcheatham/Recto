@@ -245,8 +245,7 @@
 		     Apple's same-build-rejection rule + Android versionCode
 		     bump invalidates the MAUI BlazorWebView resource cache
 		     so sideload reinstalls pick up the new bytecode without
-		     requiring an uninstall+reinstall cycle — banked gotcha
-		     in Recto/CLAUDE.md).
+		     requiring an uninstall+reinstall cycle).
 		     Build 9 (2026-06-03 night, About-card build-number
 		     cosmetic fix): the FileVersion template below got
 		     authored for 2-segment ApplicationDisplayVersion ("1.0"

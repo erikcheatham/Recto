@@ -1,9 +1,8 @@
 """
 recto.qr — QR-as-visual-transport primitive for signed payloads.
 
-The QR substrate primitive shipped as Phase 1 of the artifact-as-
-canonical-record canonical pivot (banked 2026-05-20 morning in
-Recto/CLAUDE.md). Downstream of Hard Rule #13: signed payloads are
+Phase 1 of the artifact-as-canonical-record pivot. Downstream of
+Hard Rule #13 (docs/hard-rules.md): signed payloads are
 portable artifacts; the bytes themselves are the canonical record,
 NOT a row in any centralized database. QR codes are one transport
 layer for those bytes (alongside HTTP and the folder-drop event bus
@@ -40,10 +39,7 @@ except Pillow's image-codec backends; both have permissive BSD/HPND
 licenses. SVG output is available via qrcode's built-in SVG factory
 (no Pillow dependency for the SVG path).
 
-See `recto/qr/SPEC.md` for the wire-format specification and
-Recto/CLAUDE.md "QR-as-visual-transport for capability JWS +
-signed-payload contracts" section for the canonical architectural
-framework + per-wave sequencing roadmap.
+See `recto/qr/SPEC.md` for the wire-format specification.
 """
 
 from __future__ import annotations

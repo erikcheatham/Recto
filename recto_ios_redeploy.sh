@@ -115,7 +115,7 @@ say "Build configuration: $CONFIG"
 
 # ---------- Phase 1: git pull -----------------------------------------------
 #
-# Two escape hatches per the banked Recto gotcha (CLAUDE.md):
+# Two escape hatches:
 #   SKIP_PULL=1        skip the git pull entirely (deploy current local state)
 #   RECTO_PAT=<token>  pull with embedded PAT (non-interactive SSH-friendly)
 # Default GIT_TERMINAL_PROMPT=0 so the script surfaces a clean error instead

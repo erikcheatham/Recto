@@ -144,9 +144,8 @@ qr = [
    # or structured QRPayloadV1 envelopes as QR PNG/SVG images;
    # multi-witness contract operations for chain-of-trust artifacts
    # that grow as witnesses sign). Phase 1 of the artifact-as-
-   # canonical-record canonical pivot banked 2026-05-20 morning per
-   # Recto/CLAUDE.md "QR-as-visual-transport" section + Hard Rule
-   # #13. v1 ships ENCODE-only (PNG + SVG output via qrcode + Pillow);
+   # canonical-record pivot (Hard Rule #13, docs/hard-rules.md).
+   # v1 ships ENCODE-only (PNG + SVG output via qrcode + Pillow);
    # decode (QR image -> JWS string) is deferred to v2 because Recto
    # Phone has its own native QR scanner via MAUI Blazor and Python
    # decode would require pyzbar/zxing-cpp (native deps). Canonical

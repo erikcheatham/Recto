@@ -11,8 +11,7 @@ replay -- a captured signature for one target can't be reused against
 a different target.
 
 Trust model for v1: any genuine paired phone has implicit authority
-over its siblings (the "phones-as-master-quorum" model banked in
-CLAUDE.md). Phase 5 v3 multi-device-per-user architecture will tighten
+over its siblings (the "phones-as-master-quorum" model). Phase 5 v3 multi-device-per-user architecture will tighten
 this with capability-JWT-gating; for v1 the signed-challenge from a
 registered phone IS the authority.
 """

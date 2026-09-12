@@ -26,9 +26,7 @@ namespace Recto.Shared.QR;
 /// <see cref="QrCanonicalJson.CanonicalSigningInput"/>.
 /// </para>
 /// <para>
-/// Cross-references: Recto Hard Rule #13 (artifact-as-canonical-record);
-/// A consumer commitment on portable signed artifacts; Recto/CLAUDE.md
-/// "QR-as-visual-transport" multi-witness contract extension schema.
+/// Cross-reference: Hard Rule #13 (docs/hard-rules.md), artifact-as-canonical-record.
 /// </para>
 /// </summary>
 public static class QrMultiWitness

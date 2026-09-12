@@ -18,10 +18,8 @@ namespace Recto.Shared.QR;
 // canonical record; the dataclass records here are just the in-memory
 // view of those bytes.
 //
-// Cross-references: recto/qr/SPEC.md (canonical wire-format spec);
-// Recto/CLAUDE.md "QR-as-visual-transport for capability JWS +
-// signed-payload contracts" (architectural framework); Recto.Shared.
-// Capability namespace (sister mirror pattern for capability JWS).
+// Cross-references: recto/qr/SPEC.md (wire-format spec); docs/hard-rules.md
+// (#13); Recto.Shared.Capability (sister mirror pattern for capability JWS).
 
 /// <summary>
 /// Per-QR-spec v40 capacity ceiling at error-correction-level L

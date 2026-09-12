@@ -35,8 +35,6 @@ namespace Recto.Shared.QR;
 //     concern. This decoder is envelope-validation only.
 //
 // Cross-references:
-//   - Recto/CLAUDE.md "QR-as-visual-transport for capability JWS +
-//     signed-payload contracts" — architectural framework.
 //   - QrEncoder.cs — sister encoder this decoder round-trips against.
 //   - Hard Rule #13 (artifact-as-canonical-record) — the QR's bytes ARE
 //     the canonical record; this decoder produces the typed view of those

@@ -182,8 +182,7 @@ RUN mkdir -p ${RECTO_STATE_DIR} /etc/recto
 # /v0.4/capability/manifest is GUARANTEED 404 in the canonical state
 # where the manifest isn't wired into the vault, which is the live
 # posture for capability_request flows. /v0.4/health is the canonical
-# health endpoint per .staging/CLAUDE.md smoke endpoints section —
-# returns 200 with bootloader_id + ok:true + v0_4_protocol:1 from
+# health endpoint — returns 200 with bootloader_id + ok:true + v0_4_protocol:1 from
 # server.py:_handle_health. Swapping eliminates the cosmetic "Docker
 # unhealthy" label that was firing every 30s × 25h despite the
 # bootloader operating cleanly end-to-end. Application-state-vs-

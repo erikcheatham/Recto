@@ -16,7 +16,7 @@ Why optional dependency
 -----------------------
 
 OpenTelemetry's Python tree is ~10 transitive packages (api, sdk,
-exporter, proto, etc.). Hard rule from CLAUDE.md is that the launcher
+exporter, proto, etc.). Hard rule (docs/hard-rules.md): the launcher
 path must run from a default ``pip install recto`` with no extra
 ceremony. The OTel deps are gated behind the ``[otel]`` extra so
 operators who want traces opt in explicitly:

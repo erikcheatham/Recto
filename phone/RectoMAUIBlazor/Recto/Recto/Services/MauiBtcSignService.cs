@@ -181,10 +181,8 @@ public sealed class MauiBtcSignService : IBtcSignService
             //       for BTC + LTC; P2PKH compressed (31..34) for DOGE +
             //       BCH because those coins have no bech32 HRP and the
             //       verifier would otherwise refuse to encode the
-            //       recovered hash160 as a SegWit address. See the
-            //       "BIP-137 header byte must dispatch on coin" gotcha
-            //       in CLAUDE.md (banked retroactively after wave-7
-            //       smoke on the test device, 2026-04-30).
+            //       recovered hash160 as a SegWit address: the BIP-137
+            //       header byte must dispatch on coin.
             var msgHash = BtcSigningOps.SignedMessageHash(message, coin);
             var compactSig = BtcSigningOps.SignCompactBip137(msgHash, leaf.PrivateKey, coin);
 

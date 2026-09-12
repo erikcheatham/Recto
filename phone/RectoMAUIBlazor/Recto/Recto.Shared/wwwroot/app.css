@@ -990,9 +990,8 @@ h1:focus { outline: none; }
    Bootloader id), giving each value its own "move to another device"
    affordance. Inline-flex so the button hugs its content (not full
    width); small top margin separates it visually from the value above
-   without crowding. Per the App Store screenshot impact rationale in
-   CLAUDE.md's Phase 4 entry, full-transparency-by-default + standard
-   mobile-UX affordances is what App Review tends to reward. The QR-
+   without crowding. Full-transparency-by-default + standard mobile-UX
+   affordances is what App Review tends to reward. The QR-
    code button is a v1.2 follow-up that depends on the recto/qr/
    substrate primitive (Phase 1 of the new 5-phase queue). */
 .rec-artifact-actions {

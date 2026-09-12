@@ -1,8 +1,8 @@
 """
 recto.qr.types — wire-format dataclasses for QR-encoded signed payloads.
 
-The QR-as-visual-transport architectural primitive (banked 2026-05-20
-morning in Recto/CLAUDE.md) is downstream of Hard Rule #13: signed
+The QR-as-visual-transport primitive is downstream of Hard Rule #13
+(docs/hard-rules.md): signed
 payloads are portable artifacts — the bytes themselves are the
 canonical record, NOT a row in any centralized database. QR codes
 serve as one transport layer for those bytes (alongside HTTP and the
@@ -26,9 +26,7 @@ fragmentation support for >2953-byte payloads). The QR's bytes are
 the source of truth; metadata enables future format evolution
 without breaking v1 readers.
 
-See `recto/qr/SPEC.md` for the human-readable spec and the
-"QR-as-visual-transport for capability JWS + signed-payload contracts"
-section in Recto/CLAUDE.md for the canonical architectural framework.
+See `recto/qr/SPEC.md` for the human-readable spec.
 """
 
 from __future__ import annotations
@@ -197,11 +195,8 @@ class MultiWitnessContract:
     receipt as a portable QR artifact OR the first civic-office promotion
     certificate (per that consumer's own rules + civic-office model).
 
-    Cross-references: Recto Hard Rule #13 (artifact-as-canonical-record
-    over ledger-as-canonical-record); the consumer's architectural
-    commitment #15 (portable signed artifacts feed the THRU citation
-    economy); Recto/CLAUDE.md "QR-as-visual-transport for capability
-    JWS + signed-payload contracts" section.
+    Cross-reference: Hard Rule #13 (docs/hard-rules.md) —
+    artifact-as-canonical-record over ledger-as-canonical-record.
     """
 
     # Schema version. Always 1 for MultiWitnessContract.
