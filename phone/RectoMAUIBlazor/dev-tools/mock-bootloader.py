@@ -1503,10 +1503,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             now = int(time.time())
             request_id = str(uuid.uuid4())
-            # Construct a sample CapabilityClaims using the v1 starter
-            # shape from the IM (Darwin staging-deploys, weight 18, Tier
-            # 1, 24h expiry). The same claim shape the test fixture
-            # pins.
+            # Sample CapabilityClaims in the v1 starter shape the test
+            # fixture pins (staging-deploys, Tier 1, 24h expiry).
             claims_dict = {
                 "iss": "phone:operator:enclave",
                 "sub": "agent:darwin@staging",
