@@ -723,6 +723,47 @@ def test_template_manifest_user_device_pairing_group(
     assert template_manifest.group_weight("user:device-pairing") == 2
 
 
+def test_template_manifest_users_lockout_pair(
+    template_manifest: ActionManifest,
+):
+    """users:lockout + users:lockout_verdict (2026-09-13) are a downstream
+    consumer's enforcement pair against a principal who disclosed a
+    SEALED artifact: the consumer attributes and RAISES, only the
+    operator's phone executes; the verdict is a second signed act after
+    the principal's petition. Both Tier 2 (31..100): authority-removing
+    against a third party, human-consequential. A consumer whose
+    private manifest lacks these rows sees its lockout card REFUSED BY
+    NAME at resolve_actions — the pin that keeps the sample carrying
+    them."""
+    assert "users:lockout" in template_manifest.actions
+    assert "users:lockout_verdict" in template_manifest.actions
+    lockout = template_manifest.actions["users:lockout"].count
+    verdict = template_manifest.actions["users:lockout_verdict"].count
+    assert TIER_WEIGHT_CEILINGS[1] < lockout <= TIER_WEIGHT_CEILINGS[2]
+    assert TIER_WEIGHT_CEILINGS[1] < verdict <= TIER_WEIGHT_CEILINGS[2]
+    # The verdict answers the lockout; it never outweighs it.
+    assert verdict < lockout
+
+
+def test_template_manifest_operator_user_lockout_group(
+    template_manifest: ActionManifest,
+):
+    """operator:user-lockout wraps the pair — operator-held, not
+    user-held (the author of a leaked artifact reports; only the mint
+    locks). Its weight is the sum of the two rows and sits inside the
+    Tier 2 ceiling."""
+    assert "operator:user-lockout" in template_manifest.groups
+    assert template_manifest.groups["operator:user-lockout"].actions == [
+        "users:lockout",
+        "users:lockout_verdict",
+    ]
+    assert template_manifest.group_weight("operator:user-lockout") == (
+        template_manifest.actions["users:lockout"].count
+        + template_manifest.actions["users:lockout_verdict"].count
+    )
+    assert template_manifest.group_weight("operator:user-lockout") <= TIER_WEIGHT_CEILINGS[2]
+
+
 def test_assemble_jws_round_trips(example_claims: CapabilityClaims):
     """assemble_jws + parse_jws round-trip preserves header and payload
     structure (signature verification is a separate concern)."""
