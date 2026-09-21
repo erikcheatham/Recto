@@ -33,7 +33,23 @@ public sealed record RegistrationResponse(
     // 2026-09-21 (ruling A): the poll key this bootloader RECORDED -- echoed
     // back so the phone signs reads only with a key the registry will verify.
     // The pairing flow refuses a response whose echo is not the key it sent.
-    [property: JsonPropertyName("poll_public_key_b64u")] string? PollPublicKeyB64u = null);
+    [property: JsonPropertyName("poll_public_key_b64u")] string? PollPublicKeyB64u = null,
+    // 2026-09-21 (hard rule 14.4): the slot this registration holds, and -- on
+    // a displacement -- the phone_ref that left it.
+    [property: JsonPropertyName("slot")] string? Slot = null,
+    [property: JsonPropertyName("displaced_phone_ref")] string? DisplacedPhoneRef = null,
+    // THE REPLACEMENT QUESTION: a 409 slot_occupied parses into this same
+    // record with Registered=false, Error="slot_occupied" and the occupant the
+    // operator is asked about. BootloaderClient passes that one 409 through.
+    [property: JsonPropertyName("error")] string? Error = null,
+    [property: JsonPropertyName("occupant")] SlotOccupant? Occupant = null);
+
+/// <summary>The phone holding a slot the incoming phone asked for (hard rule 14.4).</summary>
+public sealed record SlotOccupant(
+    [property: JsonPropertyName("phone_ref")] string PhoneRef,
+    [property: JsonPropertyName("device_label")] string DeviceLabel,
+    [property: JsonPropertyName("last_seen_unix")] long LastSeenUnix,
+    [property: JsonPropertyName("registered_at_unix")] long RegisteredAtUnix);
 
 /// <summary>
 /// The key set a derived bootloader id is computed from. Public keys only —

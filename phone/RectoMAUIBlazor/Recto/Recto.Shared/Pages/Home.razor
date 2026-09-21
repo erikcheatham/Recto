@@ -1549,7 +1549,13 @@
                                 {
                                     <div class="card mb-2 border-secondary-subtle">
                                         <div class="card-body p-3">
-                                            <p class="mb-1 fw-semibold">@other.DeviceLabel</p>
+                                            <p class="mb-1 fw-semibold">
+                                                @other.DeviceLabel
+                                                @if (!string.IsNullOrEmpty(other.Slot))
+                                                {
+                                                    <span class="badge bg-secondary ms-2 text-uppercase">@other.Slot</span>
+                                                }
+                                            </p>
                                             <p class="mb-1 text-muted small">
                                                 <code>@other.PhoneId</code>
                                             </p>
@@ -1723,6 +1729,41 @@
                            @bind="_pairingCode"
                            @bind:event="oninput" />
                 </div>
+
+                <div class="form-check text-start mb-3">
+                    <input id="pair-as-recovery" class="form-check-input" type="checkbox"
+                           disabled="@_busy" @bind="_pairAsRecovery" />
+                    <label for="pair-as-recovery" class="form-check-label small">
+                        Pair as the <strong>recovery</strong> device
+                        <span class="text-muted">(high-consequence operations only; leave off for the everyday phone)</span>
+                    </label>
+                </div>
+
+                @if (_slotQuestion is not null)
+                {
+                    <div class="alert alert-warning text-start mb-3" role="alert">
+                        <div class="fw-semibold mb-1">
+                            The @_slotQuestionSlot slot is taken.
+                        </div>
+                        <div class="small mb-2">
+                            <strong>@_slotQuestion.DeviceLabel</strong> holds it
+                            (last seen @DescribeAge(_slotQuestion.LastSeenUnix)).
+                            Replacing it signs that phone out of this bootloader now:
+                            its queue is cleared and it cannot read or approve again
+                            unless it is paired afresh.
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-danger btn-sm flex-fill"
+                                    @onclick="@(() => _slotAnswer?.TrySetResult(true))">
+                                Replace @_slotQuestion.DeviceLabel
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary btn-sm flex-fill"
+                                    @onclick="@(() => _slotAnswer?.TrySetResult(false))">
+                                Keep it
+                            </button>
+                        </div>
+                    </div>
+                }
 
                 <button type="button"
                         class="btn btn-lg btn-primary w-100"
@@ -1915,6 +1956,26 @@
     // potentially confusing to Apple's reviewer.
     private string _bootloaderUrl = DemoBootloaderUrl;
     private string _pairingCode = string.Empty;
+
+    // THE SLOTS (hard rule 14.4, 2026-09-21). Which slot this pairing claims,
+    // and the replacement question when it is occupied: the registry answers
+    // 409 with the occupant; the pairing flow parks on _slotAnswer until the
+    // operator taps Replace or Keep; Replace signs the claim with the identity
+    // key (one more biometric prompt) and retries on the SAME challenge.
+    private bool _pairAsRecovery;
+    private SlotOccupant? _slotQuestion;
+    private string _slotQuestionSlot = "primary";
+    private TaskCompletionSource<bool>? _slotAnswer;
+
+    private static string DescribeAge(long unixSeconds)
+    {
+        if (unixSeconds <= 0) return "never";
+        var age = DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
+        if (age < TimeSpan.FromMinutes(2)) return "just now";
+        if (age < TimeSpan.FromHours(2)) return $"{(int)age.TotalMinutes} min ago";
+        if (age < TimeSpan.FromDays(2)) return $"{(int)age.TotalHours} h ago";
+        return $"{(int)age.TotalDays} days ago";
+    }
     private bool _busy;
     private string _busyText = string.Empty;
     private string? _errorMessage;
@@ -2786,13 +2847,58 @@
                 PushToken: pushToken,
                 PushPlatform: pushPlatform,
                 PollPublicKeyB64u: pollPubB64u,
-                PollKeyDelegationB64u: pollDelegationB64u);
+                PollKeyDelegationB64u: pollDelegationB64u,
+                Slot: _pairAsRecovery ? "recovery" : "primary");
 
             var registerResult = await BootloaderClient.RegisterAsync(
                 _bootloaderUrl, request, CancellationToken.None);
             if (registerResult.IsFailure)
             {
                 _errorMessage = registerResult.Error.Message;
+                return;
+            }
+
+            // THE REPLACEMENT QUESTION (hard rule 14.4). Registered=false with
+            // an occupant is the registry asking, on a challenge it has NOT
+            // consumed. Park until the operator answers; Replace signs the
+            // claim with the identity key and retries the same registration.
+            if (!registerResult.Value.Registered && registerResult.Value.Occupant is { } occupant)
+            {
+                _slotQuestion = occupant;
+                _slotQuestionSlot = request.Slot;
+                _slotAnswer = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await SetBusyTextAsync("Waiting for your answer...");
+                var replace = await _slotAnswer.Task;
+                _slotQuestion = null;
+                _slotAnswer = null;
+                if (!replace)
+                {
+                    _errorMessage = $"Kept {occupant.DeviceLabel}; this phone was not paired.";
+                    return;
+                }
+                await SetBusyTextAsync("Awaiting biometric approval (replace)...");
+                var claim = await EnclaveKeys.SignAsync(
+                    KeyAlias,
+                    PollSigning.BuildSlotReplacePayload(request.Slot, occupant.PhoneRef, request.PublicKeyB64u),
+                    CancellationToken.None);
+                if (claim.IsFailure)
+                {
+                    _errorMessage = claim.Error.Message;
+                    return;
+                }
+                await SetBusyTextAsync("Registering with bootloader...");
+                registerResult = await BootloaderClient.RegisterAsync(
+                    _bootloaderUrl, request with { SlotReplaceB64u = Base64UrlEncode(claim.Value) },
+                    CancellationToken.None);
+                if (registerResult.IsFailure)
+                {
+                    _errorMessage = registerResult.Error.Message;
+                    return;
+                }
+            }
+            if (!registerResult.Value.Registered)
+            {
+                _errorMessage = $"The bootloader did not register this phone ({registerResult.Value.Error ?? "no reason given"}).";
                 return;
             }
 

@@ -13,4 +13,6 @@ public sealed record RegisteredPhoneInfo(
     [property: JsonPropertyName("phone_id")] string PhoneId,
     [property: JsonPropertyName("device_label")] string DeviceLabel,
     [property: JsonPropertyName("algorithm")] string Algorithm,
-    [property: JsonPropertyName("paired_at")] string PairedAt);
+    [property: JsonPropertyName("paired_at")] string PairedAt,
+    // 2026-09-21 (hard rule 14.4): "primary" | "recovery".
+    [property: JsonPropertyName("slot")] string? Slot = null);

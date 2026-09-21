@@ -59,6 +59,7 @@ from recto.bootloader.sessions import (
     verify_signature,
 )
 from recto.bootloader.state import (
+    SLOTS,
     AppContext,
     phone_ref_of,
     CapabilityResult,
@@ -102,6 +103,20 @@ POLL_SIG_FRESHNESS_SECONDS = 120
 # is the signed claim that keeps "every crossing is a signature by THAT
 # key" true: the identity key named the poll key, once, under biometrics.
 POLL_KEY_DELEGATION_PREFIX = "recto-poll-key-v1"
+
+# THE SLOTS (2026-09-21, hard rule 14.4). Two phones, not a list. Pairing into
+# an occupied slot is refused with 409 slot_occupied and the occupant's
+# model + last seen, so the phone can ask the operator the replacement
+# question; the answer is the incoming IDENTITY key's signature over
+#   recto-slot-replace-v1|{slot}|{occupant phone_ref}|{incoming pubkey}
+# carried as `slot_replace_b64u` on the retried registration. The occupant
+# is revoked in the same act as the incoming key is registered.
+SLOT_REPLACE_PREFIX = "recto-slot-replace-v1"
+
+
+def slot_replace_payload(slot: str, occupant_phone_ref: str, incoming_public_key_b64u: str) -> bytes:
+    """The ASCII bytes the incoming identity key signs to displace a slot's occupant."""
+    return f"{SLOT_REPLACE_PREFIX}|{slot}|{occupant_phone_ref}|{incoming_public_key_b64u}".encode("ascii")
 
 
 def poll_key_delegation_payload(public_key_b64u: str, poll_public_key_b64u: str) -> bytes:
@@ -1132,6 +1147,41 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 f"protocol version mismatch: server={PROTOCOL_VERSION}, "
                 f"phone={body.get('v0_4_protocol')!r}"
             )
+        # THE SLOT (hard rule 14.4). Two phones, not a list. The question is
+        # asked BEFORE the challenge is consumed: the pairing code was spent
+        # minting that challenge, and the code is the operator's authority for
+        # displacement (the claim below only binds the incoming key's intent).
+        # A 409 here leaves the challenge intact, so the phone answers on the
+        # same one, inside its TTL, with slot_replace_b64u added.
+        slot = body.get("slot") or "primary"
+        if slot not in SLOTS:
+            raise BootloaderError(
+                f"registration refused: slot must be one of {list(SLOTS)}; got {slot!r}"
+            )
+        incoming_ref = _phone_ref(public_key_b64u)
+        occupant = next(
+            (p for p in cfg.state.list_phones()
+             if p.slot == slot and p.phone_id != incoming_ref),
+            None,
+        )
+        replace_sig = body.get("slot_replace_b64u") or None
+        if occupant is not None and not replace_sig:
+            self._send_json(HTTPStatus.CONFLICT, {
+                "error": "slot_occupied",
+                "slot": slot,
+                "occupant": {
+                    "phone_ref": occupant.phone_id,
+                    "device_label": occupant.device_label,
+                    "last_seen_unix": occupant.last_seen_unix,
+                    "registered_at_unix": occupant.registered_at_unix,
+                },
+                "detail": (
+                    f"the {slot} slot holds {occupant.device_label!r}; to replace it, "
+                    "retry the same registration with slot_replace_b64u = the identity "
+                    f"key's signature over {SLOT_REPLACE_PREFIX}|{slot}|{occupant.phone_id}|<public_key_b64u>"
+                ),
+            })
+            return
         if not cfg.challenges.consume_challenge(challenge):
             raise RegistrationExpiredError("registration challenge expired or invalid")
         # Pick the algorithm the phone declared. The registration body's
@@ -1197,6 +1247,18 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 "registration refused: poll_key_delegation_b64u does not verify "
                 f"against the identity key (algorithm={chosen_algo!r})"
             )
+        if occupant is not None:
+            claimed = verify_signature(
+                payload=slot_replace_payload(slot, occupant.phone_id, public_key_b64u),
+                signature_b64u=replace_sig or "",
+                public_key_b64u=public_key_b64u,
+                algorithm=chosen_algo,
+            )
+            if not claimed:
+                raise BootloaderError(
+                    "registration refused: slot_replace_b64u does not verify against "
+                    f"the incoming identity key for occupant {occupant.phone_id!r}"
+                )
         reg = PhoneRegistration.new(
             device_label=str(device_label),
             public_key_b64u=public_key_b64u,
@@ -1204,7 +1266,17 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             push_token=push_token,
             push_platform=push_platform if push_token else None,
             poll_public_key_b64u=poll_public_key_b64u,
+            slot=slot,
         )
+        if occupant is not None:
+            # The same act: the displaced key's registration, sessions and
+            # pending queue go before the incoming key is recorded, so at no
+            # moment do two keys hold one slot.
+            cfg.state.revoke_phone(occupant.phone_id)
+            logging.getLogger("recto.bootloader.slots").warning(
+                "slot=%s displaced phone_id=%s by phone_id=%s",
+                slot, occupant.phone_id, incoming_ref,
+            )
         # THE KEY IS THE IDENTITY (2026-09-21): the store answers with the
         # record AS STORED -- a key it already held keeps the id it had, so a
         # re-pair of the same phone is the same phone and nothing carded on
@@ -1220,6 +1292,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # Ruling A: the key this registry verifies the phone's READS
             # against. The phone signs reads only with the key echoed here.
             "poll_public_key_b64u": reg.poll_public_key_b64u,
+            "slot": reg.slot,
+            **({"displaced_phone_ref": occupant.phone_id} if occupant is not None else {}),
             "bootloader_id": cfg.bootloader_id,
             # Empty managed_secrets for now; the operator wires services
             # to specific phone_ids via service.yaml's
@@ -1630,6 +1704,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                     # Additive reference field (phone_id split); never
                     # auth. Unknown key to pre-split phone clients.
                     "phone_ref": _phone_ref(p.public_key_b64u),
+                    "slot": p.slot,
                     "device_label": p.device_label,
                     "algorithm": (
                         p.supported_algorithms[0]

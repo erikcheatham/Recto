@@ -79,7 +79,8 @@ def _key() -> tuple[Ed25519PrivateKey, str]:
     return key, _b64u(pub_raw)
 
 
-def _register(ctx, key: Ed25519PrivateKey, pub_b64u: str, *, label: str) -> tuple[int, dict[str, Any]]:
+def _register(ctx, key: Ed25519PrivateKey, pub_b64u: str, *, label: str,
+              slot: str = "primary") -> tuple[int, dict[str, Any]]:
     code, _ = ctx["challenges"].issue_pairing_code()
     status, chal = _http("GET", f"{ctx['base_url']}/v0.4/registration_challenge?code={code}")
     assert status == 200, f"challenge mint failed: {status} {chal}"
@@ -90,6 +91,7 @@ def _register(ctx, key: Ed25519PrivateKey, pub_b64u: str, *, label: str) -> tupl
         "public_key_b64u": pub_b64u,
         "supported_algorithms": ["ed25519"],
         "v0_4_protocol": 1,
+        "slot": slot,
         "registration_proof": {
             "challenge": challenge,
             "signature_b64u": _b64u(key.sign(challenge.encode("ascii"))),
@@ -141,10 +143,11 @@ def test_the_same_key_registered_twice_is_one_phone(ctx):
 
 
 def test_two_different_keys_are_two_phones(ctx):
-    """The positive control for the merge: it merges on the KEY, not on anything else."""
+    """The positive control for the merge: it merges on the KEY, not on anything else.
+    Two phones are two SLOTS (rule 14.4): the second names recovery."""
     k1, p1 = _key()
     k2, p2 = _key()
     _, a = _register(ctx, k1, p1, label="pixel")
-    _, b = _register(ctx, k2, p2, label="iphone")
+    _, b = _register(ctx, k2, p2, label="iphone", slot="recovery")
     assert a["phone_id"] != b["phone_id"]
     assert len(ctx["state"].list_phones()) == 2

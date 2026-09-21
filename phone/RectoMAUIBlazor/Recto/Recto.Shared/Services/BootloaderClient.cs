@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
@@ -418,6 +419,16 @@ public sealed class BootloaderClient : IBootloaderClient
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                if (response.StatusCode == HttpStatusCode.Conflict
+                    && TryExtractServerErrorCode(errorBody) == "slot_occupied")
+                {
+                    // THE REPLACEMENT QUESTION (hard rule 14.4): a 409 whose body
+                    // names the occupant is the registry ASKING, not refusing. It
+                    // parses as a RegistrationResponse with Registered=false and
+                    // Occupant set; the pairing flow puts the question to the
+                    // operator and retries on the SAME challenge with the claim.
+                    return Result.Success(errorBody);
+                }
                 _log.LogWarning(
                     "Bootloader {Method} {Url} returned {Status}: {Body}",
                     method, url, (int)response.StatusCode, Truncate(errorBody, 500));
@@ -480,6 +491,22 @@ public sealed class BootloaderClient : IBootloaderClient
     /// object, or doesn't have an <c>error</c> field, returns null and
     /// the caller falls back to the generic HTTP-status message.
     /// </summary>
+    /// <summary>The bootloader's machine-readable <c>error</c> code, or null.</summary>
+    private static string? TryExtractServerErrorCode(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String
+                ? e.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     private static string? TryExtractServerErrorMessage(string body)
     {
         if (string.IsNullOrWhiteSpace(body)) return null;

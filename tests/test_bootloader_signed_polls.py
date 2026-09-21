@@ -427,6 +427,8 @@ def test_register_response_carries_phone_ref(advisory):
             "v0_4_protocol": 1,
             "public_key_b64u": pub_b64u,
             "device_label": "phone-ref-test",
+            # the fixture's phone holds primary; two phones are two slots (rule 14.4)
+            "slot": "recovery",
             "supported_algorithms": ["ed25519"],
             "registration_proof": {
                 "challenge": challenge,

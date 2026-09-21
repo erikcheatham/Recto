@@ -59,6 +59,17 @@ public static class PollSigning
     public static byte[] BuildDelegationPayload(string identityPubB64u, string pollPubB64u)
         => Encoding.ASCII.GetBytes($"{DelegationPrefix}|{identityPubB64u}|{pollPubB64u}");
 
+    /// <summary>Slot-replacement prefix; mirrors the server's SLOT_REPLACE_PREFIX (hard rule 14.4).</summary>
+    public const string SlotReplacePrefix = "recto-slot-replace-v1";
+
+    /// <summary>
+    /// The bytes the incoming IDENTITY key signs to displace a slot's occupant:
+    /// <c>recto-slot-replace-v1|{slot}|{occupantPhoneRef}|{incomingPubB64u}</c>.
+    /// Mirrors the server's slot_replace_payload byte for byte.
+    /// </summary>
+    public static byte[] BuildSlotReplacePayload(string slot, string occupantPhoneRef, string incomingPubB64u)
+        => Encoding.ASCII.GetBytes($"{SlotReplacePrefix}|{slot}|{occupantPhoneRef}|{incomingPubB64u}");
+
     /// <summary>Signature header; mirrors the server's POLL_SIG_HEADER.</summary>
     public const string SignatureHeader = "X-Recto-Phone-Sig";
 

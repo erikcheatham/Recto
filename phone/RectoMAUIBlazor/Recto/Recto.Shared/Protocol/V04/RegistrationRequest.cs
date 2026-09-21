@@ -26,7 +26,13 @@ public sealed record RegistrationRequest(
     // REQUIRED: the bootloader refuses a registration without both. Typed
     // optional only for construction order; the pairing flow always sets them.
     [property: JsonPropertyName("poll_public_key_b64u")] string? PollPublicKeyB64u = null,
-    [property: JsonPropertyName("poll_key_delegation_b64u")] string? PollKeyDelegationB64u = null);
+    [property: JsonPropertyName("poll_key_delegation_b64u")] string? PollKeyDelegationB64u = null,
+    // 2026-09-21 (hard rule 14.4): the SLOT this phone pairs into -- "primary"
+    // (default) or "recovery" -- and, on the retry that answers the replacement
+    // question, the identity key's signature over
+    // PollSigning.BuildSlotReplacePayload(slot, occupant ref, public_key_b64u).
+    [property: JsonPropertyName("slot")] string Slot = "primary",
+    [property: JsonPropertyName("slot_replace_b64u")] string? SlotReplaceB64u = null);
 
 /// <summary>
 /// Proof that the phone holds the private key matching <c>public_key_b64u</c> &mdash;

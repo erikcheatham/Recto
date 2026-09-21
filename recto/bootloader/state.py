@@ -42,6 +42,7 @@ from typing import Any
 
 __all__ = [
     "PhoneRegistration",
+    "SLOTS",
     "phone_ref_of",
     "Session",
     "PendingRequest",
@@ -248,6 +249,14 @@ class PhoneRegistration:
     # can verify no read. Typed optional only so the dataclass keeps its
     # field order and directly-seeded fixtures construct.
     poll_public_key_b64u: str | None = None
+    # THE SLOT (2026-09-21, hard rule 14.4). A bootloader holds two phones,
+    # not a list: PRIMARY (routine approvals, replaceable) and RECOVERY
+    # (high-consequence operations). Each slot holds one phone_ref; pairing
+    # into an occupied slot is a replacement question, and the displaced key
+    # is revoked in the same act (server._handle_register). A third key cannot
+    # pair without displacing one. Defaults to primary so directly-seeded
+    # fixtures construct; the wire always names it.
+    slot: str = "primary"
 
     @classmethod
     def new(
@@ -259,6 +268,7 @@ class PhoneRegistration:
         push_token: str | None = None,
         push_platform: str | None = None,
         poll_public_key_b64u: str | None = None,
+        slot: str = "primary",
     ) -> PhoneRegistration:
         now = int(time.time())
         # THE KEY IS THE IDENTITY (2026-09-21): the id names the key. This
@@ -276,7 +286,11 @@ class PhoneRegistration:
             push_token=push_token,
             push_platform=push_platform,
             poll_public_key_b64u=poll_public_key_b64u,
+            slot=slot,
         )
+
+
+SLOTS = ("primary", "recovery")
 
 
 def _merge_onto_existing(
