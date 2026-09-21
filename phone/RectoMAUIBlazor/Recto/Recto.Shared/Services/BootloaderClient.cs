@@ -43,17 +43,18 @@ public sealed class BootloaderClient : IBootloaderClient
     private readonly ILogger<BootloaderClient> _log;
     private readonly IReadSigner? _readSigner;
 
-    public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log)
-        : this(http, log, readSigner: null)
-    {
-    }
-
     /// <summary>
+    /// ONE constructor, deliberately. The typed-client factory
+    /// (<c>AddHttpClient&lt;IBootloaderClient, BootloaderClient&gt;</c>) builds
+    /// this with <c>ActivatorUtilities.CreateInstance(provider, httpClient)</c>,
+    /// and two constructors that both accept the given <c>HttpClient</c> are an
+    /// ambiguity it may refuse at startup -- which surfaces as the WebView
+    /// stuck on "Loading..." with no error on screen (2026-09-21, Pixel sideload).
     /// <paramref name="readSigner"/> (hard rule 14.2, ruling A) signs the
     /// phone's READS -- pending, manage/phones, manage/push_token -- with the
-    /// delegated poll key. Null means reads go bare, as before this build.
+    /// delegated poll key; the optional default lets tests construct without DI.
     /// </summary>
-    public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log, IReadSigner? readSigner)
+    public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log, IReadSigner? readSigner = null)
     {
         _http = http;
         _log = log;
