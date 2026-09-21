@@ -1552,6 +1552,20 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             return
         pending = cfg.state.list_pending_for_phone(phone_id)
         pending = [self._restamp_grant_window(p) for p in pending]
+        # A DEAD CARD IS WITHDRAWN, NOT SERVED (2026-09-21, operator: "I don't
+        # like that expired cards are sitting in the phone queue"). A
+        # capability card has two clocks: ttl_seconds bounds how long it may
+        # WAIT on the queue (default 3600) and the signed claims' exp bounds
+        # how long its AUTHORITY lives (the bridge posts ten minutes). When
+        # exp has passed the card can be neither approved nor denied -- the
+        # bootloader would refuse the signature -- yet the queue kept serving
+        # it for the rest of its ttl, and the phone rendered it as "window
+        # closed, nothing to tap here" for up to fifty minutes. Now the first
+        # poll after exp takes it off the queue; the phone's next poll simply
+        # does not see it. The agent that wanted it re-requests (it always
+        # had to). Restamping runs first, so a grant_ttl card's window is
+        # judged AFTER card-open sets it, never on the queue-time claims.
+        pending = [p for p in pending if not self._withdraw_if_authority_expired(p)]
         body: dict[str, Any] = {
             "requests": [self._pending_to_wire(p) for p in pending],
         }
@@ -1597,6 +1611,29 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             max_uses=1,
         )
         return mint_jws(claims, cfg.devices_pair_signing_key)
+
+    def _withdraw_if_authority_expired(self, req) -> bool:
+        """True (and the request is TAKEN off the queue) when a capability
+        card's signed authority has already expired. Other kinds, and cards
+        whose claims cannot be read, are left alone: withdrawing is only ever
+        done on a verdict, never on a parse failure."""
+        cfg = self.config
+        if req.kind != "capability_request" or not req.cap_payload_b64 or cfg.state is None:
+            return False
+        try:
+            pad = "=" * (-len(req.cap_payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(req.cap_payload_b64 + pad))
+            exp = int(payload["exp"])
+        except Exception:  # noqa: BLE001 - unreadable claims are not a verdict
+            return False
+        if exp > int(time.time()):
+            return False
+        cfg.state.take_pending(req.request_id)
+        logging.getLogger("recto.bootloader.pending").info(
+            "card withdrawn: authority expired request_id=%s phone_id=%s exp=%s",
+            req.request_id, req.phone_id, exp,
+        )
+        return True
 
     def _restamp_grant_window(self, req):
         """Re-stamp a queued capability_request's grant window at
