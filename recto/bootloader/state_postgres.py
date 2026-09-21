@@ -66,7 +66,9 @@ from recto.bootloader.state import (
     RevocationEntry,
     Session,
     StateStoreBase,
+    _merge_onto_existing,
     default_state_dir,
+    phone_ref_of,
     validate_genesis_pubkey,
 )
 
@@ -249,16 +251,28 @@ class PostgresStateStore(StateStoreBase):
         d["supported_algorithms"] = tuple(d.get("supported_algorithms") or ())
         return PhoneRegistration(**d)
 
-    def register_phone(self, reg: PhoneRegistration) -> None:
+    def register_phone(self, reg: PhoneRegistration) -> PhoneRegistration:
+        # THE KEY IS THE IDENTITY (2026-09-21): the same rule as the file store,
+        # in one transaction -- a key already held keeps its row's id.
         with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q(
+                    "SELECT doc FROM {schema}.phones "
+                    "WHERE doc->>'public_key_b64u' = %s LIMIT 1"
+                ),
+                (reg.public_key_b64u,),
+            ).fetchone()
+            existing = self._phone_from_doc(row[0]) if row else None
+            stored = _merge_onto_existing(existing, reg)
             conn.execute(
                 self._q(
                     "INSERT INTO {schema}.phones (phone_id, doc) "
                     "VALUES (%s, %s) "
                     "ON CONFLICT (phone_id) DO UPDATE SET doc = EXCLUDED.doc"
                 ),
-                (reg.phone_id, Jsonb(self._phone_to_doc(reg))),
+                (stored.phone_id, Jsonb(self._phone_to_doc(stored))),
             )
+        return stored
 
     def get_phone(self, phone_id: str) -> PhoneRegistration | None:
         with self._pool.connection() as conn:
@@ -266,6 +280,13 @@ class PostgresStateStore(StateStoreBase):
                 self._q("SELECT doc FROM {schema}.phones WHERE phone_id = %s"),
                 (phone_id,),
             ).fetchone()
+            if row is None and phone_id.startswith("pk_"):
+                # a legacy row (Guid id) asked for by its ref
+                for (doc,) in conn.execute(
+                    self._q("SELECT doc FROM {schema}.phones")
+                ).fetchall():
+                    if phone_ref_of(doc.get("public_key_b64u", "")) == phone_id:
+                        return self._phone_from_doc(doc)
         return self._phone_from_doc(row[0]) if row else None
 
     def list_phones(self) -> list[PhoneRegistration]:

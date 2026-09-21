@@ -60,6 +60,7 @@ from recto.bootloader.sessions import (
 )
 from recto.bootloader.state import (
     AppContext,
+    phone_ref_of,
     CapabilityResult,
     PendingRequest,
     PhoneRegistration,
@@ -102,28 +103,14 @@ SIGNED_POLL_MODES = ("off", "advisory", "required")
 
 
 def _phone_ref(public_key_b64u: str) -> str:
-    """Derive the phone's public reference id from its pubkey.
+    """The phone's identity as a name -- ``phone_ref_of`` in the state module.
 
-    ``"pk_" + first 16 hex chars of sha256(raw pubkey bytes)`` where the
-    raw bytes are the base64url-DECODED public key. This is the pure
-    REFERENCE half of the phone_id split: it names the keypair (the
-    actual identity) without being usable as any kind of credential,
-    and it is derivable by anyone who holds the public key. Additive
-    today; re-keying registries onto it is deferred until
-    signed_poll_mode flips to "required".
-
-    Falls back to hashing the ASCII bytes of the string itself when the
-    value is not decodable base64url (defensive: registrations are
-    validated at pairing time, but test fixtures and pre-validation
-    blobs may carry arbitrary strings; a reference derivation must
-    never raise).
+    THE KEY IS THE IDENTITY (2026-09-21): the phone_id split is finished. A
+    new registration's ``phone_id`` IS this ref; a legacy Guid record keeps
+    its Guid and answers to the ref too. One derivation, owned by the store,
+    so the wire and the registry cannot disagree.
     """
-    try:
-        padding = "=" * (-len(public_key_b64u) % 4)
-        raw = base64.urlsafe_b64decode(public_key_b64u + padding)
-    except Exception:  # noqa: BLE001 - reference derivation never raises
-        raw = public_key_b64u.encode("utf-8", errors="replace")
-    return "pk_" + hashlib.sha256(raw).hexdigest()[:16]
+    return phone_ref_of(public_key_b64u)
 
 
 def _constant_time_compare(a: str, b: str) -> bool:
@@ -1172,15 +1159,17 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             push_token=push_token,
             push_platform=push_platform if push_token else None,
         )
-        cfg.state.register_phone(reg)
+        # THE KEY IS THE IDENTITY (2026-09-21): the store answers with the
+        # record AS STORED -- a key it already held keeps the id it had, so a
+        # re-pair of the same phone is the same phone and nothing carded on
+        # its id goes dark. The wire shape is unchanged.
+        reg = cfg.state.register_phone(reg)
         resp: dict[str, Any] = {
             "registered": True,
             "phone_id": reg.phone_id,
-            # phone_ref (2026-08-13, phone_id split): the pure-reference
-            # sibling of phone_id -- "pk_" + first 16 hex of
-            # sha256(raw pubkey bytes). Additive; NEVER authenticates
-            # anything. Re-keying registries onto it is deferred until
-            # signed_poll_mode flips to "required".
+            # phone_ref: the reference half of the split (2026-08-13), now
+            # also the id half for every new registration. Equal to
+            # phone_id unless the record predates the split.
             "phone_ref": _phone_ref(reg.public_key_b64u),
             "bootloader_id": cfg.bootloader_id,
             # Empty managed_secrets for now; the operator wires services

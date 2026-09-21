@@ -28,6 +28,7 @@ phone app.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 from abc import ABC, abstractmethod
@@ -35,12 +36,13 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 __all__ = [
     "PhoneRegistration",
+    "phone_ref_of",
     "Session",
     "PendingRequest",
     "CapabilityResult",
@@ -195,6 +197,28 @@ def validate_genesis_pubkey(pubkey: bytes | None, algorithm: str) -> str:
     return algo
 
 
+def phone_ref_of(public_key_b64u: str) -> str:
+    """The phone's identity as a name: ``"pk_" + sha256(raw pubkey)[:16]``.
+
+    THE KEY IS THE IDENTITY (2026-09-21). A phone IS its keypair; this is the
+    reference anyone holding the public key can derive, and a credential for
+    no one. New registrations use it AS their ``phone_id`` (see
+    ``PhoneRegistration.new``); legacy records keep the Guid they were minted
+    with and answer to this ref as well (``get_phone``). The server's
+    ``_phone_ref`` is this function.
+
+    Never raises: a value that is not decodable base64url hashes as its own
+    ASCII bytes (registrations are validated at pairing time; fixtures and
+    pre-validation blobs may carry arbitrary strings).
+    """
+    try:
+        padding = "=" * (-len(public_key_b64u) % 4)
+        raw = base64.urlsafe_b64decode(public_key_b64u + padding)
+    except Exception:  # noqa: BLE001 - reference derivation never raises
+        raw = public_key_b64u.encode("utf-8", errors="replace")
+    return "pk_" + hashlib.sha256(raw).hexdigest()[:16]
+
+
 @dataclass(frozen=True, slots=True)
 class PhoneRegistration:
     """One registered phone."""
@@ -226,8 +250,13 @@ class PhoneRegistration:
         push_platform: str | None = None,
     ) -> PhoneRegistration:
         now = int(time.time())
+        # THE KEY IS THE IDENTITY (2026-09-21): the id names the key. This
+        # was `str(uuid.uuid4())` -- an address minted per registration, so
+        # the same key re-pairing made a second record and every lane keyed
+        # on the first went dark (twice in the week of 09-16). A store that
+        # already holds this key keeps the id it has (register_phone).
         return cls(
-            phone_id=str(uuid.uuid4()),
+            phone_id=phone_ref_of(public_key_b64u),
             device_label=device_label,
             public_key_b64u=public_key_b64u,
             supported_algorithms=supported_algorithms,
@@ -236,6 +265,24 @@ class PhoneRegistration:
             push_token=push_token,
             push_platform=push_platform,
         )
+
+
+def _merge_onto_existing(
+    existing: PhoneRegistration | None, incoming: PhoneRegistration
+) -> PhoneRegistration:
+    """One key, one phone. The record the store keeps when a key it already
+    holds registers again: the EXISTING id (a legacy Guid stays a Guid --
+    every lane carded on it keeps working; a ref stays a ref), the first
+    pairing's ``registered_at_unix``, and the incoming metadata (label,
+    algorithms, push routing, last seen). Shared by every backend so the
+    rule cannot drift between the file store and Postgres."""
+    if existing is None:
+        return incoming
+    return replace(
+        incoming,
+        phone_id=existing.phone_id,
+        registered_at_unix=existing.registered_at_unix,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1651,9 +1698,17 @@ class StateStoreBase(ABC):
 
     # Phones
     @abstractmethod
-    def register_phone(self, reg: PhoneRegistration) -> None: ...
+    def register_phone(self, reg: PhoneRegistration) -> PhoneRegistration:
+        """Store a registration and return the record AS STORED. The key is the
+        identity (2026-09-21): a key the store already holds is the SAME phone --
+        its existing ``phone_id`` (a legacy Guid, or its ref) is kept and the
+        metadata refreshed; ``registered_at_unix`` is the first pairing's. The
+        returned record is what the wire answers with, never the argument."""
+        ...
     @abstractmethod
-    def get_phone(self, phone_id: str) -> PhoneRegistration | None: ...
+    def get_phone(self, phone_id: str) -> PhoneRegistration | None:
+        """By id, or by ``phone_ref`` for a legacy record whose id is a Guid."""
+        ...
     @abstractmethod
     def list_phones(self) -> list[PhoneRegistration]: ...
     @abstractmethod
@@ -1875,14 +1930,29 @@ class StateStore(StateStoreBase):
     # Phones
     # ------------------------------------------------------------------
 
-    def register_phone(self, reg: PhoneRegistration) -> None:
+    def register_phone(self, reg: PhoneRegistration) -> PhoneRegistration:
         with self._lock:
-            self._phones[reg.phone_id] = reg
+            stored = _merge_onto_existing(self._find_by_pubkey_locked(reg.public_key_b64u), reg)
+            self._phones[stored.phone_id] = stored
             self._save_phones()
+            return stored
 
     def get_phone(self, phone_id: str) -> PhoneRegistration | None:
         with self._lock:
-            return self._phones.get(phone_id)
+            direct = self._phones.get(phone_id)
+            if direct is not None or not phone_id.startswith("pk_"):
+                return direct
+            # A legacy record (Guid id) asked for by its ref: the key is the identity.
+            for p in self._phones.values():
+                if phone_ref_of(p.public_key_b64u) == phone_id:
+                    return p
+            return None
+
+    def _find_by_pubkey_locked(self, public_key_b64u: str) -> PhoneRegistration | None:
+        for p in self._phones.values():
+            if p.public_key_b64u == public_key_b64u:
+                return p
+        return None
 
     def list_phones(self) -> list[PhoneRegistration]:
         with self._lock:
