@@ -1,0 +1,124 @@
+# Jekyll config for the Recto Agentic GitHub Pages site (the app the
+# repo calls Recto Phone; store-facing product name is Recto Agentic).
+#
+# Renders docs/privacy.md + docs/support.md + docs/index.md as styled
+# HTML pages at clean URLs (no .html extension). Apple App Store + Google
+# Play link to /privacy + /support; both must resolve over HTTPS.
+#
+# Theme: jekyll-theme-cayman -- GitHub's default project landing theme.
+# Clean, accessible, no third-party JS, no analytics. Looks professional
+# enough for App Review reviewers + matches the OSS-project aesthetic.
+#
+# To enable: GitHub repo Settings -> Pages -> Source = "Deploy from a
+# branch", Branch = main / folder = /docs. Pages will auto-build on
+# every push to main that touches docs/**.
+
+title: Recto Agentic
+description: >-
+  The phone signing vault for agents. Your phone as the root of trust
+  for cryptographic signing — multi-tenant Authy-analog for any service
+  that integrates with the Recto substrate. Apache 2.0 OSS.
+
+# Theme + permalink + URL config
+theme: jekyll-theme-cayman
+url: https://erikcheatham.github.io
+baseurl: /Recto
+
+# Repository (cayman theme uses this to add a "View on GitHub" link)
+repository: erikcheatham/Recto
+github:
+  repository_url: https://github.com/erikcheatham/Recto
+
+# Plugins (defaults that cayman pulls in; explicit for clarity)
+plugins:
+  - jekyll-relative-links
+  - jekyll-seo-tag
+
+# Build behavior
+relative_links:
+  enabled: true
+  collections: true
+
+# ALLOWLIST. Everything in docs/ is excluded; the public pages are named
+# back in. Adding a file to docs/ publishes NOTHING until someone edits
+# this list.
+#
+# WHY THIS SHAPE AND NOT A DENYLIST. The previous config excluded named
+# internal documents, which had two failure modes and hit both. It once
+# carried fourteen entries for files already deleted, so the exclude list
+# itself became a published roster of internal documentation -- the
+# filenames alone described what is kept and what it is called. And it
+# was FAIL-OPEN: a new internal doc dropped into docs/ published itself,
+# and the only thing standing between it and the open web was somebody
+# remembering. A rule you have to remember is not a rule.
+#
+# Inverted, omission is safe by default. The cost is the opposite
+# failure -- forget to allowlist a genuinely public page and it 404s,
+# which is loud, reversible, and discloses nothing.
+#
+# HOW JEKYLL READS THIS. `include` is consulted BEFORE `exclude`
+# (Jekyll::EntryFilter#filter short-circuits on an included entry), so
+# `exclude: ["*"]` plus a named `include` is an allowlist rather than a
+# contradiction. `_config.yml` is never copied regardless -- files
+# beginning with `_` are handled as special and are not site entries.
+# The cayman theme's own CSS ships FROM THE GEM, not from this
+# directory, so excluding everything here does not strip the styling.
+#
+# THIS IS ENFORCED, NOT ASSERTED: .github/workflows/pages-build.yml
+# builds the site on every push touching docs/** and fails if the output
+# is anything other than exactly the pages named below. That workflow is
+# the reason this change could be made at all -- the old comment here
+# said an allowlist was OWED but "untested", and a local Jekyll run
+# would only have tested it once.
+exclude:
+  - "*"
+
+# FILES INSIDE A DIRECTORY ARE LISTED BY BASENAME, NOT BY PATH.
+#
+# That looks wrong and is correct, for a reason worth writing down because it
+# cost two failed attempts. GitHub Pages builds with the `github-pages` gem,
+# which pins Jekyll 3.9.x, and 3.9's EntryFilter is ASYMMETRIC:
+#
+#   def included?(entry)
+#     glob_include?(site.include, entry) ||                  # entry, RAW
+#       glob_include?(site.include, File.basename(entry))
+#   end
+#
+#   def excluded?(entry)
+#     glob_include?(site.exclude, relative_to_source(entry)) # FULL relative path
+#   end
+#
+# When Jekyll walks into `assets/`, the entry is `badge-app-store.svg`.
+# `excluded?` tests `assets/badge-app-store.svg` against `*` and matches --
+# fnmatch without FNM_PATHNAME lets `*` cross a `/`. `included?` tests only
+# `badge-app-store.svg`, so an include entry of `assets/badge-app-store.svg`
+# can never match it. The three .md pages worked throughout only because at
+# the top level the entry IS the relative path.
+#
+# So: exclusion is path-scoped, inclusion is name-scoped. Listing a file by
+# its path is the one form guaranteed not to work.
+#
+# The cost of matching on a basename is that a file of the same name ANYWHERE
+# under docs/ would also publish. Accepted here because there are two of them
+# and both are store artwork -- but it means this list is not as tight as it
+# reads, and a new entry should be a name unlikely to recur.
+#
+# `assets` stays: it is matched at the top level, where entry == path, and
+# without it Jekyll never walks into the directory at all.
+#
+# DO NOT "fix" these back to paths. Verified against
+# jekyll/jekyll v3.9.5 lib/jekyll/entry_filter.rb, 2026-08-20.
+include:
+  - index.md
+  - privacy.md
+  - support.md
+  - assets
+  - badge-app-store.svg
+  - badge-google-play.svg
+
+# SEO defaults
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

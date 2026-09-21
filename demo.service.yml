@@ -1,0 +1,11 @@
+apiVersion: recto/v1
+kind: Service
+metadata:
+  name: demo
+  description: Recto admin UI smoke test
+spec:
+  exec: python.exe
+  args: ["-c", "import time; print('demo started'); time.sleep(120)"]
+  admin_ui:
+    enabled: true
+    bind: 127.0.0.1:5050

@@ -1,0 +1,145 @@
+{
+  "version": "2026-05-05",
+  "_doc": "Sample capability action manifest — a template operators can fork as the starting point for their own production manifest. Authored 2026-05-05 alongside Phase 5 Wave A. Action / group identifiers are constant strings (operator's call 2026-05-05) — new actions register here without code changes. Counts are operator-authored foundation weights; v1 is informational-only at the phone UI, runtime-enforced budget is v2. 'Darwin' is used as a generic agent codename throughout this template; replace with your own agent identity when forking. See the project memory 'Phase 5 capability-JWT schema design' section for the canonical design.",
+
+  "actions": {
+    "doc:edit": {
+      "count": 1,
+      "description": "Edit a non-binary doc file (markdown, txt, etc.)"
+    },
+    "doc:rename": {
+      "count": 1,
+      "description": "Rename a non-binary doc file"
+    },
+    "claude-md:update": {
+      "count": 1,
+      "description": "Update a CLAUDE.md file"
+    },
+
+    "comms:send-public": {
+      "count": 1,
+      "description": "Send a public-facing message via the Recto comms tunnel"
+    },
+    "comms:reply-to-user": {
+      "count": 1,
+      "description": "Reply to an inbound user comms message"
+    },
+
+    "smoke-test": {
+      "count": 1,
+      "description": "Run a smoke-test workflow against staging"
+    },
+    "restart-service": {
+      "count": 2,
+      "description": "Restart a Recto-supervised service on staging"
+    },
+    "feature-flag:flip-staging": {
+      "count": 2,
+      "description": "Flip a feature flag in staging only"
+    },
+
+    "deploy:staging": {
+      "count": 5,
+      "description": "Deploy a service to staging"
+    },
+    "secret:read": {
+      "count": 5,
+      "description": "Read a secret from Recto's vault"
+    },
+    "manifest:add-action": {
+      "count": 5,
+      "description": "Add a new action / group to the capability action manifest"
+    },
+
+    "deploy:prod": {
+      "count": 15,
+      "description": "Deploy a service to production"
+    },
+    "migration:apply": {
+      "count": 15,
+      "description": "Apply a database migration"
+    },
+    "secret:write-non-sensitive": {
+      "count": 10,
+      "description": "Write a non-sensitive secret to vault (e.g., config rotation)"
+    },
+
+    "secret:rotate": {
+      "count": 50,
+      "description": "Rotate a sensitive secret in the vault"
+    },
+    "auth-gate:modify": {
+      "count": 50,
+      "description": "Modify an authentication gate or policy"
+    },
+    "billing:adjust": {
+      "count": 40,
+      "description": "Adjust a billing record (manual override)"
+    },
+
+    "capability:revoke-other": {
+      "count": 100,
+      "description": "Revoke a capability issued to another agent"
+    },
+    "treasury:transfer": {
+      "count": 200,
+      "description": "Initiate a transfer from an on-chain treasury contract"
+    },
+    "operator-key:rotate": {
+      "count": 500,
+      "description": "Rotate the operator's signing key — catastrophic-tier authority"
+    }
+  },
+
+  "groups": {
+    "darwin:doc-edits": {
+      "_doc": "Tier 0 — always autonomous, both staging and prod",
+      "actions": ["doc:edit", "doc:rename", "claude-md:update"]
+    },
+
+    "darwin:public-comms": {
+      "_doc": "Tier 0 — Darwin's user-facing reply surface",
+      "actions": ["comms:send-public", "comms:reply-to-user"]
+    },
+
+    "darwin:staging-deploys": {
+      "_doc": "Tier 1 — autonomous to staging, human-confirm to prod",
+      "actions": ["deploy:staging", "smoke-test", "restart-service"]
+    },
+
+    "darwin:secret-reads": {
+      "_doc": "Tier 1 — read-only secret access for staging operations",
+      "actions": ["secret:read"]
+    },
+
+    "darwin:staging-feature-flags": {
+      "_doc": "Tier 1 — flip feature flags in staging only",
+      "actions": ["feature-flag:flip-staging"]
+    },
+
+    "darwin:registry-curation": {
+      "_doc": "Tier 1 — manage the capability action manifest itself",
+      "actions": ["manifest:add-action"]
+    },
+
+    "operator:prod-deploys": {
+      "_doc": "Tier 2 — explicit pre-authorization per capability",
+      "actions": ["deploy:prod", "migration:apply"]
+    },
+
+    "operator:secret-writes": {
+      "_doc": "Tier 2 — non-sensitive secret writes",
+      "actions": ["secret:write-non-sensitive"]
+    },
+
+    "operator:high-stakes-ops": {
+      "_doc": "Tier 2/3 boundary — sensitive secret rotation, auth gates, billing",
+      "actions": ["secret:rotate", "auth-gate:modify", "billing:adjust"]
+    },
+
+    "operator:catastrophic": {
+      "_doc": "Tier 3 — always fresh operator approval, no caching",
+      "actions": ["capability:revoke-other", "treasury:transfer", "operator-key:rotate"]
+    }
+  }
+}

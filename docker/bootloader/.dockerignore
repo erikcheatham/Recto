@@ -1,0 +1,70 @@
+# Dockerfile build-context exclusions for the bootloader image.
+#
+# Build context = Recto repo ROOT (per docker/bootloader/Dockerfile's
+# header comment). This file scopes WHICH files transfer from the
+# build-context directory into the Docker daemon. The transfer step
+# is naive `tar over a socket`, so the smaller the context, the
+# faster the build + the less RAM Docker uses staging the transfer.
+#
+# Rules: include only what the COPY directives in the Dockerfile
+# actually need. Phone-side MAUI source, test suites, dev scripts,
+# private/, etc. all get excluded -- they're irrelevant to the
+# substrate-side bootloader runtime.
+
+# Phone-side MAUI Blazor project — huge (50+ MB of C# source + assets)
+# and irrelevant at runtime.
+phone/
+
+# Test suite — only runs in CI, not in production container.
+tests/
+pytest-cache-files-*/
+.pytest_cache/
+
+# Maintainer-side helper scripts. Not substrate runtime concerns.
+scripts/
+*script_*.ps1
+*script.ps1
+
+# Docs — useful for humans, irrelevant at container runtime.
+docs/
+*.md
+!README.md
+
+# Build artifacts + cache directories.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+build/
+dist/
+
+# Maintainer-local tree (sometimes present alongside Recto
+# repo at the operator's discretion; never part of the image).
+private/
+
+# Recto's own development virtualenv if present.
+.venv/
+venv/
+
+# IDE / editor artifacts.
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# CI artifacts.
+.github/
+
+# Standalone dev/demo scripts that aren't the canonical launcher.
+demo.service.yml
+fake_phone.py
+recto_ios_redeploy.sh
+run_bootloader.py
+
+# Git metadata — not needed inside the image. The image's
+# provenance comes from the LABEL directives in the Dockerfile +
+# image-tag conventions, not from .git/.
+.git/
+.gitignore

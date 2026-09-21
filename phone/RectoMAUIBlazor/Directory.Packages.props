@@ -1,0 +1,63 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- MAUI Blazor host (Recto/Recto) -->
+    <PackageVersion Include="Microsoft.Maui.Controls" Version="10.0.51" />
+    <PackageVersion Include="Microsoft.Maui.Controls.Compatibility" Version="10.0.51" />
+    <PackageVersion Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="10.0.51" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Debug" Version="10.0.5" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.5" />
+    <PackageVersion Include="BouncyCastle.Cryptography" Version="2.4.0" />
+    <PackageVersion Include="Xamarin.AndroidX.Biometric" Version="1.1.0.32" />
+    <PackageVersion Include="Xamarin.Firebase.Messaging" Version="125.0.1.2" />
+
+    <!-- ZXing.Net.Maui RETIRED Build 5 (2026-06-02). Both packages
+         crashed on iOS first-permission-grant AND Android 16
+         16KB-page-alignment. Replaced by native bindings (iOS uses
+         AVFoundation directly; Android uses CameraX 1.5+ + ML Kit).
+         See Recto.csproj comment block for the architectural rationale. -->
+    <!-- <PackageVersion Include="ZXing.Net.Maui" Version="0.4.0" /> -->
+    <!-- <PackageVersion Include="ZXing.Net.Maui.Controls" Version="0.4.0" /> -->
+
+    <!-- Build 5 (2026-06-02): native Android QR scanner stack.
+         CameraX 1.5+ ships 16KB-page-aligned native libs that pass
+         Android 16's alignment check (the load-bearing reason for
+         dropping ZXing.Net.Maui). ML Kit barcode scanner is Google's
+         first-party QR decode implementation. All four package
+         versions track the most-recent stable Xamarin bindings at
+         the Build 5 ship time; if a future bump introduces a
+         regression, pin to specific older versions here. -->
+    <PackageVersion Include="Xamarin.AndroidX.Camera.Camera2" Version="1.5.0.1" />
+    <PackageVersion Include="Xamarin.AndroidX.Camera.Lifecycle" Version="1.5.0.1" />
+    <PackageVersion Include="Xamarin.AndroidX.Camera.View" Version="1.5.0.1" />
+    <PackageVersion Include="Xamarin.Google.MLKit.BarcodeScanning" Version="117.3.0.7" />
+
+    <!-- Shared library (Recto/Recto.Shared) -->
+    <PackageVersion Include="Microsoft.AspNetCore.Components.Web" Version="10.0.5" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.5" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
+    <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.5" />
+    <PackageVersion Include="Microsoft.Extensions.Http.Polly" Version="10.0.5" />
+    <PackageVersion Include="FluentValidation.DependencyInjectionExtensions" Version="12.1.1" />
+    <PackageVersion Include="Polly" Version="8.6.6" />
+    <PackageVersion Include="Scrutor" Version="7.0.0" />
+    <PackageVersion Include="Serilog" Version="4.3.1" />
+    <PackageVersion Include="System.IdentityModel.Tokens.Jwt" Version="8.17.0" />
+
+    <!-- Phase 2.B: QR encoder. Pure-managed MIT-licensed; PngByteQRCode
+         + SvgQRCode classes for cross-platform PNG/SVG without
+         System.Drawing dependency. Sister of Python's qrcode library
+         (Phase 1 substrate); both produce QR codes from the same
+         canonical-JSON input bytes. -->
+    <PackageVersion Include="QRCoder" Version="1.6.0" />
+
+    <!-- Test project (Recto/Recto.Shared.Tests) -->
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageVersion Include="xunit" Version="2.9.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageVersion Include="NSubstitute" Version="5.3.0" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.5" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,54 @@
+@inherits LayoutComponentBase
+@inject NavigationManager Nav
+
+@*
+  Recto vault shell. Single-column phone layout — no sidebar (the
+  default Blazor template's sidebar is a desktop-app idiom that
+  wastes the only valuable real estate on a phone). A slim top bar
+  carries the brand mark on the left (acts as a Home link) and the
+  settings gear on the right; everything else flows in the content
+  area below.
+
+  Design language: vault. Deep-slate background, copper/gold accents
+  reserved for primary CTAs, monospace brand mark to evoke
+  infrastructure tooling rather than consumer app polish. Color
+  tokens live in app.css under :root so per-page CSS can lean on
+  var(--rec-*) consistently.
+*@
+
+<div class="rec-shell">
+    <header class="rec-topbar">
+        <a class="rec-brand" href="/" title="Recto home">
+            <span class="rec-brand-mark">▣</span>
+            <span class="rec-brand-text">RECTO</span>
+        </a>
+        <button type="button"
+                class="rec-iconbtn"
+                title="Settings"
+                aria-label="Settings"
+                @onclick="@(() => Nav.NavigateTo("/settings"))">
+            @* Inline SVG gear instead of &#9881; (U+2699) — iOS 26.3
+               simulator's font fallback doesn't have a glyph for the
+               Unicode gear codepoint, renders as missing-glyph tofu.
+               SVG renders identically on every iOS version + Android
+               WebView regardless of font fallback chain. Material-
+               design 8-tooth gear, fill=currentColor so it inherits
+               the button's text color (theme-aware). Banked 2026-05-22
+               evening after the iPhone 17 Pro Max simulator screenshot
+               capture flagged the tofu. *@
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20" aria-hidden="true">
+                <path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.32-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.4.12-.61l-1.92-3.32c-.12-.21-.37-.29-.59-.21l-2.39.96c-.5-.38-1.03-.7-1.62-.94L14.4 2.81c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41L9.25 5.35c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.07.63-.07.94s.02.63.06.94L2.85 14.52c-.18.14-.23.4-.12.61l1.92 3.32c.12.21.37.29.59.21l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.21.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+            </svg>
+        </button>
+    </header>
+
+    <main class="rec-content">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">&#128473;</span>
+</div>

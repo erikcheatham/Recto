@@ -1,0 +1,128 @@
+/*
+   Recto vault shell — phone-first single-column layout, no sidebar.
+   All color tokens come from app.css :root via var(--rec-*).
+*/
+
+.rec-shell {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    background: var(--rec-bg);
+    color: var(--rec-text);
+}
+
+/* Topbar absorbs the system status-bar safe-area inset via padding-top.
+   On iOS WebKit, env(safe-area-inset-top) resolves to the actual
+   status-bar + notch height (typically ~44-59px). On Android Chromium
+   WebView, env() often resolves to 0 even when the WebView paints
+   edge-to-edge under the system bar — the max() fallback of 44px
+   ensures the brand + gear sit clear of Android's translucent system
+   bar overlay regardless. 44px is sized to cover Pixel-class devices
+   with punch-hole cameras + standard system tray icons. box-sizing
+   must be content-box so the padding ADDS to the 2.75rem content-row
+   height (the brand-mark + gear sit in that 2.75rem band, below the
+   padded safe-area space).
+
+   Banked 2026-05-20 after the Pixel reported the settings gear was
+   untappable: gear was rendering at viewport y=0, underneath Android's
+   bluetooth/wifi/battery system tray icons. Folding the safe-area
+   handling INTO the topbar (rather than using a separate sticky spacer
+   element) avoids the two-sticky-element overlap problem when scrolled
+   — when the topbar sticky-pins at top:0, its own padding-top keeps
+   the brand + gear in the safe-area-clear zone regardless of scroll
+   state. */
+.rec-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    height: 2.75rem;
+    padding: 0 0.85rem;
+    padding-top: max(env(safe-area-inset-top), 44px);
+    box-sizing: content-box;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--rec-surface);
+    border-bottom: 1px solid var(--rec-border);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
+}
+
+.rec-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    text-decoration: none;
+    color: var(--rec-text);
+    font-family: var(--rec-font-mono);
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    font-size: 0.85rem;
+}
+
+.rec-brand:hover { color: var(--rec-accent); }
+
+.rec-brand-mark {
+    color: var(--rec-accent);
+    font-size: 1.05rem;
+    line-height: 1;
+}
+
+.rec-brand-text { line-height: 1; }
+
+.rec-iconbtn {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--rec-text-muted);
+    font-size: 1.4rem;
+    line-height: 1;
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.35rem;
+    cursor: pointer;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+
+.rec-iconbtn:hover {
+    color: var(--rec-accent);
+    background: var(--rec-surface-hi);
+    border-color: var(--rec-border);
+}
+
+.rec-content {
+    flex: 1;
+    padding: 1rem 0.75rem 2rem 0.75rem;
+    max-width: 36rem;
+    width: 100%;
+    margin: 0 auto;
+    box-sizing: border-box;
+}
+
+@media (min-width: 768px) {
+    .rec-topbar { padding: 0 1.25rem; }
+    .rec-content { padding: 1.5rem 1.5rem 3rem 1.5rem; }
+}
+
+#blazor-error-ui {
+    color-scheme: dark only;
+    background: var(--rec-danger-bg);
+    color: var(--rec-text);
+    bottom: 0;
+    box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.6);
+    box-sizing: border-box;
+    display: none;
+    left: 0;
+    padding: 0.7rem 1.25rem;
+    position: fixed;
+    width: 100%;
+    z-index: 1000;
+    border-top: 1px solid var(--rec-danger);
+}
+
+#blazor-error-ui .reload { color: var(--rec-accent); }
+
+#blazor-error-ui .dismiss {
+    cursor: pointer;
+    position: absolute;
+    right: 0.75rem;
+    top: 0.5rem;
+}

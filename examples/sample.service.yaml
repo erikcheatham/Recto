@@ -1,0 +1,183 @@
+# Sample Recto service.yaml. Demonstrates every spec section.
+#
+# Drop into your project root (or wherever NSSM should look), edit the
+# fields that apply to your service, comment out the ones that don't.
+# Then either:
+#
+#   recto launch examples/sample.service.yaml --once     # smoke test
+#   recto apply  examples/sample.service.yaml            # reconcile NSSM
+#
+# See docs/upgrade-from-nssm.md for the migration path from a plain
+# NSSM service to Recto wrapping.
+
+apiVersion: recto/v1
+kind: Service
+
+metadata:
+  name: myservice
+  description: "An example service supervised by Recto"
+
+spec:
+  # ---------------------------------------------------------------------
+  # Process definition
+  # ---------------------------------------------------------------------
+
+  # The interpreter NSSM invokes. `python.exe` resolves via PATH at
+  # service-start time; pin to a specific version with e.g.
+  # `C:\Python312\python.exe` if you have multiple Pythons installed.
+  exec: python.exe
+
+  # argv after `exec`. NSSM's old AppParameters becomes this list.
+  args:
+    - "C:\\path\\to\\myservice\\app.py"
+
+  working_dir: "C:\\path\\to\\myservice"
+
+  # Optional: run as a specific service account. Default is whatever
+  # account NSSM was configured with (LocalSystem unless you set it).
+  # user: "NT AUTHORITY\\NETWORK SERVICE"
+
+  # ---------------------------------------------------------------------
+  # Secrets
+  # ---------------------------------------------------------------------
+  # Each entry tells the launcher to fetch a secret value from a backend
+  # and inject it into the child process's env at spawn time.
+  #
+  # Set values via `recto credman set myservice MY_API_KEY` (Windows).
+  # The launcher reads them at every spawn -- rotate without redeploy.
+
+  secrets:
+    - name: MY_API_KEY
+      source: credman           # Windows Credential Manager
+      target_env: MY_API_KEY    # env var on the child process
+      required: true
+
+    - name: WEBHOOK_TOKEN
+      source: credman
+      target_env: WEBHOOK_TOKEN
+      required: true
+
+    # v0.3 will add keychain (macOS), secretsvc (Linux), aws, vault.
+    # Same shape; just change the `source:` selector.
+
+  # ---------------------------------------------------------------------
+  # Plain (non-secret) env vars
+  # ---------------------------------------------------------------------
+  # Layered on top of the inherited env, then secrets override on
+  # target_env collision. Use this for feature flags, mode switches,
+  # PYTHONUNBUFFERED, etc. NEVER for secrets -- those go in `secrets:`.
+
+  env:
+    PYTHONUNBUFFERED: "1"
+    MYSERVICE_DRY_RUN: "0"
+
+  # ---------------------------------------------------------------------
+  # Liveness probe
+  # ---------------------------------------------------------------------
+  # type: http (default) -- GET url, 2xx/3xx is healthy
+  # type: tcp            -- open host:port, success is healthy
+  # type: exec           -- run command, expected_exit_code is healthy
+  #
+  # After failure_threshold consecutive failures, the launcher
+  # SIGTERMs the child and lets the restart policy fire. This catches
+  # deadlocks NSSM's exit-based restart can't see.
+
+  healthz:
+    enabled: true
+    type: http
+    url: http://localhost:5000/healthz
+    interval_seconds: 30
+    timeout_seconds: 5
+    failure_threshold: 3
+    restart_grace_seconds: 10
+
+    # tcp variant:
+    # type: tcp
+    # host: 127.0.0.1
+    # port: 5432
+
+    # exec variant:
+    # type: exec
+    # command: ["my-health-check", "--quick"]
+    # expected_exit_code: 0
+
+  # ---------------------------------------------------------------------
+  # Restart policy
+  # ---------------------------------------------------------------------
+
+  restart:
+    policy: always              # always | never | on-failure
+    backoff: exponential        # exponential | linear | constant
+    initial_delay_seconds: 1
+    max_delay_seconds: 60
+    max_attempts: 10            # 0 = unlimited
+
+    # Which lifecycle events get pushed to comms webhooks below.
+    notify_on_event:
+      - restart
+      - health_failure
+      - max_attempts_reached
+
+  # ---------------------------------------------------------------------
+  # Webhook event dispatch
+  # ---------------------------------------------------------------------
+  # Every lifecycle event matching `restart.notify_on_event` POSTs to
+  # each comms sink. Headers are template-interpolated at dispatch
+  # time so secret values sit in CredMan, not in this YAML.
+
+  comms:
+    - type: webhook
+      url: https://hooks.example.com/recto
+      headers:
+        X-Auth-Token: "${env:WEBHOOK_TOKEN}"
+        # Cloudflare Access service-token example -- the values come
+        # from CredMan via the secrets: block above:
+        # CF-Access-Client-Id: "${env:CF_ACCESS_CLIENT_ID}"
+        # CF-Access-Client-Secret: "${env:CF_ACCESS_CLIENT_SECRET}"
+      template:
+        subject: "[recto/${service.name}] ${event.kind}"
+        body: "${event.summary}"
+        context: "${event.context_json}"
+
+  # ---------------------------------------------------------------------
+  # Win32 Job Object resource limits (v0.2)
+  # ---------------------------------------------------------------------
+  # When ANY field is set, the launcher wraps the child in a Job
+  # Object. Always sets KILL_ON_JOB_CLOSE so the child dies with the
+  # launcher even if the OS shutdown skips NSSM's tree-cleanup.
+  # Omit the section entirely (or set every field to null) to skip
+  # the Job Object wrapping.
+
+  resource_limits:
+    memory_mb: 512              # per-process commit cap
+    cpu_percent: 50             # 1..100; hard cap via CpuRate
+    process_count: 32           # max active processes in the job
+
+  # ---------------------------------------------------------------------
+  # Read-only admin UI (v0.2)
+  # ---------------------------------------------------------------------
+  # Binds an HTTP server on bind: 127.0.0.1:5050 by default.
+  # Operators expose externally via Cloudflare Tunnel + CF Access (or
+  # any reverse-proxy auth layer); Recto trusts every connection that
+  # reaches it -- auth is the proxy's job.
+
+  admin_ui:
+    enabled: true
+    bind: 127.0.0.1:5050
+    cf_access_required: true    # advisory; no enforcement in v0.2
+    # expose_via_tunnel:
+    #   hostname: recto.example.com
+    #   service_token_env: CF_TUNNEL_SERVICE_TOKEN
+
+  # ---------------------------------------------------------------------
+  # OpenTelemetry traces (v0.2, opt-in)
+  # ---------------------------------------------------------------------
+  # Disabled by default. To enable: `pip install recto[otel]` to pull
+  # the OTel SDK, then set enabled: true and otlp_endpoint to your
+  # collector. One span per run() invocation; lifecycle events
+  # recorded as span events.
+
+  telemetry:
+    enabled: false
+    otlp_endpoint: http://localhost:4318
+    service_name: myservice

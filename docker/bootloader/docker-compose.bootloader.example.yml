@@ -1,0 +1,135 @@
+# Recto bootloader — canonical compose-service template for consumers.
+#
+# Copy this snippet into your project's docker-compose.yml, personalize
+# the highlighted spots, and your bootloader becomes a supervised
+# Docker service alongside the rest of your stack.
+#
+# Personalization checklist (search for [CUSTOMIZE]):
+#   1. ../Recto path — adjust to wherever your operator-side clone of
+#      Recto lives relative to this compose file. Sibling-clone is the
+#      typical pattern: <parent>/<your-app>/docker-compose.yml +
+#      <parent>/Recto/ → context = ../Recto.
+#   2. agents.json bind-mount path — point at the manifest file with
+#      YOUR consumers' agent IDs + token_env names + AppContext blocks.
+#      See ../Recto/examples/agents.json.example for the canonical
+#      shape.
+#   3. devices-pair-consumers.json bind-mount path — only needed if
+#      this bootloader brokers Phase-H end-user device pairing for one
+#      or more consumer apps. Omit the mount + the corresponding env
+#      var if not.
+#   4. Per-agent token env-vars — each agent in agents.json declares
+#      its `token_env` (e.g. RECTO_AGENT_TOKEN_MYAPP). For each,
+#      add an `${VAR:-}` interpolation in the environment: block so
+#      your host-side Recto launcher's vault-decryption flows the
+#      value through docker.exe's process env into the container.
+#   5. Container name — pick something distinguishing if you're
+#      running multiple stacks on the same host.
+#   6. Network name — match your existing stack's bridge network
+#      so the bootloader is reachable from your web/api/etc. service
+#      via Docker's internal DNS at http://bootloader:8765.
+#   7. Public URL — set RECTO_PUBLIC_URL to the Cloudflare Tunnel
+#      hostname (or whatever public ingress you have); appears on
+#      the operator's phone after pairing.
+#   8. Bootloader ID — set RECTO_BOOTLOADER_ID to something
+#      distinguishing across your fleet (e.g. recto-<consumer>-staging).
+
+services:
+  bootloader:
+    build:
+      # [CUSTOMIZE 1] Path to your Recto repo. Sibling-clone assumption:
+      # ../Recto. Adjust if your operator-side layout differs.
+      context: ../Recto
+      dockerfile: docker/bootloader/Dockerfile
+    container_name: bootloader   # [CUSTOMIZE 5]
+    environment:
+      # Substrate-level identity + binding. State-dir + manifest paths
+      # default in the image; override only if you need custom paths.
+      - RECTO_BOOTLOADER_ID=${RECTO_BOOTLOADER_ID:-recto-staging}   # [CUSTOMIZE 8]
+      - RECTO_BIND_HOST=0.0.0.0
+      - RECTO_BIND_PORT=8765
+      - RECTO_PUBLIC_URL=${RECTO_PUBLIC_URL:-http://localhost:8765}  # [CUSTOMIZE 7]
+      - RECTO_BOOTLOADER_QUIET=1
+      - RECTO_AGENTS_FILE=/etc/recto/agents.json
+      - RECTO_DEVICES_PAIR_CONSUMERS_FILE=/etc/recto/devices-pair-consumers.json
+
+      # [CUSTOMIZE 4] Per-agent token interpolation. Each agent
+      # declared in agents.json with `token_env: "VARNAME"` needs a
+      # matching VARNAME interpolation here. The host-side Recto
+      # launcher decrypts the vault entries at child-spawn and injects
+      # the values into docker.exe's process env; compose flows them
+      # through onto the container. Add one line per registered agent.
+      - RECTO_AGENT_TOKEN_MYAPP=${RECTO_AGENT_TOKEN_MYAPP:-}
+      # - RECTO_AGENT_TOKEN_OTHERAPP=${RECTO_AGENT_TOKEN_OTHERAPP:-}
+
+      # Phase-H devices-pair webhook tokens. One env var per consumer
+      # registered in devices-pair-consumers.json. Same interpolation
+      # pattern as the agent tokens above.
+      - OPENCLAW_WEBHOOK_SECRET=${OPENCLAW_WEBHOOK_SECRET:-}
+
+      # Folder-drop event bus (banked 2026-05-19 night). When set,
+      # the launcher emits capability + sign lifecycle events as JSONL
+      # records to this folder. The folder is bind-mounted from host
+      # (see volumes: block below) so peer-AIs on the host filesystem
+      # can tail-watch the daily-rotated files. Comment out the env
+      # var AND the matching volume mount to disable; events emission
+      # is fully opt-in.
+      - RECTO_EVENTS_DIR=/var/lib/recto/events
+
+    ports:
+      # Host-side port mapping. Keep the host port aligned with what
+      # your Cloudflare Tunnel route points at. Changing the
+      # container-internal port (RECTO_BIND_PORT above) requires
+      # updating EXPOSE in the Dockerfile + the healthcheck.
+      - "8765:8765"
+
+    volumes:
+      # Named volume for bootloader state. Persists across container
+      # restarts + image rebuilds; survives `docker compose down`.
+      # First-time-init can be seeded from an existing host directory
+      # via ../Recto/docker/bootloader/migrate-state.sh (one-shot
+      # operator-side script).
+      - bootloader-data:/var/lib/recto/bootloader
+
+      # [CUSTOMIZE 2 + 3] Manifest bind-mounts (read-only). agents.json
+      # is required (without it, the bootloader has no registered
+      # agents and capability endpoints return 404). devices-pair-
+      # consumers.json is optional (omit the mount AND its env var if
+      # this bootloader doesn't broker Phase-H end-user pairing).
+      - ./recto-manifests/agents.json:/etc/recto/agents.json:ro
+      # - ./recto-manifests/devices-pair-consumers.json:/etc/recto/devices-pair-consumers.json:ro
+      # Capability action manifest (optional): mount your forked production
+      # manifest and set RECTO_CAPABILITY_MANIFEST_FILE to this path to serve
+      # GET /v0.4/capability/manifest (unset = endpoint 404s, pre-manifest posture).
+      # - ./recto-manifests/capability-manifest.json:/etc/recto/capability-manifest.json:ro
+
+      # Folder-drop event bus (opt-in; comment out to disable). Bind-
+      # mount to a HOST path so peer-AIs on the host filesystem can
+      # tail-watch the daily-rotated JSONL files. Must match the
+      # RECTO_EVENTS_DIR env var above (container-side path).
+      - ./recto-events:/var/lib/recto/events
+
+    networks:
+      - appnet  # [CUSTOMIZE 6]
+
+    healthcheck:
+      # The image's HEALTHCHECK directive already covers this — but
+      # surfacing here lets consumer-side compose customize interval
+      # if their deploy has unusual probe-noise tolerance.
+      test: ["CMD", "curl", "--silent", "--fail", "--max-time", "4", "http://localhost:8765/v0.4/capability/manifest"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    restart: unless-stopped
+
+volumes:
+  bootloader-data:
+
+# [CUSTOMIZE 6] If you're folding this into an existing compose stack
+# (typical case), DELETE the networks: block below and reuse your
+# existing stack's network. Only declare networks: here if this snippet
+# stands alone.
+networks:
+  appnet:
+    driver: bridge

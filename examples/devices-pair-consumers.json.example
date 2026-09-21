@@ -1,0 +1,15 @@
+{
+  "_comment": "Canonical devices-pair consumer manifest for examples/run_bootloader_consumer.py (Phase H end-user device pairing relay, 2026-05-19). Copy to a real path (e.g., C:\\Recto\\devices-pair-consumers.json), fill in the per-consumer values, then `$env:RECTO_DEVICES_PAIR_CONSUMERS_FILE = '<path>'` and restart the launcher. When this env var is unset (or the consumers array is empty), the bootloader's POST /v0.4/devices/pair endpoint returns 404 -- zero attack surface for bootloaders that don't broker end-user device pairing for any consumer.",
+
+  "_token_resolution": "Each consumer's webhook token is resolved in priority order: (1) os.environ[token_env] if token_env is set and the env var is non-empty (the supervised-launcher case -- Recto's launcher decrypts the consumer's vault entry and injects under the named env var); (2) dpapi-machine vault fetch from vault_service / vault_secret (the foreground bring-up case -- operator runs the launcher from PowerShell without per-consumer token env vars set, the script decrypts in-process). First non-empty wins. The default vault_secret is OPENCLAW_WEBHOOK_SECRET -- v0 posture reuses the consumer's existing Openclaw webhook secret as the devices-pair webhook token. Split into a dedicated secret later (likely alongside the Hermes-cutover key rename per the 2026-05-19 architectural call).",
+
+  "_trust_model": "The webhook token is defense-in-depth: it proves 'the request came through THIS authorized bootloader' to the consumer's /api/v1/devices/pairing/complete endpoint. The load-bearing trust is the end-user JWS (user's phone enclave signs a JWS over their master pubkey + the typed pairing code with cap.allow_actions:['devices:pair'] + cap.scope.pairing_code). The consumer verifies the JWS against the caller-supplied master pubkey via SelfAttestedVerifier; the X-Openclaw-Token gate is the secondary attestation. Per architectural commitment #11 the master pubkey is the canonical identifier of 'one human' across all profiles.",
+
+  "consumers": [
+    {
+      "base_url": "https://staging.example.com",
+      "vault_service": "ExampleConsumer",
+      "vault_secret": "OPENCLAW_WEBHOOK_SECRET"
+    }
+  ]
+}

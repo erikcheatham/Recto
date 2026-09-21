@@ -1,0 +1,17 @@
+# Docker build-context allowlist for docker/bootloader/Dockerfile.
+# The Dockerfile COPYs only pyproject.toml + README.md + LICENSE +
+# recto/ + examples/, so everything else (phone/ MAUI source, tests/,
+# scripts/, docs/, .git) is excluded to keep the context transfer +
+# image layers small -- the contract the Dockerfile's header comment
+# documents. Applies to local `docker build` AND `az acr build`
+# (cloud-side builds tar + upload the context; this keeps that upload
+# to a few hundred KB of source).
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!recto
+!examples
+!docker
+**/__pycache__
+**/*.pyc
