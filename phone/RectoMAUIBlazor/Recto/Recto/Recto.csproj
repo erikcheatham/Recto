@@ -546,6 +546,16 @@
 	<ItemGroup Condition="$(TargetFramework.Contains('-android'))">
 		<PackageReference Include="Xamarin.AndroidX.Biometric" />
 		<PackageReference Include="Xamarin.Firebase.Messaging" />
+		<!-- NU1608 sweep (2026-09-21): explicit refs so the *.Ktx packages
+		     resolve at their cores' versions (see Directory.Packages.props). -->
+		<PackageReference Include="Xamarin.AndroidX.Lifecycle.LiveData" />
+		<PackageReference Include="Xamarin.AndroidX.Lifecycle.LiveData.Core.Ktx" />
+		<PackageReference Include="Xamarin.AndroidX.Lifecycle.Runtime.Ktx" />
+		<PackageReference Include="Xamarin.AndroidX.Lifecycle.Runtime.Ktx.Android" />
+		<PackageReference Include="Xamarin.AndroidX.Lifecycle.ViewModel.Ktx" />
+		<PackageReference Include="Xamarin.AndroidX.Fragment.Ktx" />
+		<PackageReference Include="Xamarin.AndroidX.Activity.Ktx" />
+		<PackageReference Include="Xamarin.AndroidX.SavedState.SavedState.Ktx" />
 		<!-- Build 6 (2026-06-02): CameraX 1.5+ + ML Kit BarcodeScanning
 		     package refs retired alongside the in-app QR scanner
 		     (Build 5's solution to the ZXing.Net.Maui crashes). The

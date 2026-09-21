@@ -19,14 +19,14 @@ namespace Recto.Platforms.AndroidImpl;
 /// inside the StrongBox HSM (Titan M / Pixel chip / Samsung Knox HSM,
 /// depending on device). Every signing operation is gated by an explicit
 /// <see cref="BiometricPrompt"/> with <see cref="BiometricPrompt.CryptoObject"/>
-/// so the user authorizes each signature individually &mdash; matches the
+/// so the user authorizes each signature individually -- matches the
 /// "operator approves every cryptographic operation" security model.
 /// <para>
 /// Why P-256 and not Ed25519: AndroidKeyStore's public
 /// <c>KEY_ALGORITHM_*</c> constants list EC / RSA / AES / HMAC / XDH but
 /// not Ed25519, even on Android 16 / API 35. The v0.4 protocol's
 /// <c>supported_algorithms</c> field lets the phone advertise
-/// <c>ecdsa-p256</c> &mdash; same as iOS Secure Enclave.
+/// <c>ecdsa-p256</c> -- same as iOS Secure Enclave.
 /// </para>
 /// <para>
 /// Key authentication model: per-use (<c>setUserAuthenticationParameters(0,
@@ -70,14 +70,16 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
             try
             {
                 generator.Initialize(spec);
-                using var pair = generator.GenerateKeyPair();
+                using var pair = generator.GenerateKeyPair()
+                    ?? throw new InvalidOperationException("GenerateKeyPair returned null.");
                 return Task.FromResult(BuildPublicKeyResult(pair));
             }
             catch (StrongBoxUnavailableException)
             {
                 spec = BuildSpec(keyAlias, strongBox: false, requireUserAuth);
                 generator.Initialize(spec);
-                using var pair = generator.GenerateKeyPair();
+                using var pair = generator.GenerateKeyPair()
+                    ?? throw new InvalidOperationException("GenerateKeyPair returned null.");
                 return Task.FromResult(BuildPublicKeyResult(pair));
             }
         }
@@ -275,7 +277,7 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
         }
 
         // OnAuthenticationFailed (single attempt didn't match) is intentionally
-        // not overridden &mdash; the system retries automatically and ultimately
+        // not overridden -- the system retries automatically and ultimately
         // surfaces failure via OnAuthenticationError(ERROR_LOCKOUT or similar).
     }
 
@@ -303,24 +305,42 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
 
     private static KeyGenParameterSpec BuildSpec(string keyAlias, bool strongBox, bool requireUserAuth)
     {
-        var builder = new KeyGenParameterSpec.Builder(keyAlias, KeyStorePurpose.Sign)
-            .SetAlgorithmParameterSpec(new ECGenParameterSpec(EcCurveName))
-            .SetDigests(KeyProperties.DigestSha256!)
-            .SetUserAuthenticationRequired(requireUserAuth);
+        // Not chained: the binding types each Builder method as returning a
+        // nullable Builder, so a fluent chain is a chain of possible-null
+        // dereferences to the analyzer (CS8602). Same calls, one receiver.
+        var builder = new KeyGenParameterSpec.Builder(keyAlias, KeyStorePurpose.Sign);
+        builder.SetAlgorithmParameterSpec(new ECGenParameterSpec(EcCurveName));
+        builder.SetDigests(KeyProperties.DigestSha256!);
+        builder.SetUserAuthenticationRequired(requireUserAuth);
 
         if (requireUserAuth)
         {
-            // Per-use authentication: timeout 0 means every cryptographic operation
-            // requires a fresh BiometricPrompt.authenticate(CryptoObject) call. This
-            // matches the protocol's "operator approves every operation" model.
-            // The poll key (requireUserAuth: false) is the one deliberate
-            // exception -- it signs READS, never approvals.
-            builder.SetUserAuthenticationParameters(
-                timeout: 0,
-                type: (int)(KeyPropertiesAuthType.BiometricStrong | KeyPropertiesAuthType.DeviceCredential));
+            // Per-use authentication: every cryptographic operation requires a
+            // fresh BiometricPrompt.authenticate(CryptoObject) call. This matches
+            // the protocol's "operator approves every operation" model. The poll
+            // key (requireUserAuth: false) is the one deliberate exception -- it
+            // signs READS, never approvals. minSdk is 24; the per-use spelling
+            // changed at API 30, so both are here, version-guarded (CA1416).
+            if (OperatingSystem.IsAndroidVersionAtLeast(30))
+            {
+                builder.SetUserAuthenticationParameters(
+                    timeout: 0,
+                    type: (int)(KeyPropertiesAuthType.BiometricStrong | KeyPropertiesAuthType.DeviceCredential));
+            }
+            else
+            {
+                // API 24-29: -1 is "authenticate for every use" -- the same
+                // per-use model, in the only spelling those releases have.
+#pragma warning disable CA1422 // obsoleted at 30; this branch never runs there
+                builder.SetUserAuthenticationValidityDurationSeconds(-1);
+#pragma warning restore CA1422
+            }
         }
 
-        if (strongBox)
+        // StrongBox exists from API 28. Below it the request is simply not
+        // made: the key lands in the TEE, which is what the caller's
+        // StrongBoxUnavailableException fallback produces anyway.
+        if (strongBox && OperatingSystem.IsAndroidVersionAtLeast(28))
         {
             builder.SetIsStrongBoxBacked(true);
         }
@@ -369,7 +389,7 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
         }
         catch
         {
-            // Swallow &mdash; DeleteAsync is "no-op if absent" and we don't
+            // Swallow -- DeleteAsync is "no-op if absent" and we don't
             // want a stale-keystore error masking a fresh GenerateAsync.
         }
     }
