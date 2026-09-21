@@ -24,7 +24,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from recto.bootloader.server import ChallengeStore, create_server
+from recto.bootloader.server import ChallengeStore, create_server, poll_key_delegation_payload
 from recto.bootloader.state import StateStore
 from recto.capability.jwt import verify_jws
 from recto.capability.pair_record import CLOCK_SKEW_SECONDS, PENDING_ACTION, PENDING_WINDOW_SECONDS
@@ -92,10 +92,15 @@ def _register(ctx) -> str:
     key = Ed25519PrivateKey.generate()
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     sig = key.sign(ch["challenge_b64u"].encode("ascii"))
+    poll_pub = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     status, body = _post(f"{ctx['base_url']}/v0.4/register", {
         "phone_id": "ignored", "device_label": "signed-pending-phone",
         "public_key_b64u": _b64u(pub), "supported_algorithms": ["ed25519"], "v0_4_protocol": 1,
         "registration_proof": {"challenge": ch["challenge_b64u"], "signature_b64u": _b64u(sig)},
+        # rule 14.2: a registration delegates a poll key or it is refused
+        "poll_public_key_b64u": _b64u(poll_pub),
+        "poll_key_delegation_b64u": _b64u(key.sign(poll_key_delegation_payload(_b64u(pub), _b64u(poll_pub)))),
     })
     assert status == 201, body
     return body["phone_id"]

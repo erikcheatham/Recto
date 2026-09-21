@@ -38,7 +38,7 @@ from recto.bootloader.push import (  # noqa: E402
     PushSender,
     PushSendError,
 )
-from recto.bootloader.server import ChallengeStore, create_server  # noqa: E402
+from recto.bootloader.server import ChallengeStore, create_server, poll_key_delegation_payload  # noqa: E402
 from recto.bootloader.state import PhoneRegistration, StateStore  # noqa: E402
 
 
@@ -374,6 +374,9 @@ def _register_phone_http(ctx, *, push_token=None, push_platform=None):
     # Canonical convention: sign the literal ASCII bytes of the
     # base64url challenge string.
     signature = key.sign(challenge.encode("ascii"))
+    poll_pub_raw = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
 
     body = {
         "phone_id": "phone-supplied-id-ignored",
@@ -385,6 +388,11 @@ def _register_phone_http(ctx, *, push_token=None, push_platform=None):
             "challenge": challenge,
             "signature_b64u": _b64u(signature),
         },
+        # rule 14.2: a registration delegates a poll key or it is refused
+        "poll_public_key_b64u": _b64u(poll_pub_raw),
+        "poll_key_delegation_b64u": _b64u(key.sign(
+            poll_key_delegation_payload(_b64u(pub_raw), _b64u(poll_pub_raw))
+        )),
     }
     if push_token is not None:
         body["push_token"] = push_token

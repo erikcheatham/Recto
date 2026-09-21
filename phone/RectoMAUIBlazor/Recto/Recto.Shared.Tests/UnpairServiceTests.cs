@@ -157,7 +157,9 @@ public class UnpairServiceTests
         // before their backing keys go.
         Assert.Equal(new[] { "save(null)" }, pairing.Calls);
         Assert.Equal(1, totp.ClearAllCalls);
-        Assert.Equal(new[] { Alias }, keys.Deleted);
+        // Ruling A (2026-09-21): the delegated poll key goes with the identity
+        // that delegated it -- identity first, then the poll key.
+        Assert.Equal(new[] { Alias, PollSigning.PollKeyAlias }, keys.Deleted);
     }
 
     [Fact]

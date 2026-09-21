@@ -2724,6 +2724,36 @@
                 return;
             }
 
+            // THE POLL KEY (hard rule 14.2, ruling A, 2026-09-21). A second,
+            // enclave-resident, NON-gated key signs this phone's reads so the
+            // identity key -- per-use biometric-gated -- never signs a poll
+            // tick. Regenerated at every pairing (a pairing is the one moment
+            // the operator is present to delegate), then delegated by ONE
+            // identity-key signature over PollSigning.BuildDelegationPayload.
+            // Fail-CLOSED: the bootloader refuses a registration without a
+            // delegated poll key (rule 14.2), so a phone that cannot mint or
+            // delegate one does not pair -- it says why here, instead of
+            // failing at the register call with the server's words.
+            await SetBusyTextAsync("Preparing poll key...");
+            var pollGen = await EnclaveKeys.GenerateDeviceKeyAsync(PollSigning.PollKeyAlias, CancellationToken.None);
+            if (pollGen.IsFailure)
+            {
+                _errorMessage = $"Could not create the poll key: {pollGen.Error.Message}";
+                return;
+            }
+            var pollPubB64u = Base64UrlEncode(pollGen.Value.PublicKey);
+            await SetBusyTextAsync("Awaiting biometric approval (poll key)...");
+            var delegation = await EnclaveKeys.SignAsync(
+                KeyAlias,
+                PollSigning.BuildDelegationPayload(Base64UrlEncode(publicKey.PublicKey), pollPubB64u),
+                CancellationToken.None);
+            if (delegation.IsFailure)
+            {
+                _errorMessage = delegation.Error.Message;
+                return;
+            }
+            var pollDelegationB64u = Base64UrlEncode(delegation.Value);
+
             await SetBusyTextAsync("Fetching push token...");
             // Best-effort: a push-token failure is non-fatal -- pairing still
             // works, the bootloader just falls back to the 3s poll cycle for
@@ -2754,7 +2784,9 @@
                     Challenge: challenge.ChallengeB64u,
                     SignatureB64u: Base64UrlEncode(signResult.Value)),
                 PushToken: pushToken,
-                PushPlatform: pushPlatform);
+                PushPlatform: pushPlatform,
+                PollPublicKeyB64u: pollPubB64u,
+                PollKeyDelegationB64u: pollDelegationB64u);
 
             var registerResult = await BootloaderClient.RegisterAsync(
                 _bootloaderUrl, request, CancellationToken.None);
@@ -2767,6 +2799,16 @@
             string? capturedPin = TryCaptureBootloaderPin(_bootloaderUrl);
 
             var registration = registerResult.Value;
+
+            // Rule 14.2: sign reads only with the key the registry ECHOED. A
+            // bootloader that recorded a different key, or none, is not one
+            // this phone can read from -- refuse the pairing rather than
+            // persist a phone that 401s on its first poll.
+            if (registration.PollPublicKeyB64u != pollPubB64u)
+            {
+                _errorMessage = "The bootloader did not record this phone's poll key; pairing refused.";
+                return;
+            }
 
             // GATE 5b, phone half: an rb1- id is a CLAIM — recompute it from
             // the key set the bootloader presented, and refuse a pairing
@@ -2811,7 +2853,9 @@
                 BootloaderUrls: registration.BootloaderUrls,
                 // 2026-09-16: the server identity above TLS -- the key that
                 // answers /v0.4/attest when the certificate chain drifts.
-                BootloaderPairPubkeyHex: registration.DevicesPairPubkeyHex);
+                BootloaderPairPubkeyHex: registration.DevicesPairPubkeyHex,
+                // Ruling A: the poll key the registry echoed (checked above).
+                PollPublicKeyB64u: pollPubB64u);
 
             var saveResult = await Pairing.SaveAsync(pairedState, CancellationToken.None);
             if (saveResult.IsFailure)

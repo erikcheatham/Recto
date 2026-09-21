@@ -44,6 +44,20 @@ public sealed class IosSecureEnclaveKeyService : IEnclaveKeyService
         NSData.FromString($"com.recto.phone.enclave.{keyAlias}", NSStringEncoding.UTF8)!;
 
     public Task<Result<EnclavePublicKey>> GenerateAsync(string keyAlias, CancellationToken ct)
+        => Generate(keyAlias, biometricGated: true);
+
+    /// <summary>
+    /// The poll key (hard rule 14.2, ruling A): Secure Enclave-resident like the
+    /// identity key, but its ACL is <c>PrivateKeyUsage</c> alone -- no biometry
+    /// -- so signing a read never raises Face ID / Touch ID. On iOS the prompt
+    /// IS the ACL, so <see cref="SignAsync"/> needs no branch: the enclave
+    /// prompts for the identity key and not for this one. Delegated once by the
+    /// identity key at pairing; never signs an approval.
+    /// </summary>
+    public Task<Result<EnclavePublicKey>> GenerateDeviceKeyAsync(string keyAlias, CancellationToken ct)
+        => Generate(keyAlias, biometricGated: false);
+
+    private Task<Result<EnclavePublicKey>> Generate(string keyAlias, bool biometricGated)
     {
         try
         {
@@ -53,9 +67,12 @@ public sealed class IosSecureEnclaveKeyService : IEnclaveKeyService
             // Biometric ACL: every private-key operation requires Face ID / Touch ID.
             // .biometryCurrentSet invalidates the key if the user enrolls a new biometric
             // (so a stolen + jailbroken phone can't auto-approve via attacker-enrolled biometrics).
+            // The poll key drops the biometry flag and keeps the device-only accessibility.
+            var flags = biometricGated
+                ? SecAccessControlCreateFlags.BiometryCurrentSet | SecAccessControlCreateFlags.PrivateKeyUsage
+                : SecAccessControlCreateFlags.PrivateKeyUsage;
             using var accessControl = new SecAccessControl(
-                SecAccessible.WhenUnlockedThisDeviceOnly,
-                SecAccessControlCreateFlags.BiometryCurrentSet | SecAccessControlCreateFlags.PrivateKeyUsage);
+                SecAccessible.WhenUnlockedThisDeviceOnly, flags);
 
             // SecAccessControl derives from NativeObject (CFType-bridged), not
             // NSObject — the NSMutableDictionary indexer needs NSObject, so we

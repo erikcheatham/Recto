@@ -54,6 +54,11 @@ public static class ServiceCollectionExtensions
         // again). Cert validation goes through IPinningService (round 6) so
         // pinned hosts verify against the SPKI captured at pairing time, and
         // un-pinned hosts fall back to system trust.
+        // Ruling A (2026-09-21): the phone's reads are signed by the delegated
+        // poll key. The typed-client factory picks the BootloaderClient ctor
+        // that takes IReadSigner once it is registered.
+        services.AddSingleton<IReadSigner, PollKeyReadSigner>();
+
         services.AddHttpClient<IBootloaderClient, BootloaderClient>(client =>
         {
             client.Timeout = TimeSpan.FromSeconds(15);

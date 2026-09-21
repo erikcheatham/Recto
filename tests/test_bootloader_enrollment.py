@@ -40,7 +40,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from recto.bootloader.server import ChallengeStore, create_server
+from recto.bootloader.server import ChallengeStore, create_server, poll_key_delegation_payload
 from recto.bootloader.sessions import SUPPORTED_ALGORITHMS
 from recto.bootloader.state import StateStore
 
@@ -121,6 +121,10 @@ def _register(ctx, *, algorithms: Any, omit: bool = False):
     pub_raw = key.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
+    poll_key = Ed25519PrivateKey.generate()
+    poll_pub = _b64u(poll_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ))
     body: dict[str, Any] = {
         "device_label": "enrollment-test-phone",
         "public_key_b64u": _b64u(pub_raw),
@@ -129,6 +133,11 @@ def _register(ctx, *, algorithms: Any, omit: bool = False):
             "challenge": challenge,
             "signature_b64u": _b64u(key.sign(challenge.encode("ascii"))),
         },
+        # rule 14.2: a registration delegates a poll key or it is refused
+        "poll_public_key_b64u": poll_pub,
+        "poll_key_delegation_b64u": _b64u(key.sign(
+            poll_key_delegation_payload(_b64u(pub_raw), poll_pub)
+        )),
     }
     if not omit:
         body["supported_algorithms"] = algorithms

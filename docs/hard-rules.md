@@ -68,15 +68,20 @@ who holds the public key and usable as a credential by no one. This governs
 six things:
 
 1. **`phone_ref` names the phone; nothing else does.** A registration's
-   `phone_id` IS its `phone_ref`. A `phone_id` that is a generated identifier
-   (the pre-2026-09 form) is a **legacy alias**: the registry keeps it for the
-   back-compat window, resolves it, and never mints another.
+   `phone_id` IS its `phone_ref`. The registry mints no other identifier.
 2. **Every crossing is a signature by that key over what crossed** — poll,
    pending read, manage reads, approve/deny, pair, unpair, attest
    (`X-Recto-Phone-Sig` / `X-Recto-Phone-Ts`). `signed_poll_mode` moves
    `advisory → required` by the ceremony the substrate names: advisory,
    an evidence window of logged per-poll verdicts, the flip, one redeploy.
-   After the flip a bare `?phone_id=` query authenticates nothing.
+   After the flip a bare `?phone_id=` query authenticates nothing. Reads
+   (poll, pending, manage) are signed by a **poll key**: a second
+   enclave-resident key with no user-presence requirement, delegated at
+   registration by the identity key's signature over
+   `recto-poll-key-v1|{identity pubkey}|{poll pubkey}`. A registration
+   without a delegated poll key does not enroll. The poll key authenticates
+   the device; it never signs an approval, and the identity key never signs
+   a read.
 3. **Registries key on the key.** The phone registry, the pending queue, the
    push-token map and the consumer webhook map resolve by `phone_ref`.
    Registering a key the registry already holds is the SAME phone: its
@@ -95,8 +100,7 @@ six things:
    credentials; it holds no opener for any user's vault and no roster of users'
    phones. Absence, not denial: the question cannot be asked of it.
 
-**Back-compat window (rule 1 applies):** phone builds that predate signed
-polling poll bare; `advisory` is the default until two store builds have
-shipped signing every crossing. The wire shape does not change: `phone_id`
-stays a string, and a phone persists whatever it was given.
+**No compatibility window.** Rule 14 predates launch; there is no earlier
+phone or registry to keep working. A registry created before it is wiped at
+the deploy that carries it, and its phones pair again on the build that signs.
 

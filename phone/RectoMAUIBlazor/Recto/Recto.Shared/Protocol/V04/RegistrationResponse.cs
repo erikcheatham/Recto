@@ -29,7 +29,11 @@ public sealed record RegistrationResponse(
     // (128 hex, uncompressed X||Y). The phone pins THIS instead of the TLS
     // leaf: a certificate change is answered by GET /v0.4/attest, signed by
     // this key. Null from bootloaders that hold no signing key.
-    [property: JsonPropertyName("devices_pair_pubkey")] string? DevicesPairPubkeyHex = null);
+    [property: JsonPropertyName("devices_pair_pubkey")] string? DevicesPairPubkeyHex = null,
+    // 2026-09-21 (ruling A): the poll key this bootloader RECORDED -- echoed
+    // back so the phone signs reads only with a key the registry will verify.
+    // The pairing flow refuses a response whose echo is not the key it sent.
+    [property: JsonPropertyName("poll_public_key_b64u")] string? PollPublicKeyB64u = null);
 
 /// <summary>
 /// The key set a derived bootloader id is computed from. Public keys only —

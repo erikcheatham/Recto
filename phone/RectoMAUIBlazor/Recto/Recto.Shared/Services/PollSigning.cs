@@ -27,23 +27,37 @@ namespace Recto.Shared.Services;
 /// call sites is the Build 13 increment that makes the flip safe.
 /// </para>
 /// <para>
-/// CALL-SITE CAUTION (why this ships as a helper + TODO map rather
-/// than pre-wired): <see cref="IEnclaveKeyService.SignAsync"/> is
-/// biometric-gated on hardware-enclave platforms (iOS Secure Enclave
-/// <c>BiometryCurrentSet</c> ACL; Android
-/// <c>setUserAuthenticationRequired</c>). Signing EVERY poll tick
-/// would fire a biometric prompt per tick. Wiring therefore needs a
-/// per-platform decision first: a second, non-biometric-gated poll
-/// key (enclave-resident, no user-auth ACL &mdash; authenticates the
-/// DEVICE, not the operator's presence), or platform-specific auth
-/// validity windows. The software-backed dev paths (Windows / Mac
-/// Catalyst) sign silently and can wire directly.
+/// THE POLL KEY (hard rule 14.2, ruling A, 2026-09-21). The identity key
+/// is per-use biometric-gated on both shipped platforms, so it cannot
+/// sign a poll tick; that is why this helper shipped in 1.1.0 with no
+/// caller. Reads are signed instead by a second, enclave-resident,
+/// NON-gated key under <see cref="PollKeyAlias"/>
+/// (<see cref="IEnclaveKeyService.GenerateDeviceKeyAsync"/>), which the
+/// identity key delegates ONCE at pairing by signing
+/// <see cref="BuildDelegationPayload"/>. The bootloader verifies reads
+/// against the poll key from then on and refuses the identity key for
+/// them. The poll key authenticates the DEVICE; it never signs an
+/// approval. <see cref="IReadSigner"/> is the call-site seam.
 /// </para>
 /// </summary>
 public static class PollSigning
 {
     /// <summary>Signing-input prefix; mirrors the server's POLL_SIG_PREFIX.</summary>
     public const string Prefix = "recto-poll-v1";
+
+    /// <summary>Enclave alias of the poll key. Distinct from the identity alias by construction.</summary>
+    public const string PollKeyAlias = "recto.phone.poll";
+
+    /// <summary>Delegation prefix; mirrors the server's POLL_KEY_DELEGATION_PREFIX.</summary>
+    public const string DelegationPrefix = "recto-poll-key-v1";
+
+    /// <summary>
+    /// The bytes the IDENTITY key signs to delegate a poll key:
+    /// <c>recto-poll-key-v1|{identityPubB64u}|{pollPubB64u}</c> (ASCII).
+    /// Mirrors the server's poll_key_delegation_payload byte for byte.
+    /// </summary>
+    public static byte[] BuildDelegationPayload(string identityPubB64u, string pollPubB64u)
+        => Encoding.ASCII.GetBytes($"{DelegationPrefix}|{identityPubB64u}|{pollPubB64u}");
 
     /// <summary>Signature header; mirrors the server's POLL_SIG_HEADER.</summary>
     public const string SignatureHeader = "X-Recto-Phone-Sig";

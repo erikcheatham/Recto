@@ -19,7 +19,14 @@ public sealed record RegistrationRequest(
     // where push registration failed). Token rotation post-pairing flows
     // through POST /v0.4/manage/push_token.
     [property: JsonPropertyName("push_token")] string? PushToken = null,
-    [property: JsonPropertyName("push_platform")] string? PushPlatform = null);
+    [property: JsonPropertyName("push_platform")] string? PushPlatform = null,
+    // 2026-09-21 (hard rule 14.2, ruling A): the non-gated poll key that will
+    // sign this phone's READS, and the identity key's signature over
+    // PollSigning.BuildDelegationPayload(public_key_b64u, poll_public_key_b64u).
+    // REQUIRED: the bootloader refuses a registration without both. Typed
+    // optional only for construction order; the pairing flow always sets them.
+    [property: JsonPropertyName("poll_public_key_b64u")] string? PollPublicKeyB64u = null,
+    [property: JsonPropertyName("poll_key_delegation_b64u")] string? PollKeyDelegationB64u = null);
 
 /// <summary>
 /// Proof that the phone holds the private key matching <c>public_key_b64u</c> &mdash;

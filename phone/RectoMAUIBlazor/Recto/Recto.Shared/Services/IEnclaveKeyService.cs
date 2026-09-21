@@ -33,6 +33,19 @@ public interface IEnclaveKeyService
     /// <summary>Generates a new keypair under <paramref name="keyAlias"/>. Overwrites any existing.</summary>
     Task<Result<EnclavePublicKey>> GenerateAsync(string keyAlias, CancellationToken ct);
 
+    /// <summary>
+    /// Generates a DEVICE key under <paramref name="keyAlias"/>: enclave-resident
+    /// where the platform has one, but with NO user-authentication ACL, so
+    /// <see cref="SignAsync"/> on it never prompts. This is the poll key of hard
+    /// rule 14.2 (ruling A, 2026-09-21): it authenticates the device on the
+    /// phone's reads (poll, pending, manage) and is delegated once, at pairing,
+    /// by an identity-key signature. It must never sign an approval. The
+    /// default falls back to <see cref="GenerateAsync"/> for implementations
+    /// that have no ACL to drop (software-backed dev paths, test fakes).
+    /// </summary>
+    Task<Result<EnclavePublicKey>> GenerateDeviceKeyAsync(string keyAlias, CancellationToken ct)
+        => GenerateAsync(keyAlias, ct);
+
     /// <summary>True if a keypair already exists under <paramref name="keyAlias"/>.</summary>
     Task<Result<bool>> KeyExistsAsync(string keyAlias, CancellationToken ct);
 

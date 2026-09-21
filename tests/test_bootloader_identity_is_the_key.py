@@ -6,17 +6,14 @@ ids, and every consumer keyed on the first id -- approval carding, push routing,
 went dark without any error. Measured twice in one week on one phone. The id was an ADDRESS the phone
 rented from its own storage; the identity was always the key.
 
-THE FIX, in three parts, each with a test below:
-  1. a NEW registration's phone_id IS its phone_ref (`pk_` + sha256(raw pubkey)[:16]) -- deterministic,
+THE FIX, in two parts, each with a test below:
+  1. a registration's phone_id IS its phone_ref (`pk_` + sha256(raw pubkey)[:16]) -- deterministic,
      derivable by anyone holding the pubkey, a credential for no one;
   2. registering a key the registry already holds is the SAME record -- one phone, the id it already
-     had, the metadata refreshed;
-  3. a LEGACY record (a Guid id from a pre-split phones.json) keeps its Guid forever (nothing that
-     carded it re-points) and ALSO answers to its phone_ref.
+     had, the metadata refreshed.
 
-Back-compat is the whole point of (3): the wire shape is unchanged (phone_id is still a string; the
-phone persists whatever it is given), build-12 phones keep polling, and a re-pair of the genesis phone
-changes no row anywhere.
+No back-compat (operator ruling, same night, pre-launch): a Guid id is not resolved by its ref; a
+pre-split phones.json is wiped at the deploy and the phones re-pair on the store build that signs.
 """
 
 from __future__ import annotations
@@ -25,7 +22,6 @@ import base64
 import hashlib
 import json
 import threading
-import uuid
 from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
@@ -35,8 +31,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from recto.bootloader.server import ChallengeStore, create_server
-from recto.bootloader.state import PhoneRegistration, StateStore, phone_ref_of
+from recto.bootloader.server import ChallengeStore, create_server, poll_key_delegation_payload
+from recto.bootloader.state import StateStore, phone_ref_of
 
 
 def _b64u(raw: bytes) -> str:
@@ -88,6 +84,7 @@ def _register(ctx, key: Ed25519PrivateKey, pub_b64u: str, *, label: str) -> tupl
     status, chal = _http("GET", f"{ctx['base_url']}/v0.4/registration_challenge?code={code}")
     assert status == 200, f"challenge mint failed: {status} {chal}"
     challenge = chal["challenge_b64u"]
+    _, poll_pub = _key()  # every registration delegates a poll key (rule 14.2)
     return _http("POST", f"{ctx['base_url']}/v0.4/register", {
         "device_label": label,
         "public_key_b64u": pub_b64u,
@@ -97,6 +94,8 @@ def _register(ctx, key: Ed25519PrivateKey, pub_b64u: str, *, label: str) -> tupl
             "challenge": challenge,
             "signature_b64u": _b64u(key.sign(challenge.encode("ascii"))),
         },
+        "poll_public_key_b64u": poll_pub,
+        "poll_key_delegation_b64u": _b64u(key.sign(poll_key_delegation_payload(pub_b64u, poll_pub))),
     })
 
 
@@ -149,58 +148,3 @@ def test_two_different_keys_are_two_phones(ctx):
     _, b = _register(ctx, k2, p2, label="iphone")
     assert a["phone_id"] != b["phone_id"]
     assert len(ctx["state"].list_phones()) == 2
-
-
-# --------------------------------------------------------------------------
-# 3. a legacy Guid record keeps its Guid and answers to its ref
-# --------------------------------------------------------------------------
-
-def _seed_legacy(state_dir: Path, pub_b64u: str) -> str:
-    """A phones.json as a pre-split bootloader wrote it: a Guid id, no notion of a ref."""
-    guid = str(uuid.uuid4())
-    (state_dir / "phones.json").write_text(json.dumps({"phones": [{
-        "phone_id": guid,
-        "device_label": "pixel (legacy)",
-        "public_key_b64u": pub_b64u,
-        "supported_algorithms": ["ed25519"],
-        "registered_at_unix": 1_700_000_000,
-        "last_seen_unix": 1_700_000_000,
-    }]}), encoding="utf-8")
-    return guid
-
-
-def test_a_legacy_guid_phone_resolves_by_its_ref_and_by_its_guid(tmp_path: Path):
-    _, pub = _key()
-    guid = _seed_legacy(tmp_path, pub)
-    state = StateStore(state_dir=tmp_path)
-    by_guid = state.get_phone(guid)
-    by_ref = state.get_phone(phone_ref_of(pub))
-    assert by_guid is not None, "the legacy record did not load"
-    assert by_ref is by_guid or (by_ref is not None and by_ref.phone_id == guid), (
-        "a legacy phone does not answer to its phone_ref -- the registries cannot re-key onto the ref"
-    )
-    assert state.get_phone("pk_0000000000000000") is None, "an unknown ref resolved to something"
-
-
-def test_a_legacy_phone_that_re_registers_keeps_its_guid(ctx):
-    """The carding lane survives the store update: genesis_phone_id in the harness, the bridge
-    config, the push-token map -- every consumer keyed on the Guid keeps working, because the
-    re-registration of the same key is the SAME record under the SAME id."""
-    key, pub = _key()
-    guid = _seed_legacy(ctx["state_dir"], pub)
-    ctx["state"]._load()  # the fixture's store was created before the seed; reload as a restart would
-
-    status, body = _register(ctx, key, pub, label="pixel (re-verified on 1.1.0)")
-    assert status == 201, body
-    assert body["phone_id"] == guid, (
-        "a legacy phone re-registering was given a new id -- every lane keyed on its Guid just went dark"
-    )
-    assert body["phone_ref"] == phone_ref_of(pub)
-    phones = ctx["state"].list_phones()
-    assert [p.phone_id for p in phones] == [guid]
-    assert phones[0].device_label == "pixel (re-verified on 1.1.0)"
-    assert phones[0].registered_at_unix == 1_700_000_000, "the first pairing's date is the record's"
-
-    # and it survives a restart: the file on disk carries one record under the Guid
-    reloaded = StateStore(state_dir=ctx["state_dir"])
-    assert [p.phone_id for p in reloaded.list_phones()] == [guid]

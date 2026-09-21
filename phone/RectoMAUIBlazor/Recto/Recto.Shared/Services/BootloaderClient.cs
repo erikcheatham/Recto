@@ -41,11 +41,23 @@ public sealed class BootloaderClient : IBootloaderClient
 
     private readonly HttpClient _http;
     private readonly ILogger<BootloaderClient> _log;
+    private readonly IReadSigner? _readSigner;
 
     public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log)
+        : this(http, log, readSigner: null)
+    {
+    }
+
+    /// <summary>
+    /// <paramref name="readSigner"/> (hard rule 14.2, ruling A) signs the
+    /// phone's READS -- pending, manage/phones, manage/push_token -- with the
+    /// delegated poll key. Null means reads go bare, as before this build.
+    /// </summary>
+    public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log, IReadSigner? readSigner)
     {
         _http = http;
         _log = log;
+        _readSigner = readSigner;
     }
 
     public Task<Result<RegistrationChallengeResponse>> GetRegistrationChallengeAsync(
@@ -115,7 +127,7 @@ public sealed class BootloaderClient : IBootloaderClient
         }
 
         var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/pending?phone_id={Uri.EscapeDataString(phoneId)}";
-        return GetPendingWithRawAsync(url, ct);
+        return GetPendingWithRawAsync(url, phoneId, ct);
     }
 
     /// <summary>
@@ -123,9 +135,10 @@ public sealed class BootloaderClient : IBootloaderClient
     /// envelope signature (2026-09-16) is over the exact `requests` text, so the
     /// typed record is parsed from the same string and carries that text along.
     /// </summary>
-    private async Task<Result<PendingRequestsResponse>> GetPendingWithRawAsync(string url, CancellationToken ct)
+    private async Task<Result<PendingRequestsResponse>> GetPendingWithRawAsync(string url, string phoneId, CancellationToken ct)
     {
-        var body = await SendForBodyAsync(HttpMethod.Get, url, body: null, ct).ConfigureAwait(false);
+        var sig = await SignReadAsync(phoneId, "/v0.4/pending", ct).ConfigureAwait(false);
+        var body = await SendForBodyAsync(HttpMethod.Get, url, body: null, ct, sig).ConfigureAwait(false);
         if (body.IsFailure) return Result.Failure<PendingRequestsResponse>(body.Error);
         try
         {
@@ -186,7 +199,7 @@ public sealed class BootloaderClient : IBootloaderClient
         }
 
         var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/manage/phones?phone_id={Uri.EscapeDataString(phoneId)}";
-        return SendAsync<RegisteredPhonesResponse>(HttpMethod.Get, url, body: null, ct);
+        return SendSignedReadAsync<RegisteredPhonesResponse>(HttpMethod.Get, url, body: null, phoneId, "/v0.4/manage/phones", ct);
     }
 
     public Task<Result<RevokeChallengeResponse>> GetRevokeChallengeAsync(
@@ -243,7 +256,7 @@ public sealed class BootloaderClient : IBootloaderClient
         }
 
         var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/manage/push_token";
-        return SendAsync<PushTokenUpdateResponse>(HttpMethod.Post, url, request, ct);
+        return SendSignedReadAsync<PushTokenUpdateResponse>(HttpMethod.Post, url, request, request.PhoneId, "/v0.4/manage/push_token", ct);
     }
 
     public Task<Result<AuditLogResponse>> GetAuditLogAsync(
@@ -344,10 +357,24 @@ public sealed class BootloaderClient : IBootloaderClient
         WriteIndented = false,
     };
 
-    private async Task<Result<T>> SendAsync<T>(
-        HttpMethod method, string url, object? body, CancellationToken ct) where T : class
+    /// <summary>A read surface (ruling A): signed by the poll key when the pairing has one.</summary>
+    private async Task<Result<T>> SendSignedReadAsync<T>(
+        HttpMethod method, string url, object? body, string phoneId, string path, CancellationToken ct) where T : class
     {
-        var text = await SendForBodyAsync(method, url, body, ct).ConfigureAwait(false);
+        var sig = await SignReadAsync(phoneId, path, ct).ConfigureAwait(false);
+        return await SendAsync<T>(method, url, body, ct, sig).ConfigureAwait(false);
+    }
+
+    private Task<PollSignatureHeaders?> SignReadAsync(string phoneId, string path, CancellationToken ct)
+        => _readSigner is null
+            ? Task.FromResult<PollSignatureHeaders?>(null)
+            : _readSigner.SignReadAsync(phoneId, path, ct);
+
+    private async Task<Result<T>> SendAsync<T>(
+        HttpMethod method, string url, object? body, CancellationToken ct,
+        PollSignatureHeaders? readSignature = null) where T : class
+    {
+        var text = await SendForBodyAsync(method, url, body, ct, readSignature).ConfigureAwait(false);
         if (text.IsFailure) return Result.Failure<T>(text.Error);
         try
         {
@@ -367,11 +394,17 @@ public sealed class BootloaderClient : IBootloaderClient
 
     /// <summary>The transport half of <see cref="SendAsync{T}"/>: status handling + the body as text.</summary>
     private async Task<Result<string>> SendForBodyAsync(
-        HttpMethod method, string url, object? body, CancellationToken ct)
+        HttpMethod method, string url, object? body, CancellationToken ct,
+        PollSignatureHeaders? readSignature = null)
     {
         try
         {
             using var request = new HttpRequestMessage(method, url);
+            if (readSignature is not null)
+            {
+                request.Headers.TryAddWithoutValidation(PollSigning.SignatureHeader, readSignature.SignatureB64u);
+                request.Headers.TryAddWithoutValidation(PollSigning.TimestampHeader, readSignature.TsUnix.ToString());
+            }
             if (body is not null)
             {
                 var json = JsonSerializer.Serialize(body, body.GetType(), _serializerOptions);

@@ -46,6 +46,18 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
     public string Algorithm => V04Protocol.AlgorithmEcdsaP256;
 
     public Task<Result<EnclavePublicKey>> GenerateAsync(string keyAlias, CancellationToken ct)
+        => Generate(keyAlias, requireUserAuth: true);
+
+    /// <summary>
+    /// The poll key (hard rule 14.2, ruling A): StrongBox/TEE-resident like the
+    /// identity key, but with NO user-authentication requirement, so signing a
+    /// read never raises a BiometricPrompt. Delegated once by the identity key
+    /// at pairing; never signs an approval.
+    /// </summary>
+    public Task<Result<EnclavePublicKey>> GenerateDeviceKeyAsync(string keyAlias, CancellationToken ct)
+        => Generate(keyAlias, requireUserAuth: false);
+
+    private static Task<Result<EnclavePublicKey>> Generate(string keyAlias, bool requireUserAuth)
     {
         try
         {
@@ -54,7 +66,7 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
             var generator = KeyPairGenerator.GetInstance(KeyProperties.KeyAlgorithmEc, AndroidKeyStoreProvider)
                 ?? throw new InvalidOperationException("KeyPairGenerator.GetInstance returned null.");
 
-            var spec = BuildSpec(keyAlias, strongBox: true);
+            var spec = BuildSpec(keyAlias, strongBox: true, requireUserAuth);
             try
             {
                 generator.Initialize(spec);
@@ -63,7 +75,7 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
             }
             catch (StrongBoxUnavailableException)
             {
-                spec = BuildSpec(keyAlias, strongBox: false);
+                spec = BuildSpec(keyAlias, strongBox: false, requireUserAuth);
                 generator.Initialize(spec);
                 using var pair = generator.GenerateKeyPair();
                 return Task.FromResult(BuildPublicKeyResult(pair));
@@ -140,6 +152,18 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
             var signer = Signature.GetInstance(SignatureAlgorithm)
                 ?? throw new InvalidOperationException("Signature.GetInstance returned null.");
             signer.InitSign(pkEntry.PrivateKey);
+
+            // The poll key (GenerateDeviceKeyAsync) carries no user-auth
+            // requirement: the KEYSTORE says so, not the caller, so no alias
+            // convention can route an approval past the prompt. It signs
+            // directly; every other key goes through BiometricPrompt.
+            if (!RequiresUserAuthentication(pkEntry.PrivateKey!))
+            {
+                signer.Update(message);
+                var derSig = signer.Sign()
+                    ?? throw new InvalidOperationException("Signature.Sign returned null.");
+                return Task.FromResult(Result.Success(EcdsaSignatureFormat.DerToRaw(derSig)));
+            }
 
             return AuthenticateAndSignAsync(signer, message, keyAlias, ct);
         }
@@ -257,19 +281,44 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
 
     // --- internals ---
 
-    private static KeyGenParameterSpec BuildSpec(string keyAlias, bool strongBox)
+    /// <summary>
+    /// Asks the keystore whether <paramref name="privateKey"/> was generated with
+    /// <c>setUserAuthenticationRequired(true)</c>. Fails CLOSED: any failure to
+    /// read the KeyInfo is reported as "requires authentication", so an
+    /// unreadable key can only ever be over-prompted, never under-prompted.
+    /// </summary>
+    private static bool RequiresUserAuthentication(IPrivateKey privateKey)
+    {
+        try
+        {
+            var factory = KeyFactory.GetInstance(privateKey.Algorithm, AndroidKeyStoreProvider);
+            var info = factory?.GetKeySpec(privateKey, Java.Lang.Class.FromType(typeof(KeyInfo))) as KeyInfo;
+            return info?.IsUserAuthenticationRequired ?? true;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private static KeyGenParameterSpec BuildSpec(string keyAlias, bool strongBox, bool requireUserAuth)
     {
         var builder = new KeyGenParameterSpec.Builder(keyAlias, KeyStorePurpose.Sign)
             .SetAlgorithmParameterSpec(new ECGenParameterSpec(EcCurveName))
             .SetDigests(KeyProperties.DigestSha256!)
-            .SetUserAuthenticationRequired(true);
+            .SetUserAuthenticationRequired(requireUserAuth);
 
-        // Per-use authentication: timeout 0 means every cryptographic operation
-        // requires a fresh BiometricPrompt.authenticate(CryptoObject) call. This
-        // matches the protocol's "operator approves every operation" model.
-        builder.SetUserAuthenticationParameters(
-            timeout: 0,
-            type: (int)(KeyPropertiesAuthType.BiometricStrong | KeyPropertiesAuthType.DeviceCredential));
+        if (requireUserAuth)
+        {
+            // Per-use authentication: timeout 0 means every cryptographic operation
+            // requires a fresh BiometricPrompt.authenticate(CryptoObject) call. This
+            // matches the protocol's "operator approves every operation" model.
+            // The poll key (requireUserAuth: false) is the one deliberate
+            // exception -- it signs READS, never approvals.
+            builder.SetUserAuthenticationParameters(
+                timeout: 0,
+                type: (int)(KeyPropertiesAuthType.BiometricStrong | KeyPropertiesAuthType.DeviceCredential));
+        }
 
         if (strongBox)
         {

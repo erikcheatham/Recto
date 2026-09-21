@@ -102,6 +102,9 @@ public sealed class UnpairService : IUnpairService
             await _pairing.SaveAsync(null!, ct).ConfigureAwait(false);
             await _totp.ClearAllAsync(ct).ConfigureAwait(false);
             await _enclaveKeys.DeleteAsync(keyAlias, ct).ConfigureAwait(false);
+            // Ruling A: the delegated poll key goes with the identity that
+            // delegated it. No-op when none was ever minted.
+            await _enclaveKeys.DeleteAsync(PollSigning.PollKeyAlias, ct).ConfigureAwait(false);
             return new UnpairAllResult(UnpairAllStatus.Completed);
         }
         catch (Exception ex)

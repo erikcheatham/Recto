@@ -44,6 +44,7 @@ from recto.bootloader.server import (
     ChallengeStore,
     _phone_ref,
     create_server,
+    poll_key_delegation_payload,
 )
 from recto.bootloader.state import PhoneRegistration, StateStore
 
@@ -97,11 +98,16 @@ def _spawn(tmp_path: Path, mode: str):
     signing key) / server (for shutdown).
     """
     state = StateStore(state_dir=tmp_path)
-    priv, pub_b64u = _make_keypair()
+    identity_priv, pub_b64u = _make_keypair()
+    # Ruling A (2026-09-21): reads are signed by the delegated POLL key, never
+    # the identity key. `priv` below is the poll key -- the one every signed
+    # read in this suite must use.
+    priv, poll_pub_b64u = _make_keypair()
     phone = PhoneRegistration.new(
         device_label="Signed-Poll Test Phone",
         public_key_b64u=pub_b64u,
         supported_algorithms=("ed25519",),
+        poll_public_key_b64u=poll_pub_b64u,
     )
     state.register_phone(phone)
     server = create_server(
@@ -408,6 +414,7 @@ def test_phone_ref_derivation_shape():
 
 def test_register_response_carries_phone_ref(advisory):
     priv, pub_b64u = _make_keypair()
+    _, poll_pub_b64u = _make_keypair()
     status, chal = _http(
         f"{advisory['base_url']}/v0.4/registration_challenge")
     assert status == HTTPStatus.OK
@@ -425,10 +432,16 @@ def test_register_response_carries_phone_ref(advisory):
                 "challenge": challenge,
                 "signature_b64u": sig,
             },
+            # rule 14.2: a registration delegates a poll key or it is refused
+            "poll_public_key_b64u": poll_pub_b64u,
+            "poll_key_delegation_b64u": _b64u(priv.sign(
+                poll_key_delegation_payload(pub_b64u, poll_pub_b64u)
+            )),
         },
     )
     assert status == HTTPStatus.CREATED
     assert body["phone_ref"] == _phone_ref(pub_b64u)
+    assert body["poll_public_key_b64u"] == poll_pub_b64u
 
 
 def test_manage_phones_rows_carry_phone_ref(advisory):

@@ -92,6 +92,22 @@ POLL_SIG_HEADER = "X-Recto-Phone-Sig"
 POLL_SIG_TS_HEADER = "X-Recto-Phone-Ts"
 POLL_SIG_FRESHNESS_SECONDS = 120
 
+# The poll-key delegation (2026-09-21, hard rule 14.2 / ruling A). The
+# identity key is per-use biometric-gated on both shipped platforms, so
+# it cannot sign a poll tick. At registration the phone MAY carry a
+# second, non-gated enclave key (`poll_public_key_b64u`) and the identity
+# key's signature (`poll_key_delegation_b64u`) over
+#   recto-poll-key-v1|{public_key_b64u}|{poll_public_key_b64u}
+# Poll signatures are then verified against the poll key. The delegation
+# is the signed claim that keeps "every crossing is a signature by THAT
+# key" true: the identity key named the poll key, once, under biometrics.
+POLL_KEY_DELEGATION_PREFIX = "recto-poll-key-v1"
+
+
+def poll_key_delegation_payload(public_key_b64u: str, poll_public_key_b64u: str) -> bytes:
+    """The ASCII bytes the identity key signs to delegate a poll key."""
+    return f"{POLL_KEY_DELEGATION_PREFIX}|{public_key_b64u}|{poll_public_key_b64u}".encode("ascii")
+
 # The three legal signed_poll_mode values. "advisory" is the DEFAULT:
 # Build 12 phones in both stores poll bare, so a hard require would
 # brick the shipped app (Hard Rule #1 back-compat). Advisory allows
@@ -1152,12 +1168,42 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 f"unknown push_platform {push_platform!r}; "
                 "expected 'apns' or 'fcm'"
             )
+        # THE POLL KEY (2026-09-21, ruling A; REQUIRED per the no-back-compat
+        # ruling the same night). A phone enrolls with a second, non-gated
+        # enclave key and the identity key's delegation over it, or it does
+        # not enroll: there is one way to read from this registry, and it is
+        # a signature by the delegated poll key. A poll key nobody delegated
+        # is refused, never dropped.
+        poll_public_key_b64u = body.get("poll_public_key_b64u") or None
+        poll_key_delegation_b64u = body.get("poll_key_delegation_b64u") or None
+        if not (poll_public_key_b64u and poll_key_delegation_b64u):
+            raise BootloaderError(
+                "registration refused: poll_public_key_b64u and "
+                "poll_key_delegation_b64u are required (hard rule 14.2). A phone "
+                "that has not delegated a poll key cannot read from this registry."
+            )
+        if poll_public_key_b64u == public_key_b64u:
+            raise BootloaderError(
+                "registration refused: the poll key must not be the identity key"
+            )
+        delegated = verify_signature(
+            payload=poll_key_delegation_payload(public_key_b64u, poll_public_key_b64u),
+            signature_b64u=poll_key_delegation_b64u,
+            public_key_b64u=public_key_b64u,
+            algorithm=chosen_algo,
+        )
+        if not delegated:
+            raise BootloaderError(
+                "registration refused: poll_key_delegation_b64u does not verify "
+                f"against the identity key (algorithm={chosen_algo!r})"
+            )
         reg = PhoneRegistration.new(
             device_label=str(device_label),
             public_key_b64u=public_key_b64u,
             supported_algorithms=algos,
             push_token=push_token,
             push_platform=push_platform if push_token else None,
+            poll_public_key_b64u=poll_public_key_b64u,
         )
         # THE KEY IS THE IDENTITY (2026-09-21): the store answers with the
         # record AS STORED -- a key it already held keeps the id it had, so a
@@ -1171,6 +1217,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # also the id half for every new registration. Equal to
             # phone_id unless the record predates the split.
             "phone_ref": _phone_ref(reg.public_key_b64u),
+            # Ruling A: the key this registry verifies the phone's READS
+            # against. The phone signs reads only with the key echoed here.
+            "poll_public_key_b64u": reg.poll_public_key_b64u,
             "bootloader_id": cfg.bootloader_id,
             # Empty managed_secrets for now; the operator wires services
             # to specific phone_ids via service.yaml's
@@ -1282,18 +1331,25 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             if ts is not None and abs(int(time.time()) - ts) <= POLL_SIG_FRESHNESS_SECONDS:
                 payload = f"{POLL_SIG_PREFIX}|{phone.phone_id}|{ts}|{path}"
                 phone_algo = _registered_algorithm(phone, phone.phone_id)
-                try:
-                    ok = verify_signature(
-                        payload=payload.encode("ascii"),
-                        signature_b64u=sig,
-                        public_key_b64u=phone.public_key_b64u,
-                        algorithm=phone_algo,
-                    )
-                except BootloaderError:
-                    # Undecodable registration pubkey / unsupported algo:
-                    # the signature cannot be validated, which is a
-                    # verdict, not a server error.
-                    ok = False
+                # Ruling A: reads are signed by the delegated POLL key and
+                # only that key. The identity key is never accepted here, so a
+                # leaked identity signature over a poll is not replayable. A
+                # record with no poll key (only reachable by seeding the store
+                # directly) cannot verify anything: that is a verdict.
+                ok = False
+                if phone.poll_public_key_b64u:
+                    try:
+                        ok = verify_signature(
+                            payload=payload.encode("ascii"),
+                            signature_b64u=sig,
+                            public_key_b64u=phone.poll_public_key_b64u,
+                            algorithm=phone_algo,
+                        )
+                    except BootloaderError:
+                        # Undecodable pubkey / unsupported algo: the signature
+                        # cannot be validated, which is a verdict, not a
+                        # server error.
+                        ok = False
                 if ok:
                     verdict = "signed-valid"
 
