@@ -62,3 +62,41 @@ bytes themselves are the record. Transports (HTTP, folder drop, QR) are
 interchangeable serializations of the same payload. **Verification must never
 require any particular runtime to still be alive.**
 
+**14. The key is the identity.** A phone IS its enclave keypair. Its reference
+is `phone_ref` — `"pk_" + sha256(raw public key)[:16]` — derivable by anyone
+who holds the public key and usable as a credential by no one. This governs
+six things:
+
+1. **`phone_ref` names the phone; nothing else does.** A registration's
+   `phone_id` IS its `phone_ref`. A `phone_id` that is a generated identifier
+   (the pre-2026-09 form) is a **legacy alias**: the registry keeps it for the
+   back-compat window, resolves it, and never mints another.
+2. **Every crossing is a signature by that key over what crossed** — poll,
+   pending read, manage reads, approve/deny, pair, unpair, attest
+   (`X-Recto-Phone-Sig` / `X-Recto-Phone-Ts`). `signed_poll_mode` moves
+   `advisory → required` by the ceremony the substrate names: advisory,
+   an evidence window of logged per-poll verdicts, the flip, one redeploy.
+   After the flip a bare `?phone_id=` query authenticates nothing.
+3. **Registries key on the key.** The phone registry, the pending queue, the
+   push-token map and the consumer webhook map resolve by `phone_ref`.
+   Registering a key the registry already holds is the SAME phone: its
+   existing id and first-pairing time are kept, its metadata refreshed, and no
+   second record exists. Nothing keyed on a phone needs re-pointing when that
+   phone pairs again.
+4. **Two slots, not a list.** A bootloader holds a PRIMARY and a RECOVERY
+   `phone_ref`. Pairing into an occupied slot is a replacement question,
+   answered by a signed claim from the incoming key; the outgoing key's slot
+   is revoked in the same act. A third key cannot pair without displacing one.
+5. **A consumer binds to the key, not to the id.** A service that stores a
+   phone's id stores a cached display value; its truth is the public key it
+   verifies signatures against. "Is this still the phone?" is answered at every
+   crossing by the signature, and by nothing else.
+6. **The user plane is a vault plane.** A consumer may hold its own automation
+   credentials; it holds no opener for any user's vault and no roster of users'
+   phones. Absence, not denial: the question cannot be asked of it.
+
+**Back-compat window (rule 1 applies):** phone builds that predate signed
+polling poll bare; `advisory` is the default until two store builds have
+shipped signing every crossing. The wire shape does not change: `phone_id`
+stays a string, and a phone persists whatever it was given.
+

@@ -79,6 +79,12 @@ An operator is an **identity, never a role.** A role can be granted, so
 something can be tricked into granting it. There is no grant operation here to
 abuse.
 
+**Step 1 is literal: the phone IS its enclave key.** Its reference, `phone_ref`,
+is derived from the public key — anyone holding the key can compute it, and it
+authenticates nothing. Every crossing after pairing is a signature by that key;
+a re-pair of the same key is the same phone, not a new one. The full contract is
+[hard rule 14](docs/hard-rules.md).
+
 Operators and users share one app, one hardware key and one approval card. They
 differ only in scope: an operator approves what affects the bootloader and its
 agents; a user approves what affects their own vault and data.
