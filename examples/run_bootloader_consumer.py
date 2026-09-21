@@ -85,6 +85,16 @@ Pairing-code mint (existing convention):
                             Operators mint codes on demand via
                             POST /v0.4/pairing/code regardless.
 
+Signed polls (hard rule 14.2 -- the phone's reads are signed by its key):
+    RECTO_SIGNED_POLL_MODE  "off" | "advisory" (default when unset) |
+                            "required". Advisory admits every read and logs
+                            a per-read verdict (signed-valid / signed-invalid
+                            / unsigned) on recto.bootloader.signed_polls;
+                            required answers an unsigned or invalid read
+                            with 401. Flip only after the verdict log shows
+                            every live phone signing. Any other value
+                            refuses startup (exit 2) -- never coerced.
+
 Folder-drop event bus (RECTO_EVENTS_DIR, banked 2026-05-19 night):
     When set + writable, the launcher constructs a FileEventEmitter
     that emits capability + sign lifecycle events as JSONL records
@@ -306,9 +316,10 @@ import logging
 import os
 import pathlib
 import sys
+from typing import Mapping
 
 from recto.bootloader.events import construct_from_env as construct_events_emitter
-from recto.bootloader.server import ChallengeStore, create_server
+from recto.bootloader.server import SIGNED_POLL_MODES, ChallengeStore, create_server
 from recto.bootloader.state import AppContext, StateStore
 from recto.secrets.dpapi_machine import DpapiMachineSource
 
@@ -338,6 +349,31 @@ def _env(name: str, *, default: str | None = None, required: bool = False) -> st
         )
         sys.exit(2)
     return default
+
+
+def _resolve_signed_poll_mode(environ: Mapping[str, str] | None = None) -> str:
+    """The config seam for the signed-poll ceremony (hard rule 14.2).
+
+    ``RECTO_SIGNED_POLL_MODE`` -> one of ``SIGNED_POLL_MODES``
+    (``off`` | ``advisory`` | ``required``); unset or empty is ``advisory``,
+    the substrate's own default. Any other spelling is refused HERE, at
+    startup, with a message naming the legal values -- never coerced, because
+    a mode that silently fell back to advisory would read as "the flip took"
+    to an operator watching the evidence window. Until this seam existed the
+    mode was a ``create_server()`` kwarg the container never passed, so the
+    ceremony's last step (advisory -> evidence -> FLIP -> one redeploy) had no
+    handle to pull. Case-insensitive; whitespace ignored.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("RECTO_SIGNED_POLL_MODE") or "").strip().lower()
+    if not raw:
+        return "advisory"
+    if raw not in SIGNED_POLL_MODES:
+        raise ValueError(
+            f"RECTO_SIGNED_POLL_MODE={raw!r} is not a signed-poll mode; "
+            f"legal values are {', '.join(SIGNED_POLL_MODES)} (unset = advisory)"
+        )
+    return raw
 
 
 def _env_int(name: str, *, default: int) -> int:
@@ -1457,12 +1493,21 @@ def main() -> int:
             )
             sys.exit(2)
 
+    # RECTO_SIGNED_POLL_MODE: the signed-poll ceremony's handle (hard rule
+    # 14.2). Refused at startup on any illegal spelling; see _resolve_signed_poll_mode.
+    try:
+        signed_poll_mode = _resolve_signed_poll_mode()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     server = create_server(
         bind_host=bind_host,
         bind_port=bind_port,
         state=state,
         challenges=challenges,
         bootloader_id=bootloader_id,
+        signed_poll_mode=signed_poll_mode,
         capability_manifest_path=capability_manifest_path,
         capability_agent_tokens=capability_agent_tokens,
         capability_agent_requestable=capability_agent_requestable or None,
@@ -1504,6 +1549,7 @@ def main() -> int:
     print(f"State dir:     {state_dir}")
     print(f"State backend: {state_banner}")
     print(f"Bootloader id: {bootloader_id}")
+    print(f"Signed polls:  {signed_poll_mode}")
     if push_dispatcher is not None:
         print(f"Push wake:     {'+'.join(push_dispatcher.platforms)}")
     else:
