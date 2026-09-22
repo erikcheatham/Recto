@@ -389,8 +389,8 @@ class AppContext:
     - ``app_url``: homepage / docs link. Operator can verify the
       app is what it claims to be by visiting. Optional.
     - ``app_icon_url``: image URL for phone-side rendering. The
-      phone fetches + caches the icon at registration time;
-      subsequent approval cards render from cache. Optional.
+      phone renders the URL directly on each card (no cache today;
+      a fetch failure falls back to a monogram tile). Optional.
     - ``app_version``: currently-running version of the app, for
       audit / debugging. Surfaces in the operator UI but isn't used
       for authorization decisions. Optional.
@@ -415,6 +415,62 @@ class AppContext:
             raise ValueError("AppContext.app_id must be a non-empty string")
         if not self.app_name or not isinstance(self.app_name, str):
             raise ValueError("AppContext.app_name must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class ActorContext:
+    """Consumer-supplied display identity of the ACTOR a
+    ``capability_request`` was made for -- the agent or persona whose
+    face and name the operator recognises -- as distinct from the
+    consumer app (``AppContext``) that delivered it.
+
+    ``AppContext`` answers "which app is asking" and is registered
+    once per consumer. A platform that hosts many agents on one
+    consumer registration cannot say WHICH of its agents is acting
+    through that channel: the signed subject carries the agent's id
+    (``agent:<id>@user:<id>``), which the operator cannot recognise
+    at a glance. ``ActorContext`` rides per request, supplied by the
+    consumer in the request body, so the card can show the actor's
+    name and face beside the signed id.
+
+    THIS IS TRANSPORT, NOT A CLAIM. It is not part of the JWS the
+    phone signs, so the phone renders it as display context only,
+    and only after checking that ``actor_id`` equals the signed
+    subject's acting-agent half: a face may decorate the identity
+    the signature names, never stand in for it. A mismatch is
+    rendered as a warning, never silently reconciled.
+
+    Fields:
+
+    - ``actor_id``: the acting-agent half of the signed ``sub``
+      (``"agent:<id>"``), verbatim. Required; the phone's
+      cross-check keys on it.
+    - ``actor_name``: the display name the operator knows the actor
+      by. Required, non-empty.
+    - ``actor_icon_url``: image URL for the actor's face. Optional.
+      Same fallback rule as ``app_icon_url``: absent or failed, the
+      phone shows a monogram tile. Consumers follow the README's
+      icon guidance -- the actor's own mark, resolved by the
+      approval's audience; never another party's personal avatar.
+    """
+
+    actor_id: str
+    actor_name: str
+    actor_icon_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.actor_id or not isinstance(self.actor_id, str):
+            raise ValueError("ActorContext.actor_id must be a non-empty string")
+        if not self.actor_name or not isinstance(self.actor_name, str):
+            raise ValueError("ActorContext.actor_name must be a non-empty string")
+        if self.actor_icon_url is not None:
+            if not isinstance(self.actor_icon_url, str) or not (
+                self.actor_icon_url.startswith("https://")
+                or self.actor_icon_url.startswith("http://")
+            ):
+                raise ValueError(
+                    "ActorContext.actor_icon_url must be an http(s) URL when set"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +653,14 @@ class PendingRequest:
     # "Unknown app" warning banner in that case so unregistered agents
     # are visible rather than silently approved.
     app_context: AppContext | None = None
+
+    # Actor context (capability_request only): the consumer-supplied
+    # display identity of the agent the request was made FOR, as
+    # distinct from the app that delivered it. Transport, never a
+    # claim; the phone renders it beside the signed subject only when
+    # ``actor_id`` equals the subject's acting-agent half. None when
+    # the consumer sent no ``actor`` object.
+    actor_context: ActorContext | None = None
 
     # Profile-create context (kind == "profile_create", Phase 2.0.B
     # integration). All optional with default None. The candidate
@@ -1103,9 +1167,14 @@ class PendingRequest:
         cap_agent_id: str | None = None,
         ttl_seconds: int = 3600,
         grant_ttl_seconds: int | None = None,
+        actor_context: ActorContext | None = None,
     ) -> PendingRequest:
         """Construct a ``capability_request`` PendingRequest for Phase 5
         Wave B routing.
+
+        ``actor_context`` (optional) is the consumer-supplied display
+        identity of the acting agent -- transport, never a claim; see
+        ``ActorContext``.
 
         ``cap_header_b64`` and ``cap_payload_b64`` are the canonical-
         JSON-encoded base64url JWS segments — typically produced via
@@ -1231,6 +1300,7 @@ class PendingRequest:
             cap_payload_b64=cap_payload_b64,
             cap_agent_id=cap_agent_id,
             cap_grant_ttl_seconds=grant_ttl_seconds,
+            actor_context=actor_context,
         )
 
     @classmethod

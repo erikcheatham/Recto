@@ -256,6 +256,25 @@ needs the business mark. The absent-mark fallback must be your platform's
 neutral mark, never a user's personal avatar, which would leak one party's
 identity into another's approval prompt.
 
+**The actor on the card.** `principal_apps` names the APP that delivers a
+card. If your platform hosts many agents behind one registration, send the
+agent the request is *for* with each request — an optional `actor` object
+in the `capability_request` body:
+
+```json
+{ "actor": { "actor_id": "agent:<id>", "actor_name": "Fenwick",
+             "actor_icon_url": "https://your-origin/agents/<id>/face.png" } }
+```
+
+`actor_id` must equal the acting-agent half of the signed `sub`
+(`agent:<id>@user:<id>` → `agent:<id>`), verbatim. The phone shows the name
+and the face beside the signed id only when they match; a mismatch renders
+as a warning and the signed id stands alone. The actor is transport — not
+part of the JWS — so it can never widen what the signature says; it only
+makes the signed identity recognisable. The icon follows the same rules as
+the app icon above (your origin, resolved by audience, a neutral fallback);
+a non-`http(s)` URL is refused at the bootloader.
+
 ### 3. Configure your app
 
 Point it at the bootloader base URL and supply the agent id and token as the

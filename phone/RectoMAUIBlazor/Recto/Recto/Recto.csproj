@@ -42,6 +42,13 @@
 		<!-- App Identifier -->
 		<ApplicationId>app.recto.phone</ApplicationId>
 		<!-- Versions -->
+		<!-- 1.1.0 -> 1.1.1 (2026-09-22): Build 16 — the actor on the card. A
+		     consumer may name the agent a capability request is FOR (name +
+		     face) beside the app that delivered it; transport, never a claim,
+		     shown only when its id equals the signed subject's acting-agent
+		     half, a warning otherwise (ActorContextCheck). Additive wire field
+		     (context.actor_context); older builds ignore it. PATCH: no
+		     protocol change, no re-pair. -->
 		<!-- 1.0.8 -> 1.1.0 (2026-09-16): Build 15 — the pairing protocol
 		     changed, hence MINOR not patch. The TLS leaf pin is retired for the
 		     bootloader's own key (attest on drift, re-pin, never brick — the
@@ -56,7 +63,7 @@
 		     (keep vault) in Settings, born from the CF cert-rotation-vs-
 		     TOFU-pin outage. New store version string required (1.0.7
 		     shipped as Build 12); Version + FileVersion derive. -->
-		<ApplicationDisplayVersion>1.1.0</ApplicationDisplayVersion>
+		<ApplicationDisplayVersion>1.1.1</ApplicationDisplayVersion>
 		<!-- Build 5 (2026-06-02): explicit Version pin to fix NU1105.
 		     MAUI auto-derives PackageVersion from ApplicationDisplayVersion
 		     on some TFMs but leaves the default 1.0.0 on others, producing:
@@ -340,7 +347,7 @@
 		     sideload-only (never uploaded), so 14 stays monotonic for
 		     both store lanes AND invalidates the WebView cache over the
 		     operator's sideloaded 13. -->
-		<ApplicationVersion>15</ApplicationVersion>
+		<ApplicationVersion>16</ApplicationVersion>
 		<!-- Mirror ApplicationDisplayVersion + ApplicationVersion into the
 		     .NET assembly metadata so System.Reflection at runtime can
 		     read the build number. MAUI's <ApplicationVersion> ONLY

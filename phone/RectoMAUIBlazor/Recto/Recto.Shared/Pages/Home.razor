@@ -1136,6 +1136,46 @@
                                                         &#9888; @warning
                                                     </p>
                                                 }
+                                                @{
+                                                    // THE ACTOR (2026-09-22): the delivering app may name the agent the
+                                                    // request is FOR (name + face) — transport, never a claim. It renders
+                                                    // beside the signed id only when ActorContextCheck finds its actor_id
+                                                    // equal to the signed subject's acting-agent half; a mismatch is a
+                                                    // warning with inline styling, and the signed id stands alone.
+                                                    var actorVerdict = Recto.Shared.Capability.ActorContextCheck.Of(capDecoded.ActingAgent, req.Context.ActorContext);
+                                                }
+                                                @if (actorVerdict.Warning is not null)
+                                                {
+                                                    <p role="alert"
+                                                       style="color:#ffffff;background:#b00020;border:2px solid #7f0016;border-radius:6px;padding:6px 10px;font-weight:600;margin:0 0 8px 0;word-break:break-word;">
+                                                        &#9888; @actorVerdict.Warning
+                                                    </p>
+                                                }
+                                                @if (actorVerdict.Show)
+                                                {
+                                                    var actorMonogram = char.ToUpperInvariant(actorVerdict.Name!.TrimStart()[0]).ToString();
+                                                    <div class="mb-1" style="display:flex;align-items:center;gap:8px;">
+                                                        @if (!string.IsNullOrEmpty(actorVerdict.IconUrl))
+                                                        {
+                                                            <img src="@actorVerdict.IconUrl"
+                                                                 alt="@actorVerdict.Name"
+                                                                 loading="lazy"
+                                                                 style="width:32px;height:32px;border-radius:50%;object-fit:cover;flex:none;"
+                                                                 onerror="this.style.display='none'; var m=this.nextElementSibling; if (m) m.style.display='flex';" />
+                                                            <div style="display:none;width:32px;height:32px;border-radius:50%;align-items:center;justify-content:center;background:#4a5568;color:#fff;font-weight:700;flex:none;"
+                                                                 aria-hidden="true">@actorMonogram</div>
+                                                        }
+                                                        else
+                                                        {
+                                                            <div style="display:flex;width:32px;height:32px;border-radius:50%;align-items:center;justify-content:center;background:#4a5568;color:#fff;font-weight:700;flex:none;"
+                                                                 aria-hidden="true">@actorMonogram</div>
+                                                        }
+                                                        <div style="min-width:0;">
+                                                            <div class="fw-semibold" style="line-height:1.2;">@actorVerdict.Name</div>
+                                                            <div class="text-muted small" style="letter-spacing:0.04em;">named by the delivering app &mdash; not covered by the signature</div>
+                                                        </div>
+                                                    </div>
+                                                }
                                                 <p class="mb-1 text-muted small" style="word-break: break-all;">
                                                     Acting agent: <code>@capDecoded.ActingAgent</code>
                                                 </p>

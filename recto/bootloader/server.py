@@ -60,6 +60,7 @@ from recto.bootloader.sessions import (
 )
 from recto.bootloader.state import (
     SLOTS,
+    ActorContext,
     AppContext,
     phone_ref_of,
     CapabilityResult,
@@ -1918,6 +1919,20 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             if ac.app_version is not None:
                 ac_obj["app_version"] = ac.app_version
             context["app_context"] = ac_obj
+        # Actor context (capability_request only): the consumer-supplied
+        # display identity of the acting agent. Emit-only-when-set;
+        # icon omitted when null. Transport, never a claim -- the phone
+        # cross-checks actor_id against the signed subject before it
+        # shows the name or the face.
+        if p.actor_context is not None:
+            actr = p.actor_context
+            actor_obj: dict[str, Any] = {
+                "actor_id": actr.actor_id,
+                "actor_name": actr.actor_name,
+            }
+            if actr.actor_icon_url is not None:
+                actor_obj["actor_icon_url"] = actr.actor_icon_url
+            context["actor_context"] = actor_obj
         return {
             "request_id": p.request_id,
             "kind": p.kind,
@@ -3349,6 +3364,26 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             raise BootloaderError(
                 "grant_ttl_seconds must be an integer in [30, 900] when provided"
             )
+        # Optional ``actor``: the consumer-supplied display identity of
+        # the agent the request is FOR (name + face), as distinct from
+        # the app delivering it. Transport, never a claim -- it is not
+        # in the signed bytes, and the phone shows it only beside a
+        # signed subject whose acting-agent half equals ``actor_id``.
+        # Malformed = refused here, so a card never carries a half-
+        # built actor; absent = the card renders as before.
+        actor_raw = body.get("actor")
+        actor_context: ActorContext | None = None
+        if actor_raw is not None:
+            if not isinstance(actor_raw, dict):
+                raise BootloaderError("actor must be a JSON object when provided")
+            try:
+                actor_context = ActorContext(
+                    actor_id=actor_raw.get("actor_id", ""),
+                    actor_name=actor_raw.get("actor_name", ""),
+                    actor_icon_url=actor_raw.get("actor_icon_url"),
+                )
+            except ValueError as exc:
+                raise BootloaderError(f"actor is malformed: {exc}") from exc
         # Convert dict -> typed CapabilityClaims to drive validation
         # through the same code path verifiers use. Lazy-imported to
         # keep the bootloader package free of recto.capability when
@@ -3434,6 +3469,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 cap_agent_id=agent_id,
                 ttl_seconds=ttl_seconds,
                 grant_ttl_seconds=grant_ttl_seconds,
+                actor_context=actor_context,
             )
         except ValueError as exc:
             raise BootloaderError(

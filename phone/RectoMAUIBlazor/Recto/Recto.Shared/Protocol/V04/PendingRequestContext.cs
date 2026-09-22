@@ -263,7 +263,14 @@ public sealed record PendingRequestContext(
     // PendingRequest from that consumer. See
     // <see cref="Recto.Shared.Protocol.V04.AppContext"/> for the
     // canonical wire shape.
-    [property: JsonPropertyName("app_context")] AppContext? AppContext = null);
+    [property: JsonPropertyName("app_context")] AppContext? AppContext = null,
+    // Actor context (capability_request only, 2026-09-22): the
+    // consumer-supplied display identity of the agent the request was
+    // made FOR, as distinct from the app that delivered it. Transport,
+    // never a claim — shown beside the signed subject only when its
+    // actor_id equals the subject's acting-agent half (ActorContextCheck).
+    // Null when the consumer sent no `actor`; the card renders as before.
+    [property: JsonPropertyName("actor_context")] ActorContext? ActorContext = null);
 
 public static class PgpOperation
 {
