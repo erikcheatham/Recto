@@ -77,10 +77,11 @@ def store(request, tmp_path):
 # Helpers
 # ----------------------------------------------------------------------
 
-def _phone(label: str = "test-phone") -> PhoneRegistration:
+def _phone(label: str = "test-phone", pubkey: str = "AAAA_test_pubkey_b64u") -> PhoneRegistration:
+    # The key IS the identity (hard rule 14.1): two phones need two keys.
     return PhoneRegistration.new(
         device_label=label,
-        public_key_b64u="AAAA_test_pubkey_b64u",
+        public_key_b64u=pubkey,
         supported_algorithms=("ed25519", "ecdsa-p256"),
     )
 
@@ -149,7 +150,7 @@ def _cap_result(request_id: str, *, ttl: int = 600) -> CapabilityResult:
 # ----------------------------------------------------------------------
 
 def test_phone_register_get_list(store):
-    p1, p2 = _phone("one"), _phone("two")
+    p1, p2 = _phone("one", "AAAA_test_pubkey_one"), _phone("two", "AAAA_test_pubkey_two")
     store.register_phone(p1)
     store.register_phone(p2)
 
