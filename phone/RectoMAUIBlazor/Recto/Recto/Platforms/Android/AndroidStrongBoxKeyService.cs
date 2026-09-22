@@ -49,7 +49,7 @@ public sealed class AndroidStrongBoxKeyService : IEnclaveKeyService
         => Generate(keyAlias, requireUserAuth: true);
 
     /// <summary>
-    /// The poll key (hard rule 14.2, ruling A): StrongBox/TEE-resident like the
+    /// The poll key (hard rule 14.2): StrongBox/TEE-resident like the
     /// identity key, but with NO user-authentication requirement, so signing a
     /// read never raises a BiometricPrompt. Delegated once by the identity key
     /// at pairing; never signs an approval.

@@ -1,4 +1,4 @@
-"""THE CONFIG SEAM for the signed-poll ceremony (hard rule 14.2; P2a, 2026-09-21).
+"""THE CONFIG SEAM for the signed-poll ceremony (hard rule 14.2; 2026-09-21).
 
 THE DEFECT. ``signed_poll_mode`` was a ``create_server()`` kwarg with no env var, no CLI
 flag and no YAML; the container's launcher never passed it. The ceremony the substrate

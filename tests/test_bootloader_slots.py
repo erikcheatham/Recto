@@ -6,10 +6,10 @@ last-seen so the phone can ask the operator; the answer is the incoming IDENTITY
 signature over `recto-slot-replace-v1|{slot}|{occupant ref}|{incoming pubkey}`; the occupant
 is revoked in the same act the incoming key is recorded.
 
-RED-BUILDS (the brief's): a third key cannot pair without displacing one; a displaced key's
+RED-BUILDS: a third key cannot pair without displacing one; a displaced key's
 queue reads empty (here: the displaced key is unknown to the registry at all -- stronger).
 POSITIVE CONTROLS: two keys fill two slots; the same key re-pairing into its own slot is not
-a replacement (P1's merge, unchanged); a claim by the wrong key, or over the wrong occupant,
+a replacement (the same-key merge, unchanged); a claim by the wrong key, or over the wrong occupant,
 is refused and displaces nobody.
 """
 

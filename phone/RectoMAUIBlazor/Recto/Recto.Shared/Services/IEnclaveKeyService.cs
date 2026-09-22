@@ -37,7 +37,7 @@ public interface IEnclaveKeyService
     /// Generates a DEVICE key under <paramref name="keyAlias"/>: enclave-resident
     /// where the platform has one, but with NO user-authentication ACL, so
     /// <see cref="SignAsync"/> on it never prompts. This is the poll key of hard
-    /// rule 14.2 (ruling A, 2026-09-21): it authenticates the device on the
+    /// rule 14.2 (2026-09-21): it authenticates the device on the
     /// phone's reads (poll, pending, manage) and is delegated once, at pairing,
     /// by an identity-key signature. It must never sign an approval. The
     /// default falls back to <see cref="GenerateAsync"/> for implementations

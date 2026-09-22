@@ -44,7 +44,7 @@ public sealed record PairingState(
     // pairings made before this build and on unsigned bootloaders -- those
     // cannot be re-verified after a certificate change and must re-pair once.
     string? BootloaderPairPubkeyHex = null,
-    // 2026-09-21 (hard rule 14.2, ruling A): the poll key this bootloader
+    // 2026-09-21 (hard rule 14.2): the poll key this bootloader
     // recorded at registration (RegistrationResponse.PollPublicKeyB64u); the
     // phone's reads are signed by the key under PollSigning.PollKeyAlias.
     // Nullable only so a demo-mode pairing (no bootloader) constructs; a real

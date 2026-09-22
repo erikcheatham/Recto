@@ -93,7 +93,7 @@ POLL_SIG_HEADER = "X-Recto-Phone-Sig"
 POLL_SIG_TS_HEADER = "X-Recto-Phone-Ts"
 POLL_SIG_FRESHNESS_SECONDS = 120
 
-# The poll-key delegation (2026-09-21, hard rule 14.2 / ruling A). The
+# The poll-key delegation (2026-09-21, hard rule 14.2). The
 # identity key is per-use biometric-gated on both shipped platforms, so
 # it cannot sign a poll tick. At registration the phone MAY carry a
 # second, non-gated enclave key (`poll_public_key_b64u`) and the identity
@@ -1218,8 +1218,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 f"unknown push_platform {push_platform!r}; "
                 "expected 'apns' or 'fcm'"
             )
-        # THE POLL KEY (2026-09-21, ruling A; REQUIRED per the no-back-compat
-        # ruling the same night). A phone enrolls with a second, non-gated
+        # THE POLL KEY (2026-09-21, rule 14.2; REQUIRED -
+        # pre-launch, no compatibility window). A phone enrolls with a second, non-gated
         # enclave key and the identity key's delegation over it, or it does
         # not enroll: there is one way to read from this registry, and it is
         # a signature by the delegated poll key. A poll key nobody delegated
@@ -1289,7 +1289,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # also the id half for every new registration. Equal to
             # phone_id unless the record predates the split.
             "phone_ref": _phone_ref(reg.public_key_b64u),
-            # Ruling A: the key this registry verifies the phone's READS
+            # Rule 14.2: the key this registry verifies the phone's READS
             # against. The phone signs reads only with the key echoed here.
             "poll_public_key_b64u": reg.poll_public_key_b64u,
             "slot": reg.slot,
@@ -1405,7 +1405,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             if ts is not None and abs(int(time.time()) - ts) <= POLL_SIG_FRESHNESS_SECONDS:
                 payload = f"{POLL_SIG_PREFIX}|{phone.phone_id}|{ts}|{path}"
                 phone_algo = _registered_algorithm(phone, phone.phone_id)
-                # Ruling A: reads are signed by the delegated POLL key and
+                # Rule 14.2: reads are signed by the delegated POLL key and
                 # only that key. The identity key is never accepted here, so a
                 # leaked identity signature over a poll is not replayable. A
                 # record with no poll key (only reachable by seeding the store

@@ -27,7 +27,7 @@ namespace Recto.Shared.Services;
 /// call sites is the Build 13 increment that makes the flip safe.
 /// </para>
 /// <para>
-/// THE POLL KEY (hard rule 14.2, ruling A, 2026-09-21). The identity key
+/// THE POLL KEY (hard rule 14.2, 2026-09-21). The identity key
 /// is per-use biometric-gated on both shipped platforms, so it cannot
 /// sign a poll tick; that is why this helper shipped in 1.1.0 with no
 /// caller. Reads are signed instead by a second, enclave-resident,

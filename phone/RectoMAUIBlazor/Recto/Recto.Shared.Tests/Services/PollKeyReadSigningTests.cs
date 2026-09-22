@@ -15,7 +15,7 @@ using Xunit;
 namespace Recto.Shared.Tests.Services;
 
 /// <summary>
-/// THE POLL KEY (hard rule 14.2, ruling A, 2026-09-21) -- the phone half.
+/// THE POLL KEY (hard rule 14.2, 2026-09-21) -- the phone half.
 /// <para>
 /// THE DEFECT this closes: <see cref="PollSigning"/> shipped in 1.1.0 with a
 /// payload test and NO caller, so every read the phone made was bare and the

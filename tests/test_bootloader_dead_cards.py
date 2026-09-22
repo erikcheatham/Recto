@@ -4,7 +4,7 @@ A capability card has two clocks: `ttl_seconds` bounds how long it may WAIT on t
 (default 3600) and the signed claims' `exp` bounds how long its AUTHORITY lives (ten minutes
 from the bridge). When `exp` has passed the card can be neither approved nor denied, yet
 the queue kept serving it for the rest of its ttl and the phone showed "window closed,
-nothing to tap here" for up to fifty minutes -- measured on 51cb and 55c7, 17:08 local.
+nothing to tap here" for up to fifty minutes -- measured in staging, 2026-09-21.
 
 RED-BUILD: drop the withdrawal from _handle_pending and `test_an_expired_card_is_withdrawn`
 serves the corpse. POSITIVE CONTROL: a live card is still served, and a non-capability kind

@@ -99,7 +99,7 @@ def _spawn(tmp_path: Path, mode: str):
     """
     state = StateStore(state_dir=tmp_path)
     identity_priv, pub_b64u = _make_keypair()
-    # Ruling A (2026-09-21): reads are signed by the delegated POLL key, never
+    # Rule 14.2 (2026-09-21): reads are signed by the delegated POLL key, never
     # the identity key. `priv` below is the poll key -- the one every signed
     # read in this suite must use.
     priv, poll_pub_b64u = _make_keypair()

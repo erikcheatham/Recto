@@ -50,8 +50,8 @@ public sealed class BootloaderClient : IBootloaderClient
     /// this with <c>ActivatorUtilities.CreateInstance(provider, httpClient)</c>,
     /// and two constructors that both accept the given <c>HttpClient</c> are an
     /// ambiguity it may refuse at startup -- which surfaces as the WebView
-    /// stuck on "Loading..." with no error on screen (2026-09-21, Pixel sideload).
-    /// <paramref name="readSigner"/> (hard rule 14.2, ruling A) signs the
+    /// stuck on "Loading..." with no error on screen (2026-09-21, a sideloaded Android build).
+    /// <paramref name="readSigner"/> (hard rule 14.2) signs the
     /// phone's READS -- pending, manage/phones, manage/push_token -- with the
     /// delegated poll key; the optional default lets tests construct without DI.
     /// </summary>
@@ -359,7 +359,7 @@ public sealed class BootloaderClient : IBootloaderClient
         WriteIndented = false,
     };
 
-    /// <summary>A read surface (ruling A): signed by the poll key when the pairing has one.</summary>
+    /// <summary>A read surface (rule 14.2): signed by the poll key when the pairing has one.</summary>
     private async Task<Result<T>> SendSignedReadAsync<T>(
         HttpMethod method, string url, object? body, string phoneId, string path, CancellationToken ct) where T : class
     {

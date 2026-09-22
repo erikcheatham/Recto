@@ -237,14 +237,14 @@ class PhoneRegistration:
     # metadata, not key material -- but keep it out of logs anyway.
     push_token: str | None = None
     push_platform: str | None = None
-    # THE POLL KEY (2026-09-21, hard rule 14.2 / ruling A). A second,
+    # THE POLL KEY (2026-09-21, hard rule 14.2). A second,
     # enclave-resident key with NO user-authentication ACL, delegated ONCE
     # at registration by an identity-key signature over
     # ``recto-poll-key-v1|{identity pubkey}|{poll pubkey}``. It signs the
     # phone's READS (poll, pending, manage) so the identity key -- per-use
     # biometric-gated on both shipped platforms -- is never asked to sign a
     # poll tick. Same algorithm as the registration. Optional + additive:
-    # REQUIRED at registration (no-back-compat ruling, same night): the
+    # REQUIRED at registration (pre-launch: no compatibility window): the
     # server refuses an enrollment without one, and a record without one
     # can verify no read. Typed optional only so the dataclass keeps its
     # field order and directly-seeded fixtures construct.

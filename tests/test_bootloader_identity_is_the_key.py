@@ -12,7 +12,7 @@ THE FIX, in two parts, each with a test below:
   2. registering a key the registry already holds is the SAME record -- one phone, the id it already
      had, the metadata refreshed.
 
-No back-compat (operator ruling, same night, pre-launch): a Guid id is not resolved by its ref; a
+No compatibility window (pre-launch): a Guid id is not resolved by its ref; a
 pre-split phones.json is wiped at the deploy and the phones re-pair on the store build that signs.
 """
 

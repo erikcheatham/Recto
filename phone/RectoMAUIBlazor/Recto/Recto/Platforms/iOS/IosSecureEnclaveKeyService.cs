@@ -47,7 +47,7 @@ public sealed class IosSecureEnclaveKeyService : IEnclaveKeyService
         => Generate(keyAlias, biometricGated: true);
 
     /// <summary>
-    /// The poll key (hard rule 14.2, ruling A): Secure Enclave-resident like the
+    /// The poll key (hard rule 14.2): Secure Enclave-resident like the
     /// identity key, but its ACL is <c>PrivateKeyUsage</c> alone -- no biometry
     /// -- so signing a read never raises Face ID / Touch ID. On iOS the prompt
     /// IS the ACL, so <see cref="SignAsync"/> needs no branch: the enclave

@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 namespace Recto.Shared.Services;
 
 /// <summary>
-/// Signs the phone's READS to a bootloader (hard rule 14.2, ruling A):
+/// Signs the phone's READS to a bootloader (hard rule 14.2):
 /// <c>GET /v0.4/pending</c>, <c>GET /v0.4/manage/phones</c>,
 /// <c>POST /v0.4/manage/push_token</c>. Returns the header pair to attach,
 /// or null when this pairing carries no poll key (demo mode only) -- the

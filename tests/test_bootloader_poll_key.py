@@ -1,15 +1,15 @@
-"""THE POLL KEY (2026-09-21, hard rule 14.2 / ruling A) -- the device signs its reads.
+"""THE POLL KEY (2026-09-21, hard rule 14.2) -- the device signs its reads.
 
 THE PROBLEM. The identity key is per-use biometric-gated on both shipped platforms, so it
 cannot sign a poll tick without a face prompt per tick; that is why the phone's PollSigning
 helper shipped in 1.1.0 with no caller, and why the evidence window would read `unsigned` on
-every poll. THE RULING (A): a second, enclave-resident, NON-gated key, delegated once at
+every poll. THE DESIGN: a second, enclave-resident, NON-gated key, delegated once at
 registration by an identity-key signature over
 
     recto-poll-key-v1|{identity pubkey}|{poll pubkey}
 
 so that "every crossing is a signature by THAT key" holds by a signed claim: the identity
-key named the poll key, once, under biometrics. REQUIRED (no-back-compat ruling, same night):
+key named the poll key, once, under biometrics. REQUIRED (pre-launch: no compatibility window):
 a registration without a delegated poll key does not enroll, and there is exactly one key a
 read verifies against.
 

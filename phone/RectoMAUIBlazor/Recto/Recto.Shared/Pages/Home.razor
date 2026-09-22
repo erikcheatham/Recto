@@ -2785,7 +2785,7 @@
                 return;
             }
 
-            // THE POLL KEY (hard rule 14.2, ruling A, 2026-09-21). A second,
+            // THE POLL KEY (hard rule 14.2, 2026-09-21). A second,
             // enclave-resident, NON-gated key signs this phone's reads so the
             // identity key -- per-use biometric-gated -- never signs a poll
             // tick. Regenerated at every pairing (a pairing is the one moment
@@ -2960,7 +2960,7 @@
                 // 2026-09-16: the server identity above TLS -- the key that
                 // answers /v0.4/attest when the certificate chain drifts.
                 BootloaderPairPubkeyHex: registration.DevicesPairPubkeyHex,
-                // Ruling A: the poll key the registry echoed (checked above).
+                // Rule 14.2: the poll key the registry echoed (checked above).
                 PollPublicKeyB64u: pollPubB64u);
 
             var saveResult = await Pairing.SaveAsync(pairedState, CancellationToken.None);
