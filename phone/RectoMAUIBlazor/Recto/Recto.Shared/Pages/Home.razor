@@ -2710,6 +2710,12 @@
     {
         _errorMessage = null;
         _busy = true;
+        // The slot is DECIDED AT THE TAP. Two biometric prompts sit between
+        // here and the register call, and on iOS each one takes the app
+        // through a scene transition that can re-render this page and drop
+        // the checkbox; reading the bound field afterwards made the operator
+        // re-tick it between prompts (measured 2026-09-21, iOS 17.1.1).
+        var slot = _pairAsRecovery ? "recovery" : "primary";
         try
         {
             // App Review demo-mode branch (banked 2026-05-22). When the
@@ -2848,7 +2854,7 @@
                 PushPlatform: pushPlatform,
                 PollPublicKeyB64u: pollPubB64u,
                 PollKeyDelegationB64u: pollDelegationB64u,
-                Slot: _pairAsRecovery ? "recovery" : "primary");
+                Slot: slot);
 
             var registerResult = await BootloaderClient.RegisterAsync(
                 _bootloaderUrl, request, CancellationToken.None);
