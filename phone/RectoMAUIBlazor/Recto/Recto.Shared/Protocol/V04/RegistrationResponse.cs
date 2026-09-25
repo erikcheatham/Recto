@@ -60,7 +60,13 @@ public sealed record BootloaderIdentityInfo(
     [property: JsonPropertyName("operator_pubkey_b64u")] string OperatorPubkeyB64u,
     [property: JsonPropertyName("member_pubkeys_b64u")] IReadOnlyList<string> MemberPubkeysB64u);
 
+/// <summary>
+/// A secret this phone GATES, by name: which service, which secret name, which
+/// algorithm. The value never crosses this wire (recurve 2026-09-25 renamed the
+/// field from <c>secret</c> so the shape says so; the bootloader emits an empty
+/// list until the launcher side wires services to phones).
+/// </summary>
 public sealed record ManagedSecretInfo(
     [property: JsonPropertyName("service")] string Service,
-    [property: JsonPropertyName("secret")] string Secret,
+    [property: JsonPropertyName("secret_name")] string SecretName,
     [property: JsonPropertyName("algorithm")] string Algorithm);

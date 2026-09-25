@@ -108,11 +108,19 @@ class TestDisabledIsNoop:
 
 class TestEnabledWithoutDepsFallsBack:
     def test_enabled_without_deps_is_inactive(
-        self, capsys: pytest.CaptureFixture[str]
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The Linux test env doesn't have opentelemetry installed (we
-        # don't add it as a hard dep). Constructing an enabled client
-        # should fall back to no-op rather than raising.
+        # Constructing an enabled client with no OTel deps must fall back to
+        # no-op rather than raise. The absence is MADE here, not assumed of
+        # the environment: a None entry in sys.modules makes the import
+        # raise ImportError whatever the interpreter has installed (the
+        # console has the otel extra since the observer stacks, 2026-09-05,
+        # and this test read green-on-Linux, red-on-the-console until then).
+        import sys
+        for mod in list(sys.modules):
+            if mod == "opentelemetry" or mod.startswith("opentelemetry."):
+                monkeypatch.delitem(sys.modules, mod)
+        monkeypatch.setitem(sys.modules, "opentelemetry", None)
         client = TelemetryClient(
             TelemetrySpec(enabled=True, otlp_endpoint="http://localhost:4318")
         )

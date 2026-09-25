@@ -10,31 +10,61 @@ public class PinningServiceTests
     private const string PinB = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
     [Fact]
-    public void Validate_NoPinNoObservation_AcceptsAnyCert()
+    public void Validate_NoPinNoObservation_OutsidePairing_Refuses()
     {
-        // The pre-pairing TOFU window: nothing has been seen yet, no pin
-        // is set. Accept whatever the bootloader presents -- the observed
-        // SPKI is recorded so the pairing flow can promote it later.
+        // Recurve 2026-09-25 (fail-open-pinning): with no pin and no system
+        // trust, and NO pairing in flight, an unknown certificate is refused.
+        // The observed SPKI is still recorded (HasDrifted needs it).
         var sut = new PinningService();
 
         var ok = sut.Validate(Host, PinA, systemTrustOk: false);
 
-        Assert.True(ok);
+        Assert.False(ok);
         Assert.Equal(PinA, sut.GetObservedPin(Host));
         Assert.Null(sut.GetPin(Host));
     }
 
     [Fact]
-    public void Validate_NoPinSelfSignedCert_StillAcceptsForTofu()
+    public void Validate_DuringPairing_SelfSignedCert_AcceptsForTofu()
     {
-        // Even when system trust says NO (typical for self-signed dev/LAN
-        // bootloaders), the TOFU window must accept the connection so the
-        // pairing handshake can complete.
+        // The pre-pairing TOFU window: between BeginPairing(host) and
+        // EndPairing(), a self-signed dev/LAN bootloader is accepted so the
+        // pairing handshake can complete, and the observed SPKI is recorded
+        // for the pairing flow to promote.
         var sut = new PinningService();
+        sut.BeginPairing(Host);
 
         var ok = sut.Validate(Host, PinA, systemTrustOk: false);
 
         Assert.True(ok);
+        Assert.Equal(PinA, sut.GetObservedPin(Host));
+    }
+
+    [Fact]
+    public void Validate_DuringPairing_OtherHost_Refuses()
+    {
+        // The window is for ONE host. A different host presenting an
+        // untrusted certificate while a pairing is in flight is refused.
+        var sut = new PinningService();
+        sut.BeginPairing(Host);
+
+        var ok = sut.Validate("other.example", PinA, systemTrustOk: false);
+
+        Assert.False(ok);
+    }
+
+    [Fact]
+    public void Validate_AfterEndPairing_Refuses()
+    {
+        // The window closes with the pairing operation, whether or not a pin
+        // was set; nothing about "no pin yet" reopens it.
+        var sut = new PinningService();
+        sut.BeginPairing(Host);
+        sut.EndPairing();
+
+        var ok = sut.Validate(Host, PinA, systemTrustOk: false);
+
+        Assert.False(ok);
     }
 
     [Fact]
@@ -130,7 +160,7 @@ public class PinningServiceTests
     }
 
     [Fact]
-    public void ClearPin_RemovesPinAndReturnsToTofuMode()
+    public void ClearPin_RemovesPin_ButDoesNotReopenTofu()
     {
         var sut = new PinningService();
         sut.SetPin(Host, PinA);
@@ -138,7 +168,10 @@ public class PinningServiceTests
         sut.ClearPin(Host);
 
         Assert.Null(sut.GetPin(Host));
-        // Back in TOFU window -- new connection accepts whatever cert.
+        // No pin is not a window: an untrusted cert is refused until a
+        // pairing opens the window for this host (recurve 2026-09-25).
+        Assert.False(sut.Validate(Host, PinB, systemTrustOk: false));
+        sut.BeginPairing(Host);
         Assert.True(sut.Validate(Host, PinB, systemTrustOk: false));
     }
 

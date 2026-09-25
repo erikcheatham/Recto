@@ -559,7 +559,7 @@
                                 <ul class="list-unstyled mb-0">
                                     @foreach (var secret in _paired.ManagedSecrets)
                                     {
-                                        <li class="text-muted"><code>@secret.Service</code>/<code>@secret.Secret</code> &mdash; @secret.Algorithm</li>
+                                        <li class="text-muted"><code>@secret.Service</code>/<code>@secret.SecretName</code> &mdash; @secret.Algorithm</li>
                                     }
                                 </ul>
                             </div>
@@ -1136,14 +1136,12 @@
                                                         &#9888; @warning
                                                     </p>
                                                 }
-                                                @{
-                                                    // THE ACTOR (2026-09-22): the delivering app may name the agent the
-                                                    // request is FOR (name + face) — transport, never a claim. It renders
-                                                    // beside the signed id only when ActorContextCheck finds its actor_id
-                                                    // equal to the signed subject's acting-agent half; a mismatch is a
-                                                    // warning with inline styling, and the signed id stands alone.
-                                                    var actorVerdict = Recto.Shared.Capability.ActorContextCheck.Of(capDecoded.ActingAgent, req.Context.ActorContext);
-                                                }
+                                                // THE ACTOR (2026-09-22): the delivering app may name the agent the
+                                                // request is FOR (name + face) — transport, never a claim. It renders
+                                                // beside the signed id only when ActorContextCheck finds its actor_id
+                                                // equal to the signed subject's acting-agent half; a mismatch is a
+                                                // warning with inline styling, and the signed id stands alone.
+                                                var actorVerdict = Recto.Shared.Capability.ActorContextCheck.Of(capDecoded.ActingAgent, req.Context.ActorContext);
                                                 @if (actorVerdict.Warning is not null)
                                                 {
                                                     <p role="alert"
@@ -2756,6 +2754,9 @@
         // the checkbox; reading the bound field afterwards made the operator
         // re-tick it between prompts (measured 2026-09-21, iOS 17.1.1).
         var slot = _pairAsRecovery ? "recovery" : "primary";
+        // The TOFU window opens here, for this bootloader's host only, and
+        // closes in the finally below (recurve 2026-09-25, fail-open-pinning).
+        try { Pinning.BeginPairing(new Uri(_bootloaderUrl).Host); } catch { /* a bad URL fails at the first request */ }
         try
         {
             // App Review demo-mode branch (banked 2026-05-22). When the
@@ -2996,7 +2997,7 @@
                 BootloaderId: registration.BootloaderId,
                 BootloaderUrl: _bootloaderUrl,
                 ManagedSecrets: registration.ManagedSecrets
-                    .Select(s => new ManagedSecretRef(s.Service, s.Secret, s.Algorithm))
+                    .Select(s => new ManagedSecretRef(s.Service, s.SecretName, s.Algorithm))
                     .ToArray(),
                 PairedAt: DateTimeOffset.UtcNow,
                 BootloaderSpkiPin: capturedPin,
@@ -3062,6 +3063,7 @@
         }
         finally
         {
+            Pinning.EndPairing();
             _busy = false;
             _busyText = string.Empty;
             StateHasChanged();

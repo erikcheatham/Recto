@@ -104,3 +104,62 @@ six things:
 phone or registry to keep working. A registry created before it is wiped at
 the deploy that carries it, and its phones pair again on the build that signs.
 
+**15. Fail-closed has named shapes, and a reader that calls one a defect is
+read back.** On 2026-09-25 the first whole-tree defensive review of Recto (a
+36B reasoner over 140 modules, refuted independently by a second model) raised
+24 findings at or above high. Twenty-three were this tree's design, reported as
+a fault. Each is a decision Recto stands on, so they are written here, where the
+next reader — human or model — looks first, and each is pinned by a test that
+fails in the tree before a reader has to find it again
+(`tests/test_recurve_acceptances.py` is the map).
+
+- **a. No operator key, no authority.** `capability_operator_pubkey is None`
+  is a REFUSAL at every site that reads it — mint, profile create, add
+  device — never a skipped check. A defence that silently disables itself
+  is not one. Pinned: `test_mint_refuses_when_no_operator_pubkey_is_configured`.
+- **b. The pending envelope is a read, never an approval.** `GET /pending`
+  is signed as tier 0, one action (`bootloader:pending`), single use, pinned
+  to the exact `requests` bytes on the wire. It lets the phone RENDER cards
+  that came from the pinned key; each approval is minted separately against
+  that record's own fingerprint. Pinned: `test_bootloader_pending_signed.py`.
+- **c. Time bounds are upstream; the grant adds the ceiling.** `verify_jws`
+  refuses `now < nbf` and `now >= exp`; `verify_pair_grant` is called on
+  claims that already passed it and adds the window CEILING on top. Pinned:
+  `TestRule15cTimeBoundsAreUpstream`.
+- **d. "While children exist" means active children.** A master whose
+  children are all revoked has nothing left to orphan; revoking it then is
+  the intended end state (children first, then master). Pinned:
+  `TestRule15dMasterRevocation`.
+- **e. The mnemonic gate is the caller's, and there is one caller.**
+  `ExportMnemonicAsync` performs a bare keychain read by design; its ONLY
+  caller (Settings' backup ceremony) obtains a fresh biometric proof via
+  `IEnclaveKeyService.SignAsync` immediately before, and refuses on failure.
+  A second caller without the same gate is a rule violation, not a feature.
+- **f. The TOFU window is one host, one pairing operation.** With no pin
+  and no system trust, an unknown certificate is accepted only between
+  `BeginPairing(host)` and `EndPairing()`, and only for that host. "No pin
+  yet" is not a window. (The one finding of the 24 that was REAL: the
+  comment promised this scope and the code did not keep it. Fixed the same
+  day.) Pinned: `PinningServiceTests`.
+- **g. An in-memory challenge store is still a gate.** `ChallengeStore`
+  without a state store loses cross-replica persistence, never single-use
+  or the TTL. Pinned: `TestRule15gInMemoryChallengeStoreIsStillAGate`.
+- **h. The wire names what it carries.** `managed_secrets[].secret_name` is
+  a NAME the phone gates, never a value; the field was renamed from `secret`
+  the day a reader mistook it. A value-bearing field on this wire is a
+  design change, not a rename.
+- **i. Dev-host code is compiled out, not configured out.**
+  `SoftwareEnclaveKeyService` and its registration exist only under the
+  non-iOS/non-Android preprocessor branch; a storefront build cannot reach
+  them. Configuration is not the gate; the compiler is.
+- **j. Verification is staged, and each stage says what it defers.**
+  `verify_jws` documents that jti/replay is the StateStore tracker's;
+  `multi_witness` documents that signature verification is its consumer's;
+  `evaluate_scope` returning `False` on an unknown group or action is the
+  fail-CLOSED answer. A stage is read with its docstring or it is misread.
+
+**The reader's residue.** Findings that name a design here are not re-argued;
+they are answered by the rule's letter and the test's name. A finding this
+rule does not answer is a real finding until it is fixed or a letter is added
+— and adding a letter requires adding the test.
+

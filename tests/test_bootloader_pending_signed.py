@@ -33,6 +33,13 @@ from recto.capability.signing import public_key_hex
 _KEY = bytes.fromhex("7" * 64)
 
 
+def wire_requests_bytes(raw: str) -> bytes:
+    """The exact `requests` text as it sits on the wire (what the phone hashes)."""
+    m = re.search(r'"requests": (\[.*\])(?=, "pending_jws"|\})', raw, re.S)
+    assert m, raw[:200]
+    return m.group(1).encode("utf-8")
+
+
 def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -130,6 +137,13 @@ class TestSignedPendingEnvelope:
         assert claims.iss == "bootloader:pending-signed-test"
         assert claims.sub == f"phone:{phone_id}"
         assert claims.cap.allow_actions == [PENDING_ACTION]
+        # Hard rule 15.b (recurve 2026-09-25): the envelope is a READ of the
+        # list, never an approval - one action, tier 0, single use, pinned to
+        # the list bytes. Approvals mint per record, against that record's
+        # own fingerprint (pair_record.verify_pair_grant).
+        assert claims.cap.tier == 0
+        assert claims.max_uses == 1
+        assert claims.cap.scope.payload_sha256 == hashlib.sha256(wire_requests_bytes(raw)).hexdigest()
         assert claims.exp - claims.nbf == PENDING_WINDOW_SECONDS + CLOCK_SKEW_SECONDS
         assert claims.nbf == claims.iat - CLOCK_SKEW_SECONDS   # a phone a minute behind still verifies
         # The digest is over the exact `requests` text as it sits on the wire

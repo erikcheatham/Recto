@@ -12,6 +12,17 @@ public sealed class PinningService : IPinningService
 {
     private readonly ConcurrentDictionary<string, string> _pins = new();
     private readonly ConcurrentDictionary<string, string> _observed = new();
+    private volatile string? _pairingHost;
+
+    public void BeginPairing(string host)
+    {
+        _pairingHost = host;
+    }
+
+    public void EndPairing()
+    {
+        _pairingHost = null;
+    }
 
     public void RecordObserved(string host, string spkiPinB64u)
     {
@@ -72,8 +83,12 @@ public sealed class PinningService : IPinningService
         }
 
         // No pin and no system trust: the pre-pairing TOFU window for a
-        // self-signed dev/LAN bootloader. Spans only the user-initiated
-        // pairing operation; SetPin locks the anchor once pairing succeeds.
-        return true;
+        // self-signed dev/LAN bootloader. It is OPEN only between
+        // BeginPairing(host) and EndPairing() - the user-initiated pairing
+        // operation - and only for THAT host; SetPin locks the anchor once
+        // pairing succeeds. Any other host, or any time outside the window,
+        // is refused (recurve 2026-09-25: the comment promised this scope,
+        // the code did not keep it).
+        return string.Equals(_pairingHost, host, StringComparison.OrdinalIgnoreCase);
     }
 }

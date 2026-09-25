@@ -51,4 +51,5 @@ public sealed record PairingState(
     // pairing is refused without it.
     string? PollPublicKeyB64u = null);
 
-public sealed record ManagedSecretRef(string Service, string Secret, string Algorithm);
+/// <summary>A NAME the phone gates (service + secret name + algorithm) - never a value.</summary>
+public sealed record ManagedSecretRef(string Service, string SecretName, string Algorithm);

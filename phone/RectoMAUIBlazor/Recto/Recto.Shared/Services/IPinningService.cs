@@ -74,6 +74,17 @@ public interface IPinningService
     /// </para>
     /// </summary>
     bool Validate(string host, string actualSpki, bool systemTrustOk);
+
+    /// <summary>
+    /// Opens the pre-pairing TOFU window for ONE host: while open, a
+    /// certificate that is neither pinned nor system-trusted is accepted for
+    /// that host only. Recurve 2026-09-25 (fail-open-pinning): the window used
+    /// to be implied by "no pin yet" and so stood open for every host, forever.
+    /// </summary>
+    void BeginPairing(string host);
+
+    /// <summary>Closes the TOFU window. Called from the pairing flow's finally.</summary>
+    void EndPairing();
 }
 
 /// <summary>
