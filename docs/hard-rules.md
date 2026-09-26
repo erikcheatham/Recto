@@ -157,6 +157,19 @@ fails in the tree before a reader has to find it again
   `multi_witness` documents that signature verification is its consumer's;
   `evaluate_scope` returning `False` on an unknown group or action is the
   fail-CLOSED answer. A stage is read with its docstring or it is misread.
+- **k. A secret's config is the operator's definition, never a caller's
+  request.** `SecretSource.fetch(secret_name, config)` takes the registry
+  row the OPERATOR wrote; `EnvSource`'s `env_var` override reads the
+  operator's own process environment under a name the operator chose. No
+  request, header or payload ever reaches `config`; a path that builds one
+  from a request is a rule violation. (Second whole-tree review, 09-26:
+  the one finding not already named above.) Pinned:
+  `TestRule15kSecretConfigIsTheOperators`.
+- **l. A heartbeat token is a credential, not a capability.** The cluster
+  registry's token is a long-lived per-cluster bearer secret compared in
+  constant time over its sha256; its threat is theft, answered by TLS and
+  rotation, not by a jti. A reader asking it for a replay guard is asking a
+  password for a nonce.
 
 **The reader's residue.** Findings that name a design here are not re-argued;
 they are answered by the rule's letter and the test's name. A finding this

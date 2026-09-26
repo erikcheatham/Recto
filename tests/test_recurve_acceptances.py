@@ -119,3 +119,32 @@ class TestRule15gInMemoryChallengeStoreIsStillAGate:
         expired, _ = store.issue_pairing_code(ttl_seconds=0)
         time.sleep(0.01)
         assert store.consume_pairing_code(expired) is False
+
+
+class TestRule15kSecretConfigIsTheOperators:
+    """Hard rule 15.k: `config` is the operator's secret definition. EnvSource
+    reads the operator's own environment under the operator's chosen name;
+    nothing in a request shapes it - the backend takes no request at all."""
+
+    def test_env_source_reads_only_the_name_the_operator_wrote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import inspect
+
+        from recto.secrets.env import EnvSource
+
+        monkeypatch.setenv("OPERATOR_CHOSE_THIS", "v1")
+        monkeypatch.delenv("db-password", raising=False)
+        src = EnvSource()
+        assert src.fetch("db-password", {"env_var": "OPERATOR_CHOSE_THIS"}).value == "v1"
+        # the backend's contract carries no request: (secret_name, config) and nothing else
+        params = list(inspect.signature(EnvSource.fetch).parameters)
+        assert params == ["self", "secret_name", "config"]
+
+    def test_no_secret_source_takes_a_request(self) -> None:
+        import inspect
+
+        from recto.secrets.base import SecretSource
+
+        params = list(inspect.signature(SecretSource.fetch).parameters)
+        assert params == ["self", "secret_name", "config"]
+        assert not any(p in ("request", "headers", "payload", "handler") for p in params)
+
