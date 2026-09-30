@@ -480,6 +480,43 @@ def test_challenge_kinds_are_isolated(store):
     assert store.consume_pairing_code(code) is True
 
 
+# THE MEMBER PLANE (2026-09-30): a consumer's member codes + challenges are their own kinds, on both backends.
+
+def test_member_pairing_code_issue_and_single_use_consume(store):
+    code, exp = store.issue_member_pairing_code(ttl_seconds=300)
+    assert len(code) == 6 and code.isdigit() and exp > int(time.time())
+    assert store.consume_member_pairing_code(code) is True
+    assert store.consume_member_pairing_code(code) is False
+
+
+def test_member_and_owner_codes_are_isolated(store):
+    """A member code never buys an owner challenge, and an owner code is never a member one."""
+    member, _ = store.issue_member_pairing_code(ttl_seconds=300)
+    owner, _ = store.issue_pairing_code(ttl_seconds=300)
+    assert store.consume_pairing_code(member) is False
+    assert store.consume_member_pairing_code(owner) is False
+    assert store.consume_member_pairing_code(member) is True
+    assert store.consume_pairing_code(owner) is True
+
+
+def test_member_challenge_peek_never_consumes_and_kinds_are_isolated(store):
+    c, _ = store.issue_member_challenge(ttl_seconds=60)
+    owner_c, _ = store.issue_challenge(ttl_seconds=60)
+    assert store.is_member_challenge(c) is True
+    assert store.is_member_challenge(c) is True, "the peek consumed the challenge"
+    assert store.is_member_challenge(owner_c) is False
+    assert store.consume_challenge(c) is False, "a member challenge answered as an owner one"
+    assert store.consume_member_challenge(c) is True
+    assert store.is_member_challenge(c) is False
+    assert store.consume_member_challenge(c) is False
+
+
+def test_member_challenge_expired_is_not_a_member_challenge(store):
+    c, _ = store.issue_member_challenge(ttl_seconds=-1)
+    assert store.is_member_challenge(c) is False
+    assert store.consume_member_challenge(c) is False
+
+
 def test_challenge_store_adapter_delegates_to_state(store):
     """Regression pin for the 2026-07-20 prod finding: a ChallengeStore
     constructed WITH a state store must share challenge visibility with
