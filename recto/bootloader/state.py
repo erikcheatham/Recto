@@ -292,6 +292,10 @@ class PhoneRegistration:
 
 SLOTS = ("primary", "recovery")
 
+# THE MEMBER PLANE (2026-09-30): where a consumer's member phone registers - beside the business slots, never one of
+# them. Not in SLOTS by construction, so every "who holds a slot" question skips it.
+MEMBER_SLOT = "member"
+
 
 def _merge_onto_existing(
     existing: PhoneRegistration | None, incoming: PhoneRegistration
@@ -1955,6 +1959,20 @@ class StateStoreBase(ABC):
     def issue_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]: ...
     @abstractmethod
     def consume_pairing_code(self, code: str) -> bool: ...
+    # THE MEMBER PLANE (2026-09-30). A consumer's MEMBER code and the registration challenge it buys are their own
+    # kind: a member registers BESIDE the business slots (hard rule 14.4) and never answers a slot question. The owner
+    # codes above keep their meaning (the code is the owner's authority for displacement); a member code carries none.
+    @abstractmethod
+    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]: ...
+    @abstractmethod
+    def consume_member_pairing_code(self, code: str) -> bool: ...
+    @abstractmethod
+    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]: ...
+    @abstractmethod
+    def is_member_challenge(self, challenge: str) -> bool:
+        """Peek, never consume: registration asks the plane BEFORE its slot question."""
+    @abstractmethod
+    def consume_member_challenge(self, challenge: str) -> bool: ...
 
 
 class StateStore(StateStoreBase):
@@ -1978,6 +1996,9 @@ class StateStore(StateStoreBase):
         # note). value -> expires_at_unix.
         self._challenges: dict[str, int] = {}
         self._pairing_codes: dict[str, int] = {}
+        # THE MEMBER PLANE (2026-09-30): member codes + their challenges, apart from the owner's.
+        self._member_pairing_codes: dict[str, int] = {}
+        self._member_challenges: dict[str, int] = {}
         # Resolved capability requests waiting to be polled by the
         # requesting agent. In-memory only at v1 (purged on bootloader
         # restart, same as the pending queue). Keyed by request_id.
@@ -2753,6 +2774,39 @@ class StateStore(StateStoreBase):
             exp = self._pairing_codes.pop(code, None)
         return exp is not None and time.time() < exp
 
+    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        exp = int(time.time()) + ttl_seconds
+        with self._lock:
+            self._purge_challenges()
+            self._member_pairing_codes[code] = exp
+        return code, exp
+
+    def consume_member_pairing_code(self, code: str) -> bool:
+        with self._lock:
+            self._purge_challenges()
+            exp = self._member_pairing_codes.pop(code, None)
+        return exp is not None and time.time() < exp
+
+    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+        exp = int(time.time()) + ttl_seconds
+        with self._lock:
+            self._purge_challenges()
+            self._member_challenges[c] = exp
+        return c, exp
+
+    def is_member_challenge(self, challenge: str) -> bool:
+        with self._lock:
+            exp = self._member_challenges.get(challenge)
+        return exp is not None and time.time() < exp
+
+    def consume_member_challenge(self, challenge: str) -> bool:
+        with self._lock:
+            self._purge_challenges()
+            exp = self._member_challenges.pop(challenge, None)
+        return exp is not None and time.time() < exp
+
     def _purge_challenges(self) -> None:
         # Caller holds the lock.
         now = time.time()
@@ -2762,6 +2816,8 @@ class StateStore(StateStoreBase):
         self._pairing_codes = {
             c: e for c, e in self._pairing_codes.items() if e > now
         }
+        self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
+        self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
 
     # ------------------------------------------------------------------
     # Disk I/O (private)

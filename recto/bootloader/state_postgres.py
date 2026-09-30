@@ -721,6 +721,9 @@ class PostgresStateStore(StateStoreBase):
 
     _CHALLENGE_KIND_REGISTRATION = "registration"
     _CHALLENGE_KIND_PAIRING_CODE = "pairing_code"
+    # THE MEMBER PLANE (2026-09-30): the same table, two more kinds - no schema change.
+    _CHALLENGE_KIND_MEMBER_PAIRING_CODE = "member_pairing_code"
+    _CHALLENGE_KIND_MEMBER_REGISTRATION = "member_registration"
 
     def _issue_one_time(self, kind: str, value: str, ttl_seconds: int) -> int:
         exp = int(time.time()) + ttl_seconds
@@ -788,3 +791,26 @@ class PostgresStateStore(StateStoreBase):
         return self._consume_one_time(
             self._CHALLENGE_KIND_PAIRING_CODE, code
         )
+
+    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        return code, self._issue_one_time(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code, ttl_seconds)
+
+    def consume_member_pairing_code(self, code: str) -> bool:
+        return self._consume_one_time(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code)
+
+    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+        return c, self._issue_one_time(self._CHALLENGE_KIND_MEMBER_REGISTRATION, c, ttl_seconds)
+
+    def is_member_challenge(self, challenge: str) -> bool:
+        now = int(time.time())
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q("SELECT expires_at_unix FROM {schema}.challenges WHERE kind = %s AND value = %s"),
+                (self._CHALLENGE_KIND_MEMBER_REGISTRATION, challenge),
+            ).fetchone()
+        return row is not None and now < row[0]
+
+    def consume_member_challenge(self, challenge: str) -> bool:
+        return self._consume_one_time(self._CHALLENGE_KIND_MEMBER_REGISTRATION, challenge)

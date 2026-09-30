@@ -59,6 +59,7 @@ from recto.bootloader.sessions import (
     verify_signature,
 )
 from recto.bootloader.state import (
+    MEMBER_SLOT,
     SLOTS,
     ActorContext,
     AppContext,
@@ -633,6 +634,8 @@ class ChallengeStore:
         self._state = state
         self._challenges: dict[str, int] = {}  # value -> expires_at_unix
         self._pairing_codes: dict[str, int] = {}  # code -> expires_at_unix
+        self._member_pairing_codes: dict[str, int] = {}  # THE MEMBER PLANE (2026-09-30)
+        self._member_challenges: dict[str, int] = {}
 
     def issue_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
         if self._state is not None:
@@ -667,10 +670,50 @@ class ChallengeStore:
         exp = self._pairing_codes.pop(code, None)
         return exp is not None and time.time() < exp
 
+    # THE MEMBER PLANE (2026-09-30): a consumer's member code, and the registration challenge it buys, are their own
+    # kind - a member registers BESIDE the business slots and never answers a slot question.
+    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_member_pairing_code(ttl_seconds)
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        exp = int(time.time()) + ttl_seconds
+        self._member_pairing_codes[code] = exp
+        return code, exp
+
+    def consume_member_pairing_code(self, code: str) -> bool:
+        if self._state is not None:
+            return self._state.consume_member_pairing_code(code)
+        self._purge()
+        exp = self._member_pairing_codes.pop(code, None)
+        return exp is not None and time.time() < exp
+
+    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_member_challenge(ttl_seconds)
+        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+        exp = int(time.time()) + ttl_seconds
+        self._member_challenges[c] = exp
+        return c, exp
+
+    def is_member_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.is_member_challenge(c)
+        exp = self._member_challenges.get(c)
+        return exp is not None and time.time() < exp
+
+    def consume_member_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.consume_member_challenge(c)
+        self._purge()
+        exp = self._member_challenges.pop(c, None)
+        return exp is not None and time.time() < exp
+
     def _purge(self) -> None:
         now = time.time()
         self._challenges = {c: e for c, e in self._challenges.items() if e > now}
         self._pairing_codes = {c: e for c, e in self._pairing_codes.items() if e > now}
+        self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
+        self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
 
 
 class BootloaderHandler(BaseHTTPRequestHandler):
@@ -1095,10 +1138,19 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # Optional pairing-code gating: if `code=` query param is present,
         # the operator-issued pairing code must match.
         params = parse_qs(url.query)
+        member = False
         if "code" in params:
-            if not cfg.challenges.consume_pairing_code(params["code"][0]):
+            code = params["code"][0]
+            if cfg.challenges.consume_pairing_code(code):
+                pass
+            elif cfg.challenges.consume_member_pairing_code(code):
+                # THE MEMBER PLANE (2026-09-30): a consumer's member code buys a MEMBER challenge - never an owner one.
+                member = True
+            else:
                 raise RegistrationExpiredError("pairing code expired or invalid")
-        challenge, expires_at = cfg.challenges.issue_challenge()
+        challenge, expires_at = (
+            cfg.challenges.issue_member_challenge() if member else cfg.challenges.issue_challenge()
+        )
         self._send_json(HTTPStatus.OK, {
             "challenge_b64u": challenge,
             "expires_at_unix": expires_at,
@@ -1154,18 +1206,34 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # displacement (the claim below only binds the incoming key's intent).
         # A 409 here leaves the challenge intact, so the phone answers on the
         # same one, inside its TTL, with slot_replace_b64u added.
-        slot = body.get("slot") or "primary"
-        if slot not in SLOTS:
-            raise BootloaderError(
-                f"registration refused: slot must be one of {list(SLOTS)}; got {slot!r}"
-            )
         incoming_ref = _phone_ref(public_key_b64u)
-        occupant = next(
-            (p for p in cfg.state.list_phones()
-             if p.slot == slot and p.phone_id != incoming_ref),
-            None,
-        )
-        replace_sig = body.get("slot_replace_b64u") or None
+        # THE MEMBER PLANE (2026-09-30). A challenge bought with a consumer's MEMBER code carries none of the owner's
+        # authority: the phone registers BESIDE the slots (MEMBER_SLOT), the slot question is never asked, and a
+        # replace claim is refused by name - a member key never displaces a business phone. A key that already HOLDS
+        # a business slot keeps it (the owner's phone scanning a member code is still the owner's phone).
+        member = cfg.challenges.is_member_challenge(challenge)
+        if member:
+            if body.get("slot_replace_b64u"):
+                raise BootloaderError(
+                    "registration refused: a member registration answers no slot question - "
+                    "slot_replace_b64u is the business owner's act, never a member code's"
+                )
+            held = cfg.state.get_phone(incoming_ref)
+            slot = held.slot if held is not None and held.slot in SLOTS else MEMBER_SLOT
+            occupant = None
+            replace_sig = None
+        else:
+            slot = body.get("slot") or "primary"
+            if slot not in SLOTS:
+                raise BootloaderError(
+                    f"registration refused: slot must be one of {list(SLOTS)}; got {slot!r}"
+                )
+            occupant = next(
+                (p for p in cfg.state.list_phones()
+                 if p.slot == slot and p.phone_id != incoming_ref),
+                None,
+            )
+            replace_sig = body.get("slot_replace_b64u") or None
         if occupant is not None and not replace_sig:
             self._send_json(HTTPStatus.CONFLICT, {
                 "error": "slot_occupied",
@@ -1183,7 +1251,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 ),
             })
             return
-        if not cfg.challenges.consume_challenge(challenge):
+        consumed = (
+            cfg.challenges.consume_member_challenge(challenge) if member
+            else cfg.challenges.consume_challenge(challenge)
+        )
+        if not consumed:
             raise RegistrationExpiredError("registration challenge expired or invalid")
         # Pick the algorithm the phone declared. The registration body's
         # `supported_algorithms` is a list (phone enumerates what it
@@ -4872,6 +4944,21 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             raise BootloaderError(
                 "ttl_seconds must be an integer in [60, 3600] (1 minute - 1 hour)"
             )
+        # THE MEMBER PLANE (2026-09-30): a consumer mints a code for one of ITS MEMBERS by naming who it is for.
+        # That code registers beside the business slots and carries none of the owner's authority; a code minted
+        # without member_of keeps its meaning (the owner's, e.g. the owner's own re-pair lane).
+        member_of = body.get("member_of")
+        if member_of is not None:
+            if (not isinstance(member_of, dict)
+                    or not isinstance(member_of.get("consumer"), str) or not member_of["consumer"].strip()
+                    or not isinstance(member_of.get("user_id"), str) or not member_of["user_id"].strip()):
+                raise BootloaderError("member_of must be {\"consumer\": <base url>, \"user_id\": <id>}")
+            code, exp = cfg.challenges.issue_member_pairing_code(ttl_seconds=ttl_seconds)
+            print(f"[bootloader] minted MEMBER pairing code via /v0.4/pairing/code "
+                  f"(agent={agent_id}, consumer={member_of['consumer']}, expires_at_unix={exp})", flush=True)
+            self._send_json(HTTPStatus.OK, {"code": code, "expires_at_unix": exp, "ttl_seconds": ttl_seconds,
+                                            "plane": "member"})
+            return
         # Mint via the in-process ChallengeStore primitive
         code, exp = cfg.challenges.issue_pairing_code(ttl_seconds=ttl_seconds)
         # Operator-friendly stdout for the foreground-bootloader case
