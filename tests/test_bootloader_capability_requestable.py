@@ -3,11 +3,14 @@
 
 The policy is a PRE-CARDING filter on what an agent may ASK for:
 
-* An agent WITH a policy entry is deny-by-default — a request whose
-  resolved action set (groups expanded via the manifest, allow_actions
-  added, deny_actions subtracted; the same resolution verifiers use)
-  strays outside its list is refused 403 and NOTHING is queued. The
-  refusal names the disallowed actions.
+* An agent WITH a policy entry is deny-by-default — a request that
+  NAMES an action outside its list (allow_actions, plus each group's
+  members expanded via the manifest) is refused 403 and NOTHING is
+  queued. The refusal names the disallowed actions.
+* deny_actions is never subtracted before the policy judges: a deny
+  cannot cancel its own allow into a pass. "allow [x], deny [x]" still
+  names x, and a verifier that reads allow_actions alone would grant
+  it. A deny of an action the clause does not name asks for nothing.
 * An agent WITHOUT an entry is unrestricted at this layer (legacy
   behavior) — the operator's approval remains the gate.
 * Group-bearing claims from a policed agent REQUIRE a loaded manifest;
@@ -242,14 +245,89 @@ class TestRequestablePolicy:
             assert body["error"] == "action_policy_unevaluable"
         assert _pending_count(live) == 0
 
-    def test_deny_actions_subtract_before_policy(self, live) -> None:
-        """Resolution matches the verifier's: a denied action is not part
-        of what is being asked for, so it does not trip the policy."""
+    def test_a_deny_never_cancels_its_own_allow_into_a_pass(self, live) -> None:
+        """The policy judges what the clause NAMES, not what survives the
+        verifier's deny subtraction. Allowing an out-of-policy action and
+        denying it in the same clause still names it: a verifier that
+        reads allow_actions alone would grant it. Refused whole, never
+        queued, with or without a manifest."""
         status, body = _request(
             live, POLICED_AGENT, POLICED_TOKEN,
             _claims(
                 allow_actions=["queue:submit-item", "queue:approve-item"],
                 deny_actions=["queue:approve-item"],
+            ),
+        )
+        assert status == 403, body
+        assert body["error"] == "action_not_requestable"
+        assert body["disallowed_actions"] == ["queue:approve-item"]
+        assert _pending_count(live) == 0
+
+    def test_an_action_allowed_and_denied_alone_is_still_asked_for(
+        self, live,
+    ) -> None:
+        """The bare form: a clause whose only allow is cancelled by its
+        own deny allows nothing at Recto's verifier, and it is still
+        refused here, because it names the action."""
+        status, body = _request(
+            live, POLICED_AGENT, POLICED_TOKEN,
+            _claims(
+                allow_actions=["queue:approve-item"],
+                deny_actions=["queue:approve-item"],
+            ),
+        )
+        assert status == 403, body
+        assert body["error"] == "action_not_requestable"
+        assert body["disallowed_actions"] == ["queue:approve-item"]
+        assert _pending_count(live) == 0
+
+    def test_a_deny_never_cancels_a_group_member_into_a_pass(self, live) -> None:
+        """Group members are allows too: denying every member of a group
+        the agent may not request does not make the group requestable.
+        With a manifest the group expands and refuses on its members;
+        without one it refuses unexpanded, as before."""
+        status, body = _request(
+            live, POLICED_AGENT, POLICED_TOKEN,
+            _claims(
+                groups=["ops:queue-admin"],
+                deny_actions=["queue:approve-item", "queue:run-item"],
+            ),
+        )
+        assert status == 403, body
+        if live["has_manifest"]:
+            assert body["error"] == "action_not_requestable"
+            assert body["disallowed_actions"] == [
+                "queue:approve-item", "queue:run-item",
+            ]
+        else:
+            assert body["error"] == "action_policy_unevaluable"
+        assert _pending_count(live) == 0
+
+    def test_a_deny_alone_asks_for_nothing(self, live) -> None:
+        """A deny of an action the clause does not name only narrows: it
+        never trips the policy, even when the denied action is outside
+        the agent's list."""
+        status, body = _request(
+            live, POLICED_AGENT, POLICED_TOKEN,
+            _claims(
+                allow_actions=["queue:submit-item"],
+                deny_actions=["queue:approve-item"],
+            ),
+        )
+        assert status == 201, body
+        assert _pending_count(live) == 1
+
+    def test_a_clause_naming_only_requestable_actions_passes_whatever_it_denies(
+        self, live,
+    ) -> None:
+        """The policy bounds the agent's surface; it is not a clause-
+        hygiene rule. A clause that names only requestable actions is
+        carded even when it also denies one of them."""
+        status, body = _request(
+            live, POLICED_AGENT, POLICED_TOKEN,
+            _claims(
+                allow_actions=["queue:submit-item"],
+                deny_actions=["queue:submit-item"],
             ),
         )
         assert status == 201, body

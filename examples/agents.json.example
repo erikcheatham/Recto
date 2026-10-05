@@ -9,7 +9,9 @@
 
   "_two_agents": "Two entries are shown because the manifest exists to register MORE THAN ONE consumer against one bootloader; a single-agent example would not demonstrate the thing the file is for. Each agent gets its own token, its own vault entry, and its own app block -- nothing is shared but the bootloader.",
 
-  "_requestable_actions": "OPTIONAL per-agent field: an array of action keys this agent may ASK for. When present the agent is deny-by-default -- a capability request whose resolved action set (groups expanded via the manifest, allow_actions added, deny_actions subtracted) strays outside this list is refused 403 BEFORE it reaches the operator's approval queue, so a misbehaving or compromised agent cannot spend the operator's attention on requests it was never meant to make. When absent the agent is unrestricted at this layer and the operator's approval remains the only gate. Note this is a filter on what may be REQUESTED, never a grant: every listed action still requires the normal per-request approval. If a policed agent sends group-bearing claims the bootloader must have its action manifest loaded (RECTO_CAPABILITY_MANIFEST_FILE), otherwise the request is refused unexpanded, fail-closed. An empty array is a config error and refuses startup: an agent that may request nothing should not be registered.",
+  "_requestable_actions": "OPTIONAL per-agent field: an array of action keys this agent may ASK for. When present the agent is deny-by-default -- a capability request that names any action outside this list (allow_actions, plus each group's members expanded via the manifest; deny_actions is never subtracted first, so a deny cannot cancel its own allow into a pass) is refused 403 BEFORE it reaches the operator's approval queue, so a misbehaving or compromised agent cannot spend the operator's attention on requests it was never meant to make. When absent the agent is unrestricted at this layer and the operator's approval remains the only gate. Note this is a filter on what may be REQUESTED, never a grant: every listed action still requires the normal per-request approval. If a policed agent sends group-bearing claims the bootloader must have its action manifest loaded (RECTO_CAPABILITY_MANIFEST_FILE), otherwise the request is refused unexpanded, fail-closed. An empty array is a config error and refuses startup: an agent that may request nothing should not be registered.",
+
+  "_requestable_audiences": "OPTIONAL per-agent field: an array of audience strings this agent may name in a request's aud claim -- WHERE the grant it asks for may be spent, as requestable_actions bounds WHAT it may do. When present the agent is deny-by-default -- a request whose aud is not an array of strings, is empty, or names any audience outside this list is refused 403 BEFORE it reaches the operator's approval queue. When absent the agent is unrestricted at this layer. The values are YOURS: name each verifier the way it expects to be named (one audience per consumer, per cluster, per executor). Recto ships none, treats aud as opaque, compares it exactly (case included) and never rewrites it; the phone shows it on the approval card. Like requestable_actions this narrows what may be ASKED and grants nothing. An empty array is a config error and refuses startup.",
 
   "agents": [
     {
@@ -31,6 +33,7 @@
       "vault_service": "SecondExampleService",
       "vault_secret": "RECTO_CAPABILITY_AGENT_TOKEN",
       "requestable_actions": ["example:submit-item"],
+      "requestable_audiences": ["example-consumer:staging"],
       "app": {
         "app_id": "second-example-service",
         "app_name": "Second Example Service",

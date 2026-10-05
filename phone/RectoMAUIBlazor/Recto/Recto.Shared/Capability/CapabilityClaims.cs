@@ -27,11 +27,21 @@ namespace Recto.Shared.Capability;
 /// list means "no restriction at this dimension" (rare &mdash; most
 /// capabilities scope all three).
 /// </para>
+/// <para>
+/// <c>PayloadSha256</c> (2026-10-04) mirrors Python's
+/// <c>CapabilityScope.payload_sha256</c>: the SHA-256 hex fingerprint of
+/// the exact payload a consumer binds the grant to. It is read so the
+/// card can SHOW the pin it signs (sign-what-you-see), and it is emitted
+/// in the canonical JSON only when set &mdash; Python's
+/// <c>_strip_none</c> rule &mdash; so every claim without it keeps its
+/// byte-identical signing input.
+/// </para>
 /// </summary>
 public sealed record CapabilityScope(
     IReadOnlyList<string> Env,
     IReadOnlyList<string> Services,
-    IReadOnlyList<string> Repos)
+    IReadOnlyList<string> Repos,
+    string? PayloadSha256 = null)
 {
     public static CapabilityScope Empty { get; } = new(
         Env: System.Array.Empty<string>(),

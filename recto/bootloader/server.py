@@ -368,16 +368,33 @@ class BootloaderConfig:
     # Per-agent REQUESTABLE-action policy, evaluated BEFORE a request
     # is queued for approval. Map of agent_id -> list of action keys
     # that agent may ask for. An agent WITH an entry is deny-by-default:
-    # a capability request whose effective action set (groups expanded
-    # via the manifest + allow_actions, deny_actions subtracted — the
-    # same resolution verifiers use) contains any action outside its
-    # list is refused 403 and never reaches the approval queue. An
+    # a capability request that NAMES any action outside its list
+    # (allow_actions, plus each group's members expanded via the
+    # manifest) is refused 403 and never reaches the approval queue.
+    # deny_actions is never subtracted first: a deny cannot cancel its
+    # own allow into a pass, because a verifier that reads allow_actions
+    # alone would grant the action the deny was meant to cancel. An
     # agent WITHOUT an entry is unrestricted at this layer (legacy
     # behavior — the operator's approval remains the gate). This is a
     # pre-carding filter on what may be ASKED, not a grant of anything:
     # nothing here mints authority, it only narrows which requests are
     # allowed to spend the operator's attention.
     capability_agent_requestable: dict[str, list[str]] = {}
+    # Per-agent REQUESTABLE-audience policy (2026-10-04), the audience
+    # twin of the action policy above: WHERE a requested grant may be
+    # spent, as the action policy bounds WHAT it may do. Map of agent_id
+    # -> list of audience strings that agent may name in a request's
+    # `aud`. An agent WITH an entry is deny-by-default: a request whose
+    # `aud` is not a JSON array of strings, is empty, or names any
+    # audience outside the list is refused 403 and never queued. An agent
+    # WITHOUT an entry is unrestricted at this layer (legacy behavior).
+    # The strings are the deploying operator's configuration -- one per
+    # consumer, per cluster, per executor, whatever its verifiers expect
+    # -- and the substrate carries none of them: `aud` stays opaque here,
+    # is compared exactly (case included, as verify_jws compares it), and
+    # is never rewritten. Like the action policy, this narrows what may
+    # be ASKED; it grants nothing.
+    capability_agent_audiences: dict[str, list[str]] = {}
     # Operator's expected secp256k1 public key (uncompressed, 64 raw
     # bytes — X || Y, no 0x04 prefix). When set, the bootloader
     # verifies the phone's capability signature recovers to this key
@@ -3477,8 +3494,16 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # through unchanged (approval remains their gate). The refusal
         # names the disallowed actions and the allowed set — a refusal
         # that names what is missing beats a silent drop.
+        #
+        # The policy judges what the clause NAMES on its allow side:
+        # allow_actions plus every group's members. deny_actions is NOT
+        # subtracted first. A deny narrows a grant at a verifier that
+        # honours it, but it never turns an action the agent may not ask
+        # for into a passing request: "allow [x], deny [x]" still names
+        # x, and a verifier that reads allow_actions alone would grant x.
         requestable = cfg.capability_agent_requestable.get(agent_id)
         if requestable is not None:
+            asked = set(claims.cap.allow_actions)
             if claims.cap.groups:
                 manifest = cfg.capability_manifest
                 if manifest is None:
@@ -3496,18 +3521,22 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                     )
                     return
                 from recto.capability.manifest import resolve_actions
+                # resolve_actions validates the clause against the
+                # manifest (its registry version, every group and every
+                # allow_action declared) and raises on the first unknown.
+                # Its deny-subtracted result is what a verifier grants,
+                # not what the request asks for, so it is not the set
+                # judged here.
                 try:
-                    effective = resolve_actions(claims.cap, manifest)
+                    resolve_actions(claims.cap, manifest)
                 except ValueError as exc:
                     raise BootloaderError(
                         f"claims failed action resolution against the "
                         f"manifest: {exc}"
                     ) from exc
-            else:
-                effective = set(claims.cap.allow_actions) - set(
-                    claims.cap.deny_actions
-                )
-            disallowed = sorted(effective - set(requestable))
+                for group_key in claims.cap.groups:
+                    asked.update(manifest.groups[group_key].actions)
+            disallowed = sorted(asked - set(requestable))
             if disallowed:
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
@@ -3515,6 +3544,40 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                      "agent_id": agent_id,
                      "disallowed_actions": disallowed,
                      "requestable_actions": sorted(requestable)},
+                )
+                return
+        # Requestable-audience policy: the same pre-carding filter, for
+        # WHERE the grant could be spent. The check reads the RAW `aud`
+        # (the typed round-trip would turn a bare string into a list of
+        # its characters) and compares exactly. An empty `aud` is refused
+        # too: a grant that names no audience is accepted by any verifier
+        # that does not insist on one, which is the widest grant there is.
+        audience_policy = cfg.capability_agent_audiences.get(agent_id)
+        if audience_policy is not None:
+            raw_aud = claims_raw.get("aud")
+            if not isinstance(raw_aud, list) or not all(
+                isinstance(a, str) for a in raw_aud
+            ):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "audience_not_requestable",
+                     "agent_id": agent_id,
+                     "detail": ("agent carries a requestable-audience policy; "
+                                "aud must be a JSON array of strings"),
+                     "requestable_audiences": sorted(audience_policy)},
+                )
+                return
+            outside = sorted({a for a in raw_aud if a not in audience_policy})
+            if not raw_aud or outside:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "audience_not_requestable",
+                     "agent_id": agent_id,
+                     "detail": ("the request names no audience" if not raw_aud
+                                else "the request names an audience outside "
+                                     "the agent's policy"),
+                     "disallowed_audiences": outside,
+                     "requestable_audiences": sorted(audience_policy)},
                 )
                 return
         # Build the JWS signing input via the same canonical-JSON
@@ -6531,6 +6594,7 @@ def create_server(
     ssl_context: Any = None,
     capability_agent_tokens: dict[str, str] | None = None,
     capability_agent_requestable: dict[str, list[str]] | None = None,
+    capability_agent_audiences: dict[str, list[str]] | None = None,
     capability_operator_pubkey: bytes | None = None,
     capability_result_ttl_seconds: int = 600,
     capability_manifest: object | None = None,
@@ -6585,11 +6649,21 @@ def create_server(
     `capability_agent_requestable` is an optional per-agent policy on
     what may be ASKED: agent_id -> list of requestable action keys.
     An agent with an entry is deny-by-default — a capability request
-    whose resolved action set strays outside the list is refused 403
+    that names an action outside the list (allow_actions plus the
+    members of its groups; deny_actions is never subtracted first, so
+    a deny cannot cancel its own allow into a pass) is refused 403
     before it is ever queued (no card reaches the operator). Agents
     without an entry are unrestricted at this layer. Requires
     `capability_manifest` to be loaded if policed agents send
     group-bearing claims (groups are refused unexpanded, fail-closed).
+
+    `capability_agent_audiences` is the audience twin of that policy:
+    agent_id -> list of audience strings the agent may name in `aud`.
+    An agent with an entry is deny-by-default — a request whose `aud`
+    is empty, is not an array of strings, or names an audience outside
+    the list is refused 403 before it is queued. Agents without an entry
+    are unrestricted at this layer. The values are the deployment's own
+    configuration; the substrate names no audience and compares exactly.
 
     `capability_operator_pubkey` is the operator's expected secp256k1
     pubkey (uncompressed 64-byte X || Y, no 0x04 prefix). When set,
@@ -6674,6 +6748,11 @@ def create_server(
     BootloaderHandler.config.capability_agent_requestable = (
         {k: list(v) for k, v in capability_agent_requestable.items()}
         if capability_agent_requestable
+        else {}
+    )
+    BootloaderHandler.config.capability_agent_audiences = (
+        {k: list(v) for k, v in capability_agent_audiences.items()}
+        if capability_agent_audiences
         else {}
     )
     # GATE 5a -- OPERATOR IMMUTABILITY: DISAGREEMENT IS FATAL (2026-08-18).

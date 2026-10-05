@@ -151,6 +151,66 @@ public class CapabilityVerifierTests
     }
 
     // -----------------------------------------------------------------
+    // cap.scope.payload_sha256 (2026-10-04): read for the card, emitted
+    // only when set. Pinned against the Python build_signing_input on the
+    // example_claims fixture with payload_sha256 = "ab" * 32.
+    // -----------------------------------------------------------------
+
+    private const string PinFixture =
+        "abababababababababababababababababababababababababababababababab";
+
+    private const string ExpectedPinnedPayloadB64 =
+        "eyJhdWQiOlsiY29uc3VtZXItYXBwIiwicmVjdG86dmF1bHQiXSwiY2FwIjp7ImFsbG93X2FjdGlvbnMiOltdLCJkZW55X2FjdGlvbnMiOltdLCJncm91cHMiOlsiZGFyd2luOmRvYy1lZGl0cyIsImRhcndpbjpzdGFnaW5nLWRlcGxveXMiXSwibGltaXRzIjp7InBlcl9kYXkiOnt9LCJwZXJfaG91ciI6eyJkZXBsb3k6c3RhZ2luZyI6NX0sInBlcl9zZXNzaW9uIjp7fX0sInJlZ2lzdHJ5X3ZlcnNpb24iOiIyMDI2LTA1LTA1Iiwic2NvcGUiOnsiZW52IjpbInN0YWdpbmciXSwicGF5bG9hZF9zaGEyNTYiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwicmVwb3MiOlsicmVjdG8iXSwic2VydmljZXMiOlsid2ViIl19LCJ0aWVyIjoxfSwiZXhwIjoxNzE1MDg2NDAwLCJpYXQiOjE3MTUwMDAwMDAsImlzcyI6InBob25lOm9wZXJhdG9yOmVuY2xhdmUiLCJqdGkiOiJjYXBfMjAyNi0wNS0wNV90ZXN0IiwibmJmIjoxNzE1MDAwMDAwLCJwdXJwb3NlIjoiVGVzdCBjYXBhYmlsaXR5IGZpeHR1cmUiLCJzdWIiOiJhZ2VudDpkYXJ3aW5Ac3RhZ2luZyJ9";
+
+    private const string ExpectedPinnedDigestHex =
+        "b995429cd7928da7c1c361daacfb16a1510902566795aee444bb374f84a8fc37";
+
+    private static CapabilityClaims PinnedExampleClaims()
+    {
+        var c = ExampleClaims();
+        return c with { Cap = c.Cap with { Scope = c.Cap.Scope with { PayloadSha256 = PinFixture } } };
+    }
+
+    [Fact]
+    public void BuildSigningInput_WithPayloadPin_MatchesPythonCanonicalBytes()
+    {
+        var (digest, _, payloadB64) = CapabilityJws.BuildSigningInput(PinnedExampleClaims());
+        Assert.Equal(ExpectedPinnedPayloadB64, payloadB64);
+        Assert.Equal(ExpectedPinnedDigestHex, Convert.ToHexString(digest).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void BuildSigningInput_WithoutPayloadPin_KeepsThePinnedBytes()
+    {
+        // The extension is omitted when null, so the pre-extension fixture
+        // still encodes to the Python bytes it always did.
+        var (_, _, payloadB64) = CapabilityJws.BuildSigningInput(ExampleClaims());
+        Assert.Equal(ExpectedPayloadB64, payloadB64);
+        Assert.DoesNotContain("payload_sha256",
+            Encoding.UTF8.GetString(CapabilityJws.Base64UrlDecode(payloadB64)));
+    }
+
+    [Fact]
+    public void PayloadToClaims_ReadsThePayloadPin_AndRoundTripsByteForByte()
+    {
+        using var doc = JsonDocument.Parse(CapabilityJws.Base64UrlDecode(ExpectedPinnedPayloadB64));
+        var claims = CapabilityJws.PayloadToClaims(doc.RootElement);
+        Assert.Equal(PinFixture, claims.Cap.Scope.PayloadSha256);
+        var (_, _, payloadB64) = CapabilityJws.BuildSigningInput(claims);
+        Assert.Equal(ExpectedPinnedPayloadB64, payloadB64);
+    }
+
+    [Fact]
+    public void PayloadToClaims_PinOfAnotherJsonKind_IsNull()
+    {
+        var json = Encoding.UTF8.GetString(CapabilityJws.Base64UrlDecode(ExpectedPayloadB64))
+            .Replace("\"repos\":[\"recto\"]", "\"payload_sha256\":7,\"repos\":[\"recto\"]");
+        using var doc = JsonDocument.Parse(json);
+        var claims = CapabilityJws.PayloadToClaims(doc.RootElement);
+        Assert.Null(claims.Cap.Scope.PayloadSha256);
+    }
+
+    // -----------------------------------------------------------------
     // ParseJws structural validation
     // -----------------------------------------------------------------
 

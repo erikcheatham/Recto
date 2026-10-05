@@ -66,9 +66,25 @@ public sealed record CapabilityAuditView(
     IReadOnlyList<string> Warnings,
     // headline
     string PurposeShort,
-    string PurposeFull)
+    string PurposeFull,
+    // 10 — audience (2026-10-04): WHERE the grant can be spent. Signed,
+    // and until now signed unseen. A consumer names one audience per
+    // verifier (a cluster, an executor), so the card must say which one
+    // the tap is for. Empty = the claims name none.
+    IReadOnlyList<string> Audience,
+    // 11 — payload pin (2026-10-04): cap.scope.payload_sha256, the
+    // fingerprint of the exact payload the grant is bound to. Null when
+    // the claims carry no pin (or carry it as anything but a string).
+    string? PayloadPin)
 {
     private const int PurposeMax = 240;
+    private const int PinShortChars = 12;
+
+    /// <summary>The pin's first characters for the card's at-a-glance line
+    /// (the full value renders under Audit details). Null when there is no pin.</summary>
+    public string? PayloadPinShort => PayloadPin is null
+        ? null
+        : PayloadPin.Length > PinShortChars ? PayloadPin.Substring(0, PinShortChars) + "..." : PayloadPin;
 
     private static readonly Regex UuidRegex = new(
         "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
@@ -124,7 +140,9 @@ public sealed record CapabilityAuditView(
             RegistryVersion: claims.Cap.RegistryVersion,
             Warnings: CrossCheck(claims, agent),
             PurposeShort: purposeShort,
-            PurposeFull: claims.Purpose);
+            PurposeFull: claims.Purpose,
+            Audience: claims.Aud,
+            PayloadPin: claims.Cap.Scope.PayloadSha256);
     }
 
     /// <summary>

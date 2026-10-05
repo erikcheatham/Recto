@@ -1105,6 +1105,41 @@ def _resolve_token_for_consumer(consumer: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-agent request policies (requestable_actions / requestable_audiences)
+# ---------------------------------------------------------------------------
+
+
+def _parse_agent_policy_list(
+    agent_id: str, agent: dict, field: str, noun: str,
+) -> list[str] | None:
+    """Read one optional per-agent policy list from an agents.json entry.
+
+    Absent = None (the agent is unrestricted at that layer). Present = a
+    non-empty array of non-blank strings, returned stripped. Anything else
+    raises ``ValueError`` naming the agent and the field: an explicitly
+    empty list is a config error, because an agent that may request
+    nothing should not be registered, and a malformed one must never be
+    read as "no policy" (that would fail OPEN).
+
+    One reader for both lists, so ``requestable_actions`` and
+    ``requestable_audiences`` cannot drift into two notions of "valid".
+    """
+    raw = agent.get(field)
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or not all(isinstance(a, str) and a.strip() for a in raw)
+    ):
+        raise ValueError(
+            f"agent {agent_id!r}: {field} must be a non-empty array of "
+            f"{noun} strings when present."
+        )
+    return [a.strip() for a in raw]
+
+
+# ---------------------------------------------------------------------------
 # AppContext construction
 # ---------------------------------------------------------------------------
 
@@ -1219,6 +1254,7 @@ def main() -> int:
 
     capability_agent_tokens: dict[str, str] = {}
     capability_agent_requestable: dict[str, list[str]] = {}
+    capability_agent_audiences: dict[str, list[str]] = {}
     principal_apps: dict[str, AppContext] = {}
 
     for agent in agents:
@@ -1273,29 +1309,29 @@ def main() -> int:
         if app_ctx is not None:
             principal_apps[agent_id] = app_ctx
 
-        # Optional requestable-action policy. Present = deny-by-default
-        # allowlist of action keys this agent may ask for (evaluated
-        # server-side before carding); absent = unrestricted at that
-        # layer. An explicitly-empty list is refused as a config error:
-        # an agent that may request NOTHING should not be registered.
-        requestable_raw = agent.get("requestable_actions")
-        if requestable_raw is not None:
-            if (
-                not isinstance(requestable_raw, list)
-                or not requestable_raw
-                or not all(
-                    isinstance(a, str) and a.strip() for a in requestable_raw
-                )
-            ):
-                print(
-                    f"ERROR: agent {agent_id!r}: requestable_actions must be "
-                    "a non-empty array of action-key strings when present.",
-                    file=sys.stderr,
-                )
-                return 2
-            capability_agent_requestable[agent_id] = [
-                a.strip() for a in requestable_raw
-            ]
+        # Optional request policies, both evaluated server-side before
+        # carding. Present = deny-by-default allowlist; absent =
+        # unrestricted at that layer. An explicitly-empty list is refused
+        # as a config error: an agent that may request NOTHING should not
+        # be registered.
+        #   requestable_actions   -- WHAT the agent may ask a grant for
+        #   requestable_audiences -- WHERE that grant may be spent (the
+        #       `aud` values; this deployment's own names, e.g. one per
+        #       cluster or executor -- the substrate carries none)
+        try:
+            requestable = _parse_agent_policy_list(
+                agent_id, agent, "requestable_actions", "action-key",
+            )
+            audiences = _parse_agent_policy_list(
+                agent_id, agent, "requestable_audiences", "audience",
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if requestable is not None:
+            capability_agent_requestable[agent_id] = requestable
+        if audiences is not None:
+            capability_agent_audiences[agent_id] = audiences
 
     # Phase H end-user device pairing relay (2026-05-19). When the
     # operator registers one or more consumers via
@@ -1511,6 +1547,7 @@ def main() -> int:
         capability_manifest_path=capability_manifest_path,
         capability_agent_tokens=capability_agent_tokens,
         capability_agent_requestable=capability_agent_requestable or None,
+        capability_agent_audiences=capability_agent_audiences or None,
         capability_operator_token=operator_write_token,
         principal_apps=principal_apps,
         devices_pair_consumer_webhook_tokens=devices_pair_consumer_webhook_tokens,
@@ -1583,6 +1620,9 @@ def main() -> int:
             policy = capability_agent_requestable.get(aid)
             if policy is not None:
                 ctx_str += f" [requestable: {', '.join(policy)}]"
+            aud_policy = capability_agent_audiences.get(aid)
+            if aud_policy is not None:
+                ctx_str += f" [audiences: {', '.join(aud_policy)}]"
             print(f"  - {aid} (token = {tok[:8]}...) {ctx_str}")
     # Phase H devices-pair consumer registry (2026-05-19). Same
     # sibling-line shape as Agents: above so the operator can spot

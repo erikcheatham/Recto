@@ -312,6 +312,39 @@ against the operator's public key, confirm `cap.allow_actions` covers what you
 are about to do, then proceed. Persist it on the row representing the action so
 a later audit can prove the operator approved that specific invocation.
 
+### Your own actions and audiences
+
+Recto names no action and no audience of yours. Declare your action keys in
+your own manifest (the file `RECTO_CAPABILITY_MANIFEST_FILE` points at;
+`recto/capability/manifest_v1.json` is a template to fork, not a registry to
+extend). Then bound each agent in `agents.json`:
+
+- `requestable_actions` — WHAT the agent may ask a grant for;
+- `requestable_audiences` — WHERE that grant may be spent: the `aud` values
+  your verifiers expect, for example one per cluster or per executor.
+
+Both are deny-by-default once present, both refuse before anything reaches the
+operator's queue, and neither grants anything. `aud` is compared exactly and
+never rewritten. Two actions you declare are two actions: a grant that allows
+one does not satisfy the other, so give each lane its own key rather than
+reusing one and telling them apart by scope.
+
+`requestable_actions` judges what the clause NAMES on its allow side:
+`allow_actions` plus every group's members, expanded through your manifest.
+`deny_actions` is not subtracted first, so a deny can never cancel its own allow
+into a pass: a clause that allows an action outside the agent's list is refused
+even when it also denies that action. (`evaluate_scope` still subtracts
+`deny_actions` at verification; that narrows what a grant permits, never what
+an agent may ask for.) A deny of an action the clause does not name asks for
+nothing and passes. The policy binds only agents that carry one, so a verifier
+of yours that reads `allow_actions` alone should still refuse any grant whose
+`groups` or `deny_actions` is non-empty.
+
+Likewise, `requestable_audiences` admits a request that names several listed
+audiences, and a grant that names two verifiers is good at both: a verifier that
+serves one audience should insist that `aud` is exactly that value, not merely
+that it contains it.
+
 ---
 
 ## The capability claim schema
@@ -322,7 +355,7 @@ Standard JWT claims plus a `cap` extension.
 |---|---|
 | `iss` | Always `phone:operator:enclave` |
 | `sub` | The calling agent and its context, e.g. `agent:<id>@user:<uuid>` |
-| `aud` | Audience list — who should accept this |
+| `aud` | Audience list — who should accept this. Yours to name (one per consumer, cluster or executor); Recto passes it through unchanged and the phone shows it on the card |
 | `iat` / `nbf` | Issued-at / not-before, Unix seconds |
 | `exp` | Expiry. 30–120s for one-shot mutations; longer only for standing roles |
 | `jti` | Globally unique. Replay defense and revocation keying |
@@ -334,7 +367,7 @@ Standard JWT claims plus a `cap` extension.
 | `tier` | 0–3 trust level. The manifest sets a weight ceiling per tier; requests exceeding it are rejected |
 | `registry_version` | Manifest version the action identifiers resolve against |
 | `groups` | Named groups from the manifest, each expanding to a set of actions |
-| `scope` | Narrowing: `env`, `services`, `repos` |
+| `scope` | Narrowing: `env`, `services`, `repos`, plus per-action extensions such as `payload_sha256` (the fingerprint of the exact payload approved, shown on the card) |
 | `allow_actions` | Explicit additions beyond group membership |
 | `deny_actions` | Explicit subtractions from group membership |
 | `limits` | Numeric rate/count limits for the verifier to enforce |

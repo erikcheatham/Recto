@@ -110,8 +110,9 @@ public static class BootloaderAttestation
             return AttestationResult.Fail("claims: allow_actions is not exactly [bootloader:attest]");
         }
 
-        // The nonce binding lives in cap.scope.payload_sha256 (the phone's
-        // typed CapabilityScope does not carry it -- read the raw payload).
+        // The nonce binding lives in cap.scope.payload_sha256, read from the
+        // raw payload: the bytes the signature covers. (The typed
+        // CapabilityScope carries it too since 2026-10-04, for the card.)
         string? payloadSha;
         try
         {

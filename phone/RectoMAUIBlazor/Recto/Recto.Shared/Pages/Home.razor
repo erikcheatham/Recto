@@ -1183,6 +1183,32 @@
                                                         On behalf of user: <code>@capDecoded.OnBehalfOfUser</code>
                                                     </p>
                                                 }
+                                                @* AUDIENCE + PIN (2026-10-04): both are signed, and both were signed
+                                                   unseen. The audience says WHERE the grant can be spent (a consumer
+                                                   names one per verifier: a cluster, an executor); the pin says WHICH
+                                                   exact payload it is bound to. Rendered from the signed bytes only. *@
+                                                @* One <code> per audience, never a joined string: an audience is opaque text, so a
+                                                   single value that itself contains ", " must not read like two, nor two like one. *@
+                                                <p class="mb-1 text-muted small" style="word-break: break-all;">
+                                                    Audience@(capDecoded.Audience.Count > 1 ? $" ({capDecoded.Audience.Count})" : ""):
+                                                    @if (capDecoded.Audience.Count > 0)
+                                                    {
+                                                        foreach (var audItem in capDecoded.Audience)
+                                                        {
+                                                            <code class="me-1">@audItem</code>
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        <span>none named</span>
+                                                    }
+                                                </p>
+                                                @if (capDecoded.PayloadPinShort is not null)
+                                                {
+                                                    <p class="mb-1 text-muted small" style="word-break: break-all;">
+                                                        Pinned to payload: <code>@capDecoded.PayloadPinShort</code>
+                                                    </p>
+                                                }
                                                 <p class="mb-1 text-muted small">
                                                     Tier: <strong>@capDecoded.Tier</strong>@if (capDecoded.TierCeiling.HasValue) {<span> / ceiling @capDecoded.TierCeiling</span>}
                                                 </p>
@@ -1251,6 +1277,12 @@
                                                         <p class="mb-1 text-muted small" style="word-break: break-all;">
                                                             Request id@(capDecoded.SingleUse ? " (single-use)" : ""): <code>@capDecoded.Jti</code>
                                                         </p>
+                                                        @if (capDecoded.PayloadPin is not null)
+                                                        {
+                                                            <p class="mb-1 text-muted small" style="word-break: break-all;">
+                                                                Payload pin (sha256): <code>@capDecoded.PayloadPin</code>
+                                                            </p>
+                                                        }
                                                         <p class="mb-0 text-muted small">
                                                             Registry: <code>@capDecoded.RegistryVersion</code>
                                                         </p>

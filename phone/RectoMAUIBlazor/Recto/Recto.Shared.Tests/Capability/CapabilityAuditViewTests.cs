@@ -29,12 +29,14 @@ public class CapabilityAuditViewTests
         long? maxUses = 1,
         IReadOnlyList<string>? allow = null,
         IReadOnlyList<string>? deny = null,
-        IReadOnlyList<string>? groups = null)
+        IReadOnlyList<string>? groups = null,
+        IReadOnlyList<string>? aud = null,
+        string? pin = null)
     {
         return new CapabilityClaims(
             Iss: "phone:operator:enclave",
             Sub: sub,
-            Aud: new[] { "consumer-app", "recto:vault" },
+            Aud: aud ?? new[] { "consumer-app", "recto:vault" },
             Iat: iat,
             Nbf: iat,
             Exp: exp,
@@ -46,7 +48,8 @@ public class CapabilityAuditViewTests
                 Scope: new CapabilityScope(
                     Env: new[] { "staging" },
                     Services: new[] { "web" },
-                    Repos: new[] { "recto" }),
+                    Repos: new[] { "recto" },
+                    PayloadSha256: pin),
                 AllowActions: allow ?? new[] { "deploy:staging" },
                 DenyActions: deny ?? new[] { "deploy:production" },
                 Limits: CapabilityLimits.Empty),
@@ -236,6 +239,60 @@ public class CapabilityAuditViewTests
                      + "11111111-1111-1111-1111-111111111111");
         var view = CapabilityAuditView.From(claims, Now);
         Assert.Equal(2, view.Warnings.Count);
+    }
+
+    // -----------------------------------------------------------------
+    // 10 + 11 — audience and payload pin (2026-10-04): signed, now seen
+    // -----------------------------------------------------------------
+
+    [Fact]
+    public void Audience_IsTheSignedAudList()
+    {
+        var view = CapabilityAuditView.From(
+            MakeClaims(aud: new[] { "executor:cluster-a" }), Now);
+        Assert.Equal(new[] { "executor:cluster-a" }, view.Audience);
+    }
+
+    [Fact]
+    public void Audience_EmptyWhenTheClaimsNameNone()
+    {
+        var view = CapabilityAuditView.From(MakeClaims(aud: Array.Empty<string>()), Now);
+        Assert.Empty(view.Audience);
+    }
+
+    [Fact]
+    public void PayloadPin_IsSurfacedWholeAndShort()
+    {
+        var pin = "016849fb" + new string('0', 56);
+        var view = CapabilityAuditView.From(MakeClaims(pin: pin), Now);
+        Assert.Equal(pin, view.PayloadPin);
+        Assert.Equal("016849fb0000...", view.PayloadPinShort);
+    }
+
+    [Fact]
+    public void PayloadPin_IsNullWithoutAPin()
+    {
+        var view = CapabilityAuditView.From(MakeClaims(), Now);
+        Assert.Null(view.PayloadPin);
+        Assert.Null(view.PayloadPinShort);
+    }
+
+    [Fact]
+    public void AudienceAndPin_ComeFromTheDecodedPayload()
+    {
+        // The card's path end to end: signed bytes -> PayloadToClaims -> view.
+        var payload = """
+            {"aud":["executor:cluster-a"],"cap":{"allow_actions":["example:act"],"deny_actions":[],"groups":[],
+             "limits":{},"registry_version":"v1","scope":{"env":[],"payload_sha256":"ab","repos":[],"services":[]},"tier":1},
+             "exp":1715000060,"iat":1715000000,"iss":"phone:operator:enclave","jti":"cap_act_audit_test","max_uses":1,
+             "nbf":1715000000,"purpose":"run one act","sub":"agent:a"}
+            """;
+        using var doc = System.Text.Json.JsonDocument.Parse(payload);
+        var view = CapabilityAuditView.From(CapabilityJws.PayloadToClaims(doc.RootElement), Now);
+        Assert.Equal(new[] { "executor:cluster-a" }, view.Audience);
+        Assert.Equal("ab", view.PayloadPin);
+        Assert.True(view.SingleUse);
+        Assert.Equal(new[] { "example:act" }, view.AllowedActions);
     }
 
     // -----------------------------------------------------------------

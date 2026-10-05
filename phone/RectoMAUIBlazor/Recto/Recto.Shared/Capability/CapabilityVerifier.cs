@@ -684,10 +684,20 @@ public static class CapabilityJws
         if (cap.TryGetProperty("scope", out var scopeElem)
             && scopeElem.ValueKind == JsonValueKind.Object)
         {
+            // payload_sha256 (2026-10-04): the consumer's pin on the exact
+            // payload approved. Read only as a string; any other JSON kind
+            // is left null rather than coerced (the card then shows no pin).
+            string? payloadSha256 = null;
+            if (scopeElem.TryGetProperty("payload_sha256", out var pinElem)
+                && pinElem.ValueKind == JsonValueKind.String)
+            {
+                payloadSha256 = pinElem.GetString();
+            }
             scope = new CapabilityScope(
                 Env: ReadStringList(scopeElem, "env"),
                 Services: ReadStringList(scopeElem, "services"),
-                Repos: ReadStringList(scopeElem, "repos"));
+                Repos: ReadStringList(scopeElem, "repos"),
+                PayloadSha256: payloadSha256);
         }
 
         var limits = CapabilityLimits.Empty;
@@ -798,12 +808,16 @@ public static class CapabilityJws
     private static IReadOnlyDictionary<string, object?> ScopeToCanonicalDict(
         CapabilityScope scope)
     {
-        return new Dictionary<string, object?>(StringComparer.Ordinal)
+        var dict = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["env"] = scope.Env,
             ["services"] = scope.Services,
             ["repos"] = scope.Repos,
         };
+        // Omitted when null, exactly as Python's _strip_none omits an unset
+        // scope extension: claims without a pin keep their pinned bytes.
+        if (scope.PayloadSha256 is not null) dict["payload_sha256"] = scope.PayloadSha256;
+        return dict;
     }
 
     private static IReadOnlyDictionary<string, object?> LimitsToCanonicalDict(
