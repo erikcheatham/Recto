@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="command",
         title="subcommands",
         required=True,
-        metavar="{launch,credman,secrets,vault,profile,status,migrate-from-nssm,apply,events}",
+        metavar="{launch,credman,secrets,vault,profile,status,migrate-from-nssm,apply,events,bootloader}",
     )
 
     # launch
@@ -796,6 +796,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--yes", "-y", action="store_true")
     p_apply.add_argument("--dry-run", action="store_true")
 
+    # bootloader - the host's own acts on the bootloader's registry (hard rule 14.4, amended). Run ON the bootloader
+    # host against its state; never an HTTP route. File backend: --state-dir (or RECTO_BOOTLOADER_STATE_DIR) names the
+    # state dir, and owner-reset refuses while a bootloader holds it. Postgres: RECTO_STATE_BACKEND=postgres with
+    # RECTO_POSTGRES_DSN (and RECTO_POSTGRES_SCHEMA), under the registry's advisory lock.
+    p_bootloader = sub.add_parser(
+        "bootloader", help="Host-side acts on the bootloader's owner slots (read them; reset a lost sole phone).",
+    )
+    sub_bootloader = p_bootloader.add_subparsers(
+        dest="bootloader_command", required=True, metavar="{owner-slots,owner-reset}",
+    )
+    p_owner_slots = sub_bootloader.add_parser(
+        "owner-slots",
+        help="List the owner slots and the genesis marker. Changes no registry row; on Postgres, opening the store runs "
+             "the bootloader's idempotent CREATE ... IF NOT EXISTS, so it needs the bootloader's own DSN.",
+    )
+    p_owner_slots.add_argument("--state-dir", default=None)
+    p_owner_slots.add_argument(
+        "--expect", default=None,
+        help="Comma-separated phone refs the owner slots must hold - exactly these, read off each phone's own "
+             "Pairing Details. Exits 1 on any difference.",
+    )
+    p_owner_reset = sub_bootloader.add_parser(
+        "owner-reset",
+        help="Remove the LAST owner phone (a lost sole phone) and reopen genesis. A non-sole owner phone is revoked "
+             "over the network by an owner phone in hand (1-of-N); this command refuses it - unless EVERY owner phone "
+             "is lost: --every-owner-lost with --confirm naming every owner phone held.",
+    )
+    p_owner_reset.add_argument("--state-dir", default=None)
+    p_owner_reset.add_argument("--slot", default=None, choices=("primary", "recovery"))
+    p_owner_reset.add_argument("--confirm", default=None, metavar="PHONE_REF",
+                               help="The phone_ref the slot must hold - the reset removes exactly that phone. With "
+                                    "--every-owner-lost: every owner phone held, comma-separated, exactly.")
+    p_owner_reset.add_argument(
+        "--every-owner-lost", action="store_true",
+        help="Every owner phone is lost: remove them all. Needs --confirm naming exactly the owner phones the slots "
+             "hold (read them with `recto bootloader owner-slots`) and --reopen-genesis; takes no --slot.",
+    )
+    p_owner_reset.add_argument(
+        "--reopen-genesis", action="store_true",
+        help="Once no owner phone remains, let the next owner code alone enroll the first owner again. Required "
+             "with the removal of the LAST owner phone; alone (no --slot/--confirm) it reopens a store that already "
+             "holds no owner.",
+    )
+
     return parser
 
 
@@ -896,6 +940,11 @@ def main(
             return _cmd_apply(args, nssm=nssm, confirm=confirm, out=out, err=err)
         if cmd == "events":
             return _cmd_events(args, out=out, err=err)
+        if cmd == "bootloader":
+            if args.bootloader_command == "owner-slots":
+                return _cmd_bootloader_owner_slots(args, out=out, err=err)
+            if args.bootloader_command == "owner-reset":
+                return _cmd_bootloader_owner_reset(args, out=out, err=err)
     except KeyboardInterrupt:
         print("\nrecto: interrupted", file=err)
         return 130
@@ -967,6 +1016,375 @@ def _detect_user_objectname_mismatch(nssm, service: str) -> tuple[str, str] | No
     if object_user != user_lower:
         return current_user, object_name
     return None
+
+
+class _OwnerStoreRefused(Exception):
+    """A host act that must not run here - the message says why."""
+
+
+def _open_owner_store(args, *, write: bool):
+    """The bootloader's registry for a host act: (store, lock). File backend: the state dir must be named and hold a
+    registry; a WRITE takes the serving process's store lock or refuses (a live server keeps phones in memory and
+    would write the removed phone back). Postgres: RECTO_POSTGRES_DSN, no lock here (the caller takes the registry's
+    advisory lock)."""
+    import os
+    from pathlib import Path
+
+    backend = (os.environ.get("RECTO_STATE_BACKEND") or "file").strip().lower()
+    if backend == "postgres":
+        dsn = (os.environ.get("RECTO_POSTGRES_DSN") or "").strip()
+        if not dsn:
+            raise _OwnerStoreRefused(
+                "RECTO_STATE_BACKEND=postgres but RECTO_POSTGRES_DSN is not set - this command reads the DSN from "
+                "that variable only")
+        schema = (os.environ.get("RECTO_POSTGRES_SCHEMA") or "recto_bootloader").strip()
+        if not schema or not set(schema) <= set("abcdefghijklmnopqrstuvwxyz0123456789_"):
+            raise _OwnerStoreRefused(f"RECTO_POSTGRES_SCHEMA must be a lowercase identifier; got {schema!r}")
+        try:
+            import psycopg
+            from recto.bootloader.state_postgres import PostgresStateStore
+        except ImportError as exc:
+            raise _OwnerStoreRefused(f"the Postgres arm needs the postgres extra (pip install recto[postgres]): {exc}")
+        # Probe first: constructing the store runs its DDL, which would CREATE a mistyped schema, empty. No message
+        # here prints the DSN or a server message (which can name the host): the error's type and SQLSTATE only.
+        try:
+            probe = psycopg.connect(dsn, connect_timeout=10)
+        except psycopg.Error as exc:
+            raise _OwnerStoreRefused(f"cannot reach the database: {_db_error(exc)}") from exc
+        try:
+            with probe:
+                found = probe.execute("SELECT to_regclass(%s)", (f"{schema}.phones",)).fetchone()[0]
+        except psycopg.Error as exc:
+            raise _OwnerStoreRefused(f"the database refused the registry probe: {_db_error(exc)}") from exc
+        if found is None:
+            raise _OwnerStoreRefused(f"no bootloader registry in schema {schema!r} (no {schema}.phones) - name the "
+                                     "live schema")
+        # By step, so each refusal names what failed. The constructor closes its own pool when it fails.
+        try:
+            store = PostgresStateStore(dsn, schema=schema)
+        except Exception as exc:
+            raise _OwnerStoreRefused(
+                f"the registry in schema {schema!r} cannot be read: the database refused ({_db_error(exc)})") from exc
+        try:
+            genesis = store.get_owner_genesis()
+        except ValueError as exc:   # a bad owner_genesis row: its value is named, never the DSN
+            store.close()
+            raise _OwnerStoreRefused(
+                f"the registry in schema {schema!r} cannot be read ({exc}) - a bad owner_genesis row in registry_meta "
+                "is repaired by hand (value {\"state\": \"closed\"}), never by this command") from exc
+        except Exception as exc:
+            store.close()
+            raise _OwnerStoreRefused(
+                f"the registry in schema {schema!r} cannot be read: the database refused ({_db_error(exc)})") from exc
+        try:
+            empty = not store.list_phones()
+        except Exception as exc:
+            store.close()
+            if type(exc).__module__.split(".")[0] in ("psycopg", "psycopg_pool"):
+                raise _OwnerStoreRefused(
+                    f"the registry in schema {schema!r} cannot be read: the database refused ({_db_error(exc)})"
+                ) from exc
+            raise _OwnerStoreRefused(
+                f"the registry in schema {schema!r} cannot be read: a row in {schema}.phones is malformed "
+                f"({_db_error(exc)}) - repair or restore that row by hand; nothing changed") from exc
+        if genesis is None and empty:
+            store.close()
+            raise _OwnerStoreRefused(f"no bootloader registry in schema {schema!r} - name the live schema")
+        return store, None
+    if backend not in ("", "file"):
+        raise _OwnerStoreRefused(f"unknown RECTO_STATE_BACKEND={backend!r} (supported: 'file', 'postgres')")
+    raw = args.state_dir or os.environ.get("RECTO_BOOTLOADER_STATE_DIR")
+    if not raw:
+        raise _OwnerStoreRefused("--state-dir is required (the bootloader's state dir, e.g. its state volume)")
+    state_dir = Path(raw)
+    if not (state_dir / "phones.json").exists() and not (state_dir / "owner_genesis.json").exists():
+        raise _OwnerStoreRefused(f"no bootloader registry at {state_dir} (no phones.json) - name the live state dir")
+    lock = None
+    if write:
+        from recto.bootloader.owner_slots import StoreLockUnavailable, acquire_store_lock
+        try:
+            lock = acquire_store_lock(state_dir)
+        except StoreLockUnavailable as exc:
+            raise _OwnerStoreRefused(f"{exc.strerror or exc} - nothing changed") from exc
+        if lock is None:
+            raise _OwnerStoreRefused(
+                f"a bootloader holds {state_dir} - stop the bootloader first (e.g. docker stop <container>), run this "
+                "against its state, then start it again")
+    from recto.bootloader.state import StateStore
+    try:
+        return StateStore(state_dir=state_dir), lock
+    except Exception as exc:
+        if lock is not None:
+            lock.release()
+        # The store's error names the file that failed; the marker's hand repair is offered only for the marker.
+        advice = (" - a bad owner_genesis.json is repaired by hand ({\"state\": \"closed\"}), never by this command"
+                  if "owner_genesis.json" in str(exc) else " - repair or restore that file; nothing changed")
+        raise _OwnerStoreRefused(
+            f"the registry at {state_dir} cannot be read ({type(exc).__name__}: {exc}){advice}") from exc
+
+
+def _db_error(exc: BaseException) -> str:
+    """A store error as printed by the host CLI: a database error by its type and SQLSTATE only (a server message can
+    name the host); anything else by its type and text."""
+    if type(exc).__module__.split(".")[0] in ("psycopg", "psycopg_pool"):
+        sqlstate = getattr(exc, "sqlstate", None)
+        return f"{type(exc).__name__}{f' {sqlstate}' if sqlstate else ''}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _norm_ref(ref: str) -> str:
+    """A ref as the operator pasted it: the grouped form the cards and 403s print ('pk_0123 4567 ...') is the same ref.
+    Exact equality after this - never a prefix or a fuzzy match."""
+    return "".join(ref.split())
+
+
+def _close_owner_store(store) -> None:
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+
+
+def _owner_rows(store):
+    from recto.bootloader.state import SLOTS, phone_ref_of
+    return [(p, phone_ref_of(p.public_key_b64u)) for p in store.list_phones() if p.slot in SLOTS]
+
+
+def _cmd_bootloader_owner_slots(args, *, out, err):
+    """List the owner slots - slot, phone_id, the key-derived ref, the caller-chosen label, registered and last-seen
+    times, whether a poll key is delegated - and the genesis marker. --expect: exactly these refs, or exit 1."""
+    try:
+        store, _ = _open_owner_store(args, write=False)
+    except _OwnerStoreRefused as exc:
+        print(f"recto bootloader owner-slots: {exc}", file=err)
+        return 1
+    try:
+        return _print_owner_slots(store, args, out=out, err=err)
+    except Exception as exc:   # never BaseException: Ctrl-C still reaches main
+        print(f"recto bootloader owner-slots: the store failed ({_db_error(exc)}) - nothing changed", file=err)
+        return 1
+    finally:
+        _close_owner_store(store)
+
+
+def _print_owner_slots(store, args, *, out, err):
+    from collections import Counter
+    from datetime import datetime, timezone
+
+    def ts(v):
+        return datetime.fromtimestamp(v, timezone.utc).strftime("%Y-%m-%d %H:%MZ") if v else "-"
+
+    expected = None
+    if args.expect is not None:
+        items = [_norm_ref(r) for r in args.expect.split(",")]
+        if not all(items):
+            print("recto bootloader owner-slots: --expect has an empty item (an unset variable?) - name each phone "
+                  "ref, comma-separated; nothing compared", file=err)
+            return 2
+        expected = set(items)
+    rows = _owner_rows(store)
+    print(f"owner genesis: {store.get_owner_genesis() or 'undecided'}", file=out)
+    for p, ref in sorted(rows, key=lambda r: (r[0].slot, r[1])):
+        print(f"{p.slot:<9} {ref}  phone_id={p.phone_id}  label={p.device_label!r} (the caller's)  "
+              f"registered={ts(p.registered_at_unix)}  last_seen={ts(p.last_seen_unix)}  "
+              f"poll_key={'yes' if p.poll_public_key_b64u else 'NO'}", file=out)
+    if not rows:
+        print("(no owner phone)", file=out)
+    rc = 0
+    if store.get_owner_genesis() == "open" and rows:
+        print("!! owner genesis is OPEN while an owner slot is held - a genesis close did not land", file=out)
+        rc = 1
+    for slot, n in Counter(p.slot for p, _ in rows).items():
+        if n > 1:
+            print(f"!! the {slot} slot has {n} holders", file=out)
+            rc = 1
+    if expected is not None:
+        held = {ref for _, ref in rows}
+        if held != expected:
+            print(f"!! expected exactly {sorted(expected)}; the owner slots hold {sorted(held)}", file=out)
+            rc = 1
+        else:
+            print("the owner slots hold exactly the expected phones", file=out)
+    return rc
+
+
+def _cmd_bootloader_owner_reset(args, *, out, err):
+    """Remove the named owner phone from its slot (with its sessions and queue). The marker is written CLOSED first, so
+    a crash midway never leaves genesis open; --reopen-genesis writes OPEN only once no owner phone remains. A store
+    failure after the store opened is a named refusal that says what landed - never a traceback."""
+    from contextlib import nullcontext
+
+    try:
+        store, lock = _open_owner_store(args, write=True)
+    except _OwnerStoreRefused as exc:
+        print(f"recto bootloader owner-reset: {exc}", file=err)
+        return 1
+    progress: dict = {"closed": False, "removed": [], "removing": None, "step": None, "held": [], "writing": False}
+    try:
+        guard = store.registry_lock() if lock is None else nullcontext()
+        with guard:
+            return _owner_reset_locked(store, args, out=out, err=err, progress=progress)
+    except Exception as exc:   # never BaseException: Ctrl-C still reaches main
+        # Postgres: each write commits on its own; one that failed late may still have landed
+        hedge = " (on Postgres the failed write may still have landed)" if lock is None and progress["writing"] else ""
+        removed = ", ".join(f"{ref} was removed from the {slot} slot" for ref, slot in progress["removed"])
+        failed = ""
+        if progress["removing"] is not None:
+            ref, slot = progress["removing"]
+            if progress["step"] == "void":
+                # Its removal never ran; only the refusal of its approvals may have landed, in part
+                failed = f"{ref} was NOT removed: refusing its approvals failed, and some may already be refused"
+            else:
+                failed = f"{ref} was NOT removed from the {slot} slot{hedge}"
+                if lock is None:   # on Postgres the refusals before it landed; the file store keeps none to refuse
+                    failed += f"; any approval or request naming {ref} was refused first"
+        if failed and progress["removed"]:
+            # The all-lost path failed midway: the phones before it are gone, the rest are still held, and the CLOSED
+            # marker written first stays
+            landed = (f"{removed}; {failed}; genesis stays CLOSED - to finish, run `recto bootloader owner-reset "
+                      f"--every-owner-lost --confirm {','.join(progress['held'])} --reopen-genesis` against the same "
+                      "store")
+            if lock is None and progress["step"] == "revoke":   # the failed removal may have landed after all
+                landed += (f" (if `owner-slots` no longer shows {ref}, leave it out; if no owner phone remains, run "
+                           "`--reopen-genesis` alone)")
+        elif failed:
+            landed = f"nothing removed (the genesis marker was written CLOSED): {failed}"
+        elif progress["removed"]:
+            # The file store's failed write changed nothing, so genesis stays closed; on Postgres it may have landed.
+            stays = " and stays CLOSED" if lock is not None else ""
+            landed = (f"{removed}, but genesis could not be reopened{stays} - run `recto bootloader owner-reset "
+                      f"--reopen-genesis` alone against the same store, once no owner phone remains{hedge}")
+        elif progress["closed"]:
+            landed = f"nothing removed (the genesis marker was written CLOSED){hedge}"
+        else:
+            landed = f"nothing changed{hedge}"
+        print(f"recto bootloader owner-reset: the store failed ({_db_error(exc)}) - {landed}; read it with "
+              "`recto bootloader owner-slots` before running again", file=err)
+        return 1
+    finally:
+        _close_owner_store(store)
+        if lock is not None:
+            lock.release()
+
+
+def _owner_reset_locked(store, args, *, out, err, progress) -> int:
+    rows = _owner_rows(store)
+    if args.every_owner_lost:
+        return _owner_reset_every_owner_lost(store, args, rows, out=out, err=err, progress=progress)
+    if args.slot is None and args.confirm is None:
+        # Reopen alone: a store that holds no owner phone (the last one removed, or a store decided closed).
+        if not args.reopen_genesis:
+            print("recto bootloader owner-reset: name --slot and --confirm, or give --reopen-genesis alone", file=err)
+            return 1
+        if rows:
+            if len(rows) == 1:
+                p, ref = rows[0]
+                hint = f"to remove it: --slot {p.slot} --confirm {ref} --reopen-genesis"
+            else:
+                hint = ("revoke all but one from an owner phone in hand, over the network, then remove the last one here "
+                        "with --slot <slot> --confirm <ref> --reopen-genesis; if every owner phone is lost: "
+                        "--every-owner-lost --confirm <every ref> --reopen-genesis")
+            print(f"recto bootloader owner-reset: owner phones remain - {sorted(ref for _, ref in rows)}; genesis "
+                  f"stays closed ({hint})", file=err)
+            return 1
+        progress["writing"] = True   # before the call: a write that raises during its commit may still have landed
+        store.set_owner_genesis("open")
+        print("owner genesis reopened: the next owner code alone enrolls the first owner - pair the replacement now, "
+              "over the operator's own route", file=out)
+        return 0
+    if args.slot is None or args.confirm is None:
+        print("recto bootloader owner-reset: --slot and --confirm go together", file=err)
+        return 1
+    confirm = _norm_ref(args.confirm)
+    matched = next(((p, ref) for p, ref in rows if ref == confirm or p.phone_id == confirm), None)
+    if matched is None or matched[0].slot != args.slot:
+        tail = (" - no owner phone remains: `--reopen-genesis` alone reopens enrollment" if not rows
+                else " (read it with `recto bootloader owner-slots`)")
+        print(f"recto bootloader owner-reset: the {args.slot} slot does not hold {confirm} - nothing removed{tail}",
+              file=err)
+        return 1
+    target, target_ref = matched
+    remaining = [p for p, _ in rows if p.phone_id != target.phone_id]
+    if remaining:
+        # Ruled 2026-10-13: the host removes only the LAST owner phone. A lost non-sole phone is revoked over the
+        # network by another owner phone, 1-of-N.
+        print(f"recto bootloader owner-reset: {target_ref} is not the last owner phone ({len(remaining)} other owner "
+              "phone(s) remain). This command removes only the last owner phone; a non-sole owner phone is revoked over "
+              "the network by an owner phone in hand. If every owner phone is lost: --every-owner-lost --confirm "
+              "<every owner ref> --reopen-genesis. Nothing removed.", file=err)
+        return 1
+    if not remaining and not args.reopen_genesis:
+        print(f"recto bootloader owner-reset: {target_ref} is the LAST owner phone - removing it leaves no owner; run "
+              "again with --reopen-genesis so the next owner code alone enrolls its replacement", file=err)
+        return 1
+    progress["writing"] = True
+    store.set_owner_genesis("closed")
+    progress["closed"] = True
+    from recto.bootloader.owner_slots import void_owner_enrolls_for
+    progress["removing"] = (target_ref, target.slot)
+    progress["step"] = "void"
+    void_owner_enrolls_for(store, target.phone_id)   # its approvals go first: a failure leaves it held, never half-done
+    progress["step"] = "revoke"
+    if not store.revoke_phone(target.phone_id):
+        print(f"recto bootloader owner-reset: {target.phone_id} was not removed", file=err)
+        return 1
+    progress["removed"].append((target_ref, target.slot))
+    progress["removing"] = None
+    print(f"removed {target_ref} from the {args.slot} slot", file=out)
+    if args.reopen_genesis:
+        store.set_owner_genesis("open")
+        print("owner genesis reopened: the next owner code alone enrolls the first owner - pair the replacement now, "
+              "over the operator's own route", file=out)
+    return 0
+
+
+def _owner_reset_every_owner_lost(store, args, rows, *, out, err, progress) -> int:
+    """Ruled 2026-10-13: when EVERY owner phone is lost, the host removes them all - only when --confirm names exactly
+    the owner phones the slots hold, and with --reopen-genesis. A single named non-last phone is still refused; member
+    phones are untouched. The marker is written CLOSED first."""
+    def refuse(why: str) -> int:
+        print(f"recto bootloader owner-reset: {why} - nothing removed", file=err)
+        return 1
+
+    if args.slot is not None:
+        return refuse("--every-owner-lost takes no --slot; --confirm names every owner phone")
+    if not args.reopen_genesis:
+        return refuse("--every-owner-lost needs --reopen-genesis: with no owner phone left, only genesis can enroll one")
+    if not args.confirm:
+        return refuse("--every-owner-lost needs --confirm naming every owner phone held, comma-separated")
+    items = [_norm_ref(r) for r in args.confirm.split(",")]
+    if not all(items):
+        return refuse("--confirm has an empty item (an unset variable?)")
+    if not rows:
+        return refuse("no owner phone remains - `--reopen-genesis` alone reopens enrollment")
+    held = sorted({ref for _, ref in rows})   # each key once: a ref names every record of its key
+    targets = []
+    for p, ref in rows:
+        if ref in items or p.phone_id in items:
+            targets.append((p, ref))
+    named = {ref for _, ref in targets} | {p.phone_id for p, _ in targets}
+    if len(targets) != len(rows) or len(set(items)) != len(items) or any(i not in named for i in items):
+        return refuse(f"--confirm must name every owner phone the slots hold, exactly; they hold {held}")
+    progress["writing"] = True
+    store.set_owner_genesis("closed")
+    progress["closed"] = True
+    from recto.bootloader.owner_slots import void_owner_enrolls_for
+    for i, (p, ref) in enumerate(targets):
+        progress["removing"] = (ref, p.slot)
+        progress["held"] = list(dict.fromkeys(r for _, r in targets[i:]))   # what a failure here leaves held, each
+        # key once (a store from before one spelling per key can hold two records of one key; its ref names both)
+        progress["step"] = "void"
+        void_owner_enrolls_for(store, p.phone_id)   # its approvals go first: a failure leaves it held, never half-done
+        progress["step"] = "revoke"
+        if not store.revoke_phone(p.phone_id):
+            print(f"recto bootloader owner-reset: {p.phone_id} was not removed", file=err)
+            return 1
+        progress["removed"].append((ref, p.slot))
+        progress["removing"] = None
+        print(f"removed {ref} from the {p.slot} slot", file=out)
+    store.set_owner_genesis("open")
+    print("owner genesis reopened: the next owner code alone enrolls the first owner - pair the replacement now, "
+          "over the operator's own route", file=out)
+    return 0
 
 
 def _default_credman_factory(service: str) -> CredManSource:

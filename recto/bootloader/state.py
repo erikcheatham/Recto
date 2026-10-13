@@ -30,15 +30,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import secrets
 from abc import ABC, abstractmethod
 import os
 import threading
 import time
 import uuid
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 __all__ = [
     "PhoneRegistration",
@@ -292,9 +294,22 @@ class PhoneRegistration:
 
 SLOTS = ("primary", "recovery")
 
+# THE OWNER-GENESIS MARKER (hard rule 14.4, amended): "open" until the first owner enrolls, "closed" after.
+# Only the operator's host reset writes "open" again.
+OWNER_GENESIS_STATES = ("open", "closed")
+
 # THE MEMBER PLANE (2026-09-30): where a consumer's member phone registers - beside the business slots, never one of
 # them. Not in SLOTS by construction, so every "who holds a slot" question skips it.
 MEMBER_SLOT = "member"
+
+
+@contextmanager
+def _naming(path: Path) -> Iterator[None]:
+    """A file that cannot be parsed or does not have the expected shape fails naming itself (an OSError already does)."""
+    try:
+        yield
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError(f"{path}: {type(exc).__name__}: {exc}") from exc
 
 
 def _merge_onto_existing(
@@ -1773,6 +1788,10 @@ class CapabilityResult:
         return time.time() >= self.expires_at_unix
 
 
+class RegistryLockUnavailable(RuntimeError):
+    """The registry lock was not granted in bounded time - another holder kept it too long."""
+
+
 class StateStoreBase(ABC):
     """Abstract persistence contract for bootloader state.
 
@@ -1974,6 +1993,56 @@ class StateStoreBase(ABC):
     @abstractmethod
     def consume_member_challenge(self, challenge: str) -> bool: ...
 
+    # THE OWNER SLOTS (hard rule 14.4, amended). A challenge bought with an OWNER code is its own kind, and only it
+    # registers into an owner slot. A challenge fetched with no code (the plain kind above) serves revoke and never
+    # registers: before this kind existed a codeless challenge bought the same authority a code buys.
+    @abstractmethod
+    def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]: ...
+    @abstractmethod
+    def is_owner_challenge(self, challenge: str) -> bool:
+        """Peek, never consume: registration asks the kind before anything else."""
+    @abstractmethod
+    def consume_owner_challenge(self, challenge: str) -> bool: ...
+
+    # The owner-genesis marker: "open" until the first owner enrolls (an owner code alone enrolls it), "closed" after.
+    # None = never decided (a store from before the marker); the server decides it once.
+    @abstractmethod
+    def get_owner_genesis(self) -> str | None: ...
+    @abstractmethod
+    def set_owner_genesis(self, state: str) -> None: ...
+
+    # Owner-enroll records, keyed by the approval card's request_id: what the card binds (the incoming key, the slot,
+    # the approvers, the occupant) and where it stands. A record carries its own expires_at_unix.
+    @abstractmethod
+    def put_owner_enroll(self, record: dict[str, Any]) -> None: ...
+    @abstractmethod
+    def get_owner_enroll(self, request_id: str) -> dict[str, Any] | None: ...
+    @abstractmethod
+    def list_owner_enrolls(self) -> list[dict[str, Any]]: ...
+    @abstractmethod
+    def delete_owner_enroll(self, request_id: str) -> dict[str, Any] | None: ...
+
+    # The push fields of a phone the store still holds - never an upsert, so a removed phone stays removed.
+    @abstractmethod
+    def update_phone_push(self, phone_id: str, push_token: str, push_platform: str) -> bool: ...
+
+    # A displacement in ONE write: the occupant (with its sessions and queue) goes and the incoming registration lands
+    # together, or nothing changes. None when the occupant is no longer held. Two writes could leave the slot empty.
+    @abstractmethod
+    def replace_phone(self, occupant_phone_id: str, reg: PhoneRegistration) -> PhoneRegistration | None: ...
+
+    @abstractmethod
+    def has_any_session(self) -> bool: ...
+
+    # registry_lock's refusal when it cannot be had in bounded time (Postgres: another instance holds it too long).
+    # The server answers it 503; the host CLI prints it as a named refusal.
+    @abstractmethod
+    def registry_lock(self) -> AbstractContextManager[None]:
+        """One lock over every owner-slot decision: the slot claim, the last-owner guard, the genesis close and the
+        approval record's transitions. Re-entrant on one thread: a holder may take it again, and only the outermost
+        exit lets it go. The file backend's is a process lock; Postgres adds an advisory lock so instances sharing one
+        database serialize too."""
+
 
 class StateStore(StateStoreBase):
     """Thread-safe persistence for bootloader state.
@@ -1999,6 +2068,13 @@ class StateStore(StateStoreBase):
         # THE MEMBER PLANE (2026-09-30): member codes + their challenges, apart from the owner's.
         self._member_pairing_codes: dict[str, int] = {}
         self._member_challenges: dict[str, int] = {}
+        # THE OWNER SLOTS: owner-code challenges, the genesis marker (owner_genesis.json; loaded below), the
+        # owner-enroll records (in-memory - a restart means re-pairing, as with the pending queue) and the
+        # registry lock over every owner-slot decision.
+        self._owner_challenges: dict[str, int] = {}
+        self._owner_genesis: str | None = None
+        self._owner_enrolls: dict[str, dict[str, Any]] = {}
+        self._registry_lock = threading.RLock()
         # Resolved capability requests waiting to be polled by the
         # requesting agent. In-memory only at v1 (purged on bootloader
         # restart, same as the pending queue). Keyed by request_id.
@@ -2047,8 +2123,11 @@ class StateStore(StateStoreBase):
     def register_phone(self, reg: PhoneRegistration) -> PhoneRegistration:
         with self._lock:
             stored = _merge_onto_existing(self._find_by_pubkey_locked(reg.public_key_b64u), reg)
-            self._phones[stored.phone_id] = stored
-            self._save_phones()
+            phones = dict(self._phones)
+            phones[stored.phone_id] = stored
+            # Disk first, memory after it lands: a failed write leaves the two agreeing.
+            self._write_phones(phones)
+            self._phones = phones
             return stored
 
     def get_phone(self, phone_id: str) -> PhoneRegistration | None:
@@ -2069,7 +2148,9 @@ class StateStore(StateStoreBase):
         with self._lock:
             if phone_id not in self._phones:
                 return False
-            del self._phones[phone_id]
+            phones = {k: p for k, p in self._phones.items() if k != phone_id}
+            self._write_phones(phones)
+            self._phones = phones
             # Drop any sessions / pending tied to this phone.
             self._sessions = {
                 k: s for k, s in self._sessions.items() if s.phone_id != phone_id
@@ -2077,9 +2158,7 @@ class StateStore(StateStoreBase):
             self._pending = {
                 k: p for k, p in self._pending.items() if p.phone_id != phone_id
             }
-            self._save_phones()
-            self._save_sessions()
-            self._save_pending()
+            self._save_after_phones()
             return True
 
     # ------------------------------------------------------------------
@@ -2761,12 +2840,21 @@ class StateStore(StateStoreBase):
     def issue_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
         # 6-digit human-readable; collision risk acceptable for
         # personal-use (a collision just refreshes the code's expiry).
-        code = f"{secrets.randbelow(1_000_000):06d}"
         exp = int(time.time()) + ttl_seconds
         with self._lock:
             self._purge_challenges()
+            code = self._unique_code_locked()
             self._pairing_codes[code] = exp
         return code, exp
+
+    def _unique_code_locked(self) -> str:
+        # Owner and member codes share one 6-digit space and the challenge GET tries the owner code first, so a
+        # member code equal to a live owner code would buy an OWNER challenge. A new code is unique across both.
+        for _ in range(64):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            if code not in self._pairing_codes and code not in self._member_pairing_codes:
+                return code
+        raise RuntimeError("no free pairing code after 64 draws")
 
     def consume_pairing_code(self, code: str) -> bool:
         with self._lock:
@@ -2775,10 +2863,10 @@ class StateStore(StateStoreBase):
         return exp is not None and time.time() < exp
 
     def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
-        code = f"{secrets.randbelow(1_000_000):06d}"
         exp = int(time.time()) + ttl_seconds
         with self._lock:
             self._purge_challenges()
+            code = self._unique_code_locked()
             self._member_pairing_codes[code] = exp
         return code, exp
 
@@ -2807,6 +2895,99 @@ class StateStore(StateStoreBase):
             exp = self._member_challenges.pop(challenge, None)
         return exp is not None and time.time() < exp
 
+    def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+        exp = int(time.time()) + ttl_seconds
+        with self._lock:
+            self._purge_challenges()
+            self._owner_challenges[c] = exp
+        return c, exp
+
+    def is_owner_challenge(self, challenge: str) -> bool:
+        with self._lock:
+            exp = self._owner_challenges.get(challenge)
+        return exp is not None and time.time() < exp
+
+    def consume_owner_challenge(self, challenge: str) -> bool:
+        with self._lock:
+            self._purge_challenges()
+            exp = self._owner_challenges.pop(challenge, None)
+        return exp is not None and time.time() < exp
+
+    def get_owner_genesis(self) -> str | None:
+        with self._lock:
+            return self._owner_genesis
+
+    def set_owner_genesis(self, state: str) -> None:
+        if state not in OWNER_GENESIS_STATES:
+            raise ValueError(f"owner genesis must be one of {OWNER_GENESIS_STATES}; got {state!r}")
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._atomic_write(self._dir / "owner_genesis.json", {"state": state})
+            self._owner_genesis = state
+
+    def put_owner_enroll(self, record: dict[str, Any]) -> None:
+        with self._lock:
+            self._owner_enrolls[record["request_id"]] = dict(record)
+
+    def get_owner_enroll(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._purge_owner_enrolls()
+            rec = self._owner_enrolls.get(request_id)
+            return dict(rec) if rec is not None else None
+
+    def list_owner_enrolls(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._purge_owner_enrolls()
+            return [dict(r) for r in self._owner_enrolls.values()]
+
+    def delete_owner_enroll(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._purge_owner_enrolls()
+            return self._owner_enrolls.pop(request_id, None)
+
+    def _purge_owner_enrolls(self) -> None:
+        # Caller holds the lock.
+        now = time.time()
+        self._owner_enrolls = {k: r for k, r in self._owner_enrolls.items() if r.get("expires_at_unix", 0) > now}
+
+    def update_phone_push(self, phone_id: str, push_token: str, push_platform: str) -> bool:
+        with self._lock:
+            phone = self._phones.get(phone_id)
+            if phone is None:
+                return False
+            phones = dict(self._phones)
+            phones[phone_id] = replace(
+                phone, push_token=push_token, push_platform=push_platform, last_seen_unix=int(time.time()))
+            self._write_phones(phones)
+            self._phones = phones
+            return True
+
+    def replace_phone(self, occupant_phone_id: str, reg: PhoneRegistration) -> PhoneRegistration | None:
+        with self._lock:
+            if occupant_phone_id not in self._phones:
+                return None
+            phones = {k: p for k, p in self._phones.items() if k != occupant_phone_id}
+            existing = next((p for p in phones.values() if p.public_key_b64u == reg.public_key_b64u), None)
+            stored = _merge_onto_existing(existing, reg)
+            phones[stored.phone_id] = stored
+            # One phones.json write; memory follows only after it lands.
+            self._write_phones(phones)
+            self._phones = phones
+            self._sessions = {k: s for k, s in self._sessions.items() if s.phone_id != occupant_phone_id}
+            self._pending = {k: p for k, p in self._pending.items() if p.phone_id != occupant_phone_id}
+            self._save_after_phones()
+            return stored
+
+    def has_any_session(self) -> bool:
+        with self._lock:
+            return bool(self._sessions)
+
+    @contextmanager
+    def registry_lock(self) -> Iterator[None]:
+        with self._registry_lock:
+            yield
+
     def _purge_challenges(self) -> None:
         # Caller holds the lock.
         now = time.time()
@@ -2818,25 +2999,29 @@ class StateStore(StateStoreBase):
         }
         self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
         self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
+        self._owner_challenges = {c: e for c, e in self._owner_challenges.items() if e > now}
 
     # ------------------------------------------------------------------
     # Disk I/O (private)
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
+        # Each file's failure names the file: an operator repairing a store must know which one is bad.
         with self._lock:
             phones_path = self._dir / "phones.json"
             if phones_path.exists():
-                raw = json.loads(phones_path.read_text(encoding="utf-8"))
-                for r in raw.get("phones", []):
-                    r["supported_algorithms"] = tuple(r["supported_algorithms"])
-                    self._phones[r["phone_id"]] = PhoneRegistration(**r)
+                with _naming(phones_path):
+                    raw = json.loads(phones_path.read_text(encoding="utf-8"))
+                    for r in raw.get("phones", []):
+                        r["supported_algorithms"] = tuple(r["supported_algorithms"])
+                        self._phones[r["phone_id"]] = PhoneRegistration(**r)
             sessions_path = self._dir / "sessions.json"
             if sessions_path.exists():
-                raw = json.loads(sessions_path.read_text(encoding="utf-8"))
-                for s in raw.get("sessions", []):
-                    sess = Session(**s)
-                    self._sessions[(sess.service, sess.secret)] = sess
+                with _naming(sessions_path):
+                    raw = json.loads(sessions_path.read_text(encoding="utf-8"))
+                    for s in raw.get("sessions", []):
+                        sess = Session(**s)
+                        self._sessions[(sess.service, sess.secret)] = sess
             # Pending requests are intentionally NOT reloaded across
             # bootloader restarts. In-flight requests fail; the child
             # decides whether to retry. This is safer than carrying
@@ -2845,24 +3030,42 @@ class StateStore(StateStoreBase):
             # Phase 5 Wave C part 2: revocation entries DO survive
             # restart -- a revocation that was committed yesterday
             # stays committed across a bootloader bounce.
+            genesis_path = self._dir / "owner_genesis.json"
+            if genesis_path.exists():
+                with _naming(genesis_path):
+                    state = json.loads(genesis_path.read_text(encoding="utf-8")).get("state")
+                if state not in OWNER_GENESIS_STATES:
+                    raise ValueError(f"{genesis_path} holds {state!r}; expected one of {OWNER_GENESIS_STATES}")
+                self._owner_genesis = state
             revocations_path = self._dir / "revocations.json"
             if revocations_path.exists():
-                raw = json.loads(revocations_path.read_text(encoding="utf-8"))
-                for r in raw.get("revocations", []):
-                    entry = RevocationEntry(**r)
-                    # Skip entries that have already aged out at load
-                    # time. The next save_revocations call (triggered
-                    # by any add or by the next purge_expired sweep)
-                    # writes the cleaned list.
-                    if not entry.is_expired:
-                        self._revocations[entry.jti] = entry
+                with _naming(revocations_path):
+                    raw = json.loads(revocations_path.read_text(encoding="utf-8"))
+                    for r in raw.get("revocations", []):
+                        entry = RevocationEntry(**r)
+                        # Skip entries that have already aged out at load
+                        # time. The next save_revocations call (triggered
+                        # by any add or by the next purge_expired sweep)
+                        # writes the cleaned list.
+                        if not entry.is_expired:
+                            self._revocations[entry.jti] = entry
 
     def _save_phones(self) -> None:
-        path = self._dir / "phones.json"
-        body = {
-            "phones": [self._asdict_phone(p) for p in self._phones.values()],
-        }
-        self._atomic_write(path, body)
+        self._write_phones(self._phones)
+
+    def _save_after_phones(self) -> None:
+        """Once phones.json has landed the act is done: a failed sessions.json or pending.json write is logged, never
+        raised. Memory already dropped the rows, and the next save of either file rewrites it whole. Caller holds the
+        lock."""
+        for name, save in (("sessions.json", self._save_sessions), ("pending.json", self._save_pending)):
+            try:
+                save()
+            except OSError as exc:
+                logging.getLogger("recto.bootloader.state").warning(
+                    "%s not written after a phone change (%s) - the next save rewrites it", name, exc.strerror)
+
+    def _write_phones(self, phones: dict[str, PhoneRegistration]) -> None:
+        self._atomic_write(self._dir / "phones.json", {"phones": [self._asdict_phone(p) for p in phones.values()]})
 
     def _save_sessions(self) -> None:
         path = self._dir / "sessions.json"

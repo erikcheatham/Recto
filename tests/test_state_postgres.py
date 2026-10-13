@@ -531,3 +531,422 @@ def test_challenge_store_adapter_delegates_to_state(store):
     # And the reverse direction.
     c, _ = store.issue_challenge(ttl_seconds=60)
     assert cs.consume_challenge(c) is True
+
+
+# ----------------------------------------------------------------------
+# THE OWNER SLOTS (hard rule 14.4, amended)
+# ----------------------------------------------------------------------
+
+def test_owner_challenge_peek_never_consumes_and_kinds_are_isolated(store):
+    c, _ = store.issue_owner_challenge(ttl_seconds=60)
+    plain, _ = store.issue_challenge(ttl_seconds=60)
+    member, _ = store.issue_member_challenge(ttl_seconds=60)
+    assert store.is_owner_challenge(c) is True
+    assert store.is_owner_challenge(c) is True, "the peek consumed the challenge"
+    assert store.is_owner_challenge(plain) is False, "a codeless challenge answered as an owner one"
+    assert store.is_owner_challenge(member) is False
+    assert store.consume_challenge(c) is False
+    assert store.consume_member_challenge(c) is False
+    assert store.consume_owner_challenge(plain) is False
+    assert store.consume_owner_challenge(c) is True
+    assert store.consume_owner_challenge(c) is False
+
+
+def test_owner_challenge_expired_is_not_an_owner_challenge(store):
+    c, _ = store.issue_owner_challenge(ttl_seconds=-1)
+    assert store.is_owner_challenge(c) is False
+    assert store.consume_owner_challenge(c) is False
+
+
+def test_owner_genesis_marker_round_trip(store):
+    assert store.get_owner_genesis() is None
+    store.set_owner_genesis("open")
+    assert store.get_owner_genesis() == "open"
+    store.set_owner_genesis("closed")
+    assert store.get_owner_genesis() == "closed"
+    with pytest.raises(ValueError):
+        store.set_owner_genesis("ajar")
+    assert store.get_owner_genesis() == "closed"
+
+
+def test_owner_genesis_marker_survives_a_new_file_store(tmp_path):
+    StateStore(state_dir=tmp_path).set_owner_genesis("closed")
+    assert StateStore(state_dir=tmp_path).get_owner_genesis() == "closed"
+
+
+def test_owner_enroll_records_put_get_list_take_and_expire(store):
+    now = int(time.time())
+    live = {"request_id": "r-live", "slot": "recovery", "state": "pending", "cards": {"c1": "pk_a"},
+            "expires_at_unix": now + 300}
+    dead = {"request_id": "r-dead", "slot": "primary", "state": "pending", "cards": {},
+            "expires_at_unix": now - 1}
+    store.put_owner_enroll(live)
+    store.put_owner_enroll(dead)
+    assert store.get_owner_enroll("r-live")["cards"] == {"c1": "pk_a"}
+    assert store.get_owner_enroll("r-dead") is None
+    assert [r["request_id"] for r in store.list_owner_enrolls()] == ["r-live"]
+    store.put_owner_enroll({**live, "state": "approved"})
+    assert store.get_owner_enroll("r-live")["state"] == "approved"
+    assert store.delete_owner_enroll("r-live")["request_id"] == "r-live"
+    assert store.delete_owner_enroll("r-live") is None
+    assert store.list_owner_enrolls() == []
+
+
+def test_update_phone_push_updates_only_a_held_phone(store):
+    p = _phone("pusher", pubkey="push_key_b64u")
+    from dataclasses import replace
+    p = replace(p, slot="recovery")
+    store.register_phone(p)
+    assert store.update_phone_push(p.phone_id, "tok-1", "fcm") is True
+    got = store.get_phone(p.phone_id)
+    assert (got.push_token, got.push_platform, got.slot) == ("tok-1", "fcm", "recovery")
+    assert store.revoke_phone(p.phone_id) is True
+    assert store.update_phone_push(p.phone_id, "tok-2", "apns") is False
+    assert store.get_phone(p.phone_id) is None, "the push update re-inserted a removed phone"
+
+
+def test_has_any_session(store):
+    assert store.has_any_session() is False
+    store.put_session(_session())
+    assert store.has_any_session() is True
+
+
+def test_registry_lock_is_reentrant(store):
+    import threading
+
+    done = threading.Event()
+
+    def nested():
+        with store.registry_lock():
+            with store.registry_lock():
+                store.register_phone(_phone("locked", pubkey="lock_key_b64u"))
+        done.set()
+
+    worker = threading.Thread(target=nested, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert done.is_set(), "a nested registry_lock waited on itself"
+    assert store.get_phone(_phone("x", pubkey="lock_key_b64u").phone_id) is not None
+
+
+def test_owner_and_member_codes_never_collide(store, monkeypatch):
+    import secrets
+
+    draws = iter([123456, 123456, 654321, 111111, 111111, 222222])
+    monkeypatch.setattr(secrets, "randbelow", lambda n: next(draws))
+    member, _ = store.issue_member_pairing_code(ttl_seconds=300)
+    owner, _ = store.issue_pairing_code(ttl_seconds=300)
+    assert (member, owner) == ("123456", "654321"), "an owner code drawn equal to a live member code"
+    owner2, _ = store.issue_pairing_code(ttl_seconds=300)
+    member2, _ = store.issue_member_pairing_code(ttl_seconds=300)
+    assert (owner2, member2) == ("111111", "222222"), "a member code equal to a live owner code would buy an OWNER challenge"
+
+
+def test_a_plain_challenge_survives_a_flood(store):
+    """A codeless challenge serves revoke; no flood of them evicts a phone's revoke challenge."""
+    first, _ = store.issue_challenge(ttl_seconds=600)
+    for _ in range(1100):
+        store.issue_challenge(ttl_seconds=600)
+    assert store.consume_challenge(first) is True
+
+
+def _slotted(label: str, pubkey: str, slot: str) -> PhoneRegistration:
+    return PhoneRegistration.new(device_label=label, public_key_b64u=pubkey, supported_algorithms=("ed25519",),
+                                 slot=slot)
+
+
+def test_replace_phone_swaps_the_occupant_in_one_act(store):
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    other = store.register_phone(_slotted("other", "other_key_b64u", "recovery"))
+    store.put_session(_session(phone_id=occupant.phone_id))
+    store.add_pending(_pending("occupant-card", phone_id=occupant.phone_id))
+    store.add_pending(_pending("other-card", phone_id=other.phone_id))
+    stored = store.replace_phone(occupant.phone_id, _slotted("new", "incoming_key_b64u", "primary"))
+    assert stored is not None and stored.slot == "primary"
+    assert {p.phone_id for p in store.list_phones()} == {stored.phone_id, other.phone_id}
+    assert store.get_phone(occupant.phone_id) is None
+    assert store.has_any_session() is False, "the displaced phone's session survived"
+    assert store.list_pending_for_phone(occupant.phone_id) == []
+    assert [p.request_id for p in store.list_pending_for_phone(other.phone_id)] == ["other-card"]
+
+
+def test_replace_phone_that_fails_midway_keeps_the_occupant(store, monkeypatch):
+    """The displacement is one act: when building the incoming row fails after the occupant's rows would have gone,
+    the occupant, its session and its queue are all still there (Postgres: the transaction rolled back)."""
+    import recto.bootloader.state as state_module
+
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    store.put_session(_session(phone_id=occupant.phone_id))
+    store.add_pending(_pending("occupant-card", phone_id=occupant.phone_id))
+
+    def broken(*_a, **_k):
+        raise RuntimeError("the incoming row could not be built")
+
+    monkeypatch.setattr(state_module, "_merge_onto_existing", broken)
+    if not isinstance(store, StateStore):
+        import recto.bootloader.state_postgres as pg_module
+        monkeypatch.setattr(pg_module, "_merge_onto_existing", broken)
+    with pytest.raises(RuntimeError):
+        store.replace_phone(occupant.phone_id, _slotted("new", "incoming_key_b64u", "primary"))
+    monkeypatch.undo()
+    assert [p.phone_id for p in store.list_phones()] == [occupant.phone_id]
+    assert store.has_any_session() is True
+    assert [p.request_id for p in store.list_pending_for_phone(occupant.phone_id)] == ["occupant-card"]
+
+
+# 4 is past the three writes a one-act replace makes: it injects nothing on correct code, and turns a revoke-then-register
+# (two-act) displacement red.
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 4])
+def test_replace_phone_never_leaves_the_slot_empty_or_doubled_on_a_failed_write(tmp_path, monkeypatch, fail_at):
+    """File store: whichever write fails, the primary slot holds exactly one key - the occupant's or the incoming
+    one - and memory agrees with disk."""
+    store = StateStore(state_dir=tmp_path)
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    store.put_session(_session(phone_id=occupant.phone_id))
+    store.add_pending(_pending("occupant-card", phone_id=occupant.phone_id))
+    real, calls = store._atomic_write, [0]
+
+    def failing(path, body):
+        calls[0] += 1
+        if calls[0] == fail_at:
+            raise OSError(28, "no space left on device")
+        return real(path, body)
+
+    monkeypatch.setattr(store, "_atomic_write", failing)
+    try:
+        store.replace_phone(occupant.phone_id, _slotted("new", "incoming_key_b64u", "primary"))
+    except OSError:
+        pass
+    monkeypatch.undo()
+    in_memory = [p.public_key_b64u for p in store.list_phones() if p.slot == "primary"]
+    on_disk = [p.public_key_b64u for p in StateStore(state_dir=tmp_path).list_phones() if p.slot == "primary"]
+    assert in_memory in (["occupant_key_b64u"], ["incoming_key_b64u"]), in_memory
+    assert on_disk == in_memory
+
+
+def test_replace_phone_changes_nothing_when_the_occupant_is_gone(store):
+    other = store.register_phone(_slotted("other", "other_key_b64u", "recovery"))
+    assert store.replace_phone("pk_0000000000000000", _slotted("new", "incoming_key_b64u", "primary")) is None
+    assert [p.phone_id for p in store.list_phones()] == [other.phone_id]
+
+
+@pytest.mark.parametrize("store", ["postgres"], indirect=True)   # no [file] item: the Postgres job skips nothing
+def test_postgres_owner_genesis_refuses_an_unknown_value(store):
+    from psycopg.types.json import Jsonb
+    with store._pool.connection() as conn:  # noqa: SLF001 - a corrupted row, written behind the store's back
+        conn.execute(store._q("INSERT INTO {schema}.registry_meta (key, value) VALUES ('owner_genesis', %s)"),
+                     (Jsonb({"state": "ajar"}),))
+    with pytest.raises(ValueError):
+        store.get_owner_genesis()
+
+
+@pytest.mark.parametrize("store", ["postgres"], indirect=True)
+def test_postgres_registry_lock_serializes_two_instances(store):
+    import threading
+    from typing import Any
+
+    from recto.bootloader.state_postgres import PostgresStateStore
+
+    second = PostgresStateStore(PG_DSN, schema=store._schema)  # noqa: SLF001
+    key = store._registry_lock_key  # noqa: SLF001
+    try:
+        with second._pool.connection() as probe_conn:  # noqa: SLF001 - a probe that never blocks
+            probe_conn.autocommit = True
+
+            def free() -> bool:
+                return probe_conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (key,)).fetchone()[0]
+
+            outcome: dict[str, Any] = {}
+
+            def held_twice() -> None:
+                with store.registry_lock():
+                    with store.registry_lock():          # nested on one thread: one hold, no self-deadlock
+                        outcome["inner"] = free()
+                    outcome["after_inner"] = free()
+                outcome["after_outer"] = free()
+
+            worker = threading.Thread(target=held_twice, daemon=True)
+            worker.start()
+            worker.join(timeout=10)
+            assert not worker.is_alive(), "registry_lock hung (a nested hold waited on itself?)"
+            assert outcome == {"inner": False, "after_inner": False, "after_outer": True}, outcome
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize("act", ["register-new", "register-merge", "revoke", "push", "replace"])
+def test_a_failed_phones_write_changes_neither_memory_nor_disk(tmp_path, monkeypatch, act):
+    """File store: phones.json is written first and memory follows only once it lands, for every act that changes it."""
+    store = StateStore(state_dir=tmp_path)
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    other = store.register_phone(_slotted("other", "other_key_b64u", "recovery"))
+    before = store.list_phones()
+    real = store._atomic_write
+
+    def failing(path, body):
+        if os.path.basename(str(path)) == "phones.json":
+            raise OSError(28, "no space left on device")
+        return real(path, body)
+
+    monkeypatch.setattr(store, "_atomic_write", failing)
+    with pytest.raises(OSError):
+        if act == "register-new":
+            store.register_phone(_slotted("new", "new_key_b64u", "primary"))
+        elif act == "register-merge":
+            store.register_phone(_slotted("renamed", "other_key_b64u", "recovery"))
+        elif act == "revoke":
+            store.revoke_phone(occupant.phone_id)
+        elif act == "push":
+            store.update_phone_push(other.phone_id, "tok", "fcm")
+        else:
+            store.replace_phone(occupant.phone_id, _slotted("new", "new_key_b64u", "primary"))
+    monkeypatch.undo()
+    assert store.list_phones() == StateStore(state_dir=tmp_path).list_phones() == before
+
+
+@pytest.mark.parametrize("bad", ["sessions.json", "pending.json"])
+def test_a_phone_change_that_landed_is_done_when_a_later_file_fails(tmp_path, monkeypatch, caplog, bad):
+    """Once phones.json has landed, a failed sessions/pending write is logged and the act reports done."""
+    store = StateStore(state_dir=tmp_path)
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    other = store.register_phone(_slotted("other", "other_key_b64u", "recovery"))
+    store.put_session(_session(phone_id=occupant.phone_id))
+    store.add_pending(_pending("occupant-card", phone_id=occupant.phone_id))
+    real = store._atomic_write
+
+    def failing(path, body):
+        if os.path.basename(str(path)) == bad:
+            raise OSError(28, "no space left on device")
+        return real(path, body)
+
+    monkeypatch.setattr(store, "_atomic_write", failing)
+    assert store.revoke_phone(other.phone_id) is True
+    stored = store.replace_phone(occupant.phone_id, _slotted("new", "new_key_b64u", "primary"))
+    assert stored is not None
+    monkeypatch.undo()
+    assert [p.phone_id for p in store.list_phones()] == [stored.phone_id]
+    assert [p.phone_id for p in StateStore(state_dir=tmp_path).list_phones()] == [stored.phone_id]
+    said = [r.getMessage() for r in caplog.records if r.name == "recto.bootloader.state"]
+    assert len(said) == 2 and all(m.startswith(f"{bad} not written after a phone change") for m in said), said
+
+
+@pytest.mark.parametrize("name", ["phones.json", "sessions.json", "owner_genesis.json", "revocations.json"])
+def test_a_corrupt_store_file_is_named(tmp_path, name):
+    (tmp_path / name).write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match=name.replace(".", r"\.")):
+        StateStore(state_dir=tmp_path)
+
+
+def test_a_store_file_of_the_wrong_shape_is_named(tmp_path):
+    (tmp_path / "phones.json").write_text('{"phones": [{"no_such_field": 1}]}', encoding="utf-8")
+    with pytest.raises(ValueError, match="phones.json"):
+        StateStore(state_dir=tmp_path)
+
+
+def test_replace_phone_writes_each_file_once(tmp_path, monkeypatch):
+    store = StateStore(state_dir=tmp_path)
+    occupant = store.register_phone(_slotted("old", "occupant_key_b64u", "primary"))
+    store.put_session(_session(phone_id=occupant.phone_id))
+    store.add_pending(_pending("occupant-card", phone_id=occupant.phone_id))
+    real, written = store._atomic_write, []
+
+    def spy(path, body):
+        written.append(os.path.basename(str(path)))
+        return real(path, body)
+
+    monkeypatch.setattr(store, "_atomic_write", spy)
+    store.replace_phone(occupant.phone_id, _slotted("new", "incoming_key_b64u", "primary"))
+    assert written == ["phones.json", "sessions.json", "pending.json"], written
+
+
+def test_the_cli_never_creates_a_mistyped_schema(monkeypatch):
+    """The host CLI probes before it constructs the store (whose DDL would CREATE a mistyped schema, empty)."""
+    if not PG_DSN:
+        pytest.skip("RECTO_TEST_POSTGRES_DSN not set -- postgres arm skipped")
+    psycopg = pytest.importorskip("psycopg", reason="recto[postgres] not installed")
+    import io
+
+    from recto.cli import main
+
+    schema = f"recto_missing_{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("RECTO_STATE_BACKEND", "postgres")
+    monkeypatch.setenv("RECTO_POSTGRES_DSN", PG_DSN)
+    monkeypatch.setenv("RECTO_POSTGRES_SCHEMA", schema)
+    out, err = io.StringIO(), io.StringIO()
+    assert main(["bootloader", "owner-slots"], stdout=out, stderr=err) == 1
+    assert "no bootloader registry" in err.getvalue()
+    with psycopg.connect(PG_DSN) as conn:
+        assert conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                            (schema,)).fetchone() is None, "the refused command created the schema"
+
+
+@pytest.mark.parametrize("store", ["postgres"], indirect=True)
+def test_postgres_registry_lock_refuses_by_name_when_another_session_holds_it(store, monkeypatch):
+    """A real contention: a session lock on the key held outside the store; registry_lock refuses by name within its
+    bound, then is granted once the holder lets go (the refused attempt rolled back and returned its connection)."""
+    import threading
+
+    import psycopg
+    import recto.bootloader.state_postgres as spg
+    from recto.bootloader.state import RegistryLockUnavailable
+
+    monkeypatch.setattr(spg, "REGISTRY_LOCK_WAIT_SECONDS", 1)
+    key = store._registry_lock_key  # noqa: SLF001
+    with psycopg.connect(PG_DSN, autocommit=True) as holder:
+        holder.execute("SELECT pg_advisory_lock(%s)", (key,))
+        outcome: dict = {}
+
+        def attempt() -> None:
+            try:
+                with store.registry_lock():
+                    outcome["granted"] = True
+            except RegistryLockUnavailable as exc:
+                outcome["refused"] = str(exc)
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "registry_lock waited past its bound"
+        assert "refused" in outcome, outcome
+        holder.execute("SELECT pg_advisory_unlock(%s)", (key,))
+    with store.registry_lock():
+        pass
+
+
+@pytest.mark.parametrize("store", ["postgres"], indirect=True)
+def test_postgres_registry_lock_outlasts_a_roles_statement_timeout(store, monkeypatch):
+    """A connection whose role cancels statements after 1 s still waits the lock's own bound and refuses by name -
+    never QueryCanceled (57014)."""
+    import threading
+
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    import recto.bootloader.state_postgres as spg
+    from recto.bootloader.state import RegistryLockUnavailable
+
+    monkeypatch.setattr(spg, "REGISTRY_LOCK_WAIT_SECONDS", 3)
+    impatient = spg.PostgresStateStore(make_conninfo(PG_DSN, options="-c statement_timeout=1000"),
+                                       schema=store._schema)  # noqa: SLF001
+    key = store._registry_lock_key  # noqa: SLF001
+    try:
+        with psycopg.connect(PG_DSN, autocommit=True) as holder:
+            holder.execute("SELECT pg_advisory_lock(%s)", (key,))
+            outcome: dict = {}
+
+            def attempt() -> None:
+                try:
+                    with impatient.registry_lock():
+                        outcome["granted"] = True
+                except RegistryLockUnavailable:
+                    outcome["refused"] = True
+                except Exception as exc:  # noqa: BLE001
+                    outcome["other"] = type(exc).__name__
+
+            worker = threading.Thread(target=attempt, daemon=True)
+            worker.start()
+            worker.join(timeout=15)
+            assert not worker.is_alive() and outcome == {"refused": True}, outcome
+            holder.execute("SELECT pg_advisory_unlock(%s)", (key,))
+    finally:
+        impatient.close()

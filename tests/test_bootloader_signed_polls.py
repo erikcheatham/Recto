@@ -412,38 +412,61 @@ def test_phone_ref_derivation_shape():
     assert len(ref) == 3 + 16
 
 
-def test_register_response_carries_phone_ref(advisory):
+def _register_body(priv, pub_b64u: str, poll_pub_b64u: str, challenge: str, slot: str) -> dict:
+    return {
+        "v0_4_protocol": 1,
+        "public_key_b64u": pub_b64u,
+        "device_label": "phone-ref-test",
+        "slot": slot,
+        "supported_algorithms": ["ed25519"],
+        "registration_proof": {
+            "challenge": challenge,
+            "signature_b64u": _b64u(priv.sign(challenge.encode("ascii"))),
+        },
+        # rule 14.2: a registration delegates a poll key or it is refused
+        "poll_public_key_b64u": poll_pub_b64u,
+        "poll_key_delegation_b64u": _b64u(priv.sign(
+            poll_key_delegation_payload(pub_b64u, poll_pub_b64u)
+        )),
+    }
+
+
+def test_a_codeless_challenge_never_registers(advisory):
+    """THE FLIP (hard rule 14.4, amended): this test asserted that a challenge fetched with NO code registered a
+    stranger's own key into the empty recovery slot, 201. A codeless challenge now serves revoke only."""
     priv, pub_b64u = _make_keypair()
     _, poll_pub_b64u = _make_keypair()
-    status, chal = _http(
-        f"{advisory['base_url']}/v0.4/registration_challenge")
+    status, chal = _http(f"{advisory['base_url']}/v0.4/registration_challenge")
     assert status == HTTPStatus.OK
-    challenge = chal["challenge_b64u"]
-    sig = _b64u(priv.sign(challenge.encode("ascii")))
-    status, body = _http(
-        f"{advisory['base_url']}/v0.4/register",
-        method="POST",
-        body={
-            "v0_4_protocol": 1,
-            "public_key_b64u": pub_b64u,
-            "device_label": "phone-ref-test",
-            # the fixture's phone holds primary; two phones are two slots (rule 14.4)
-            "slot": "recovery",
-            "supported_algorithms": ["ed25519"],
-            "registration_proof": {
-                "challenge": challenge,
-                "signature_b64u": sig,
-            },
-            # rule 14.2: a registration delegates a poll key or it is refused
-            "poll_public_key_b64u": poll_pub_b64u,
-            "poll_key_delegation_b64u": _b64u(priv.sign(
-                poll_key_delegation_payload(pub_b64u, poll_pub_b64u)
-            )),
-        },
-    )
-    assert status == HTTPStatus.CREATED
-    assert body["phone_ref"] == _phone_ref(pub_b64u)
-    assert body["poll_public_key_b64u"] == poll_pub_b64u
+    status, body = _http(f"{advisory['base_url']}/v0.4/register", method="POST",
+                         body=_register_body(priv, pub_b64u, poll_pub_b64u, chal["challenge_b64u"], "recovery"))
+    assert status == HTTPStatus.BAD_REQUEST, body
+    assert [p.phone_id for p in advisory["state"].list_phones()] == [advisory["phone"].phone_id]
+
+
+def test_register_response_carries_phone_ref(tmp_path):
+    """On a bootloader that has never had an owner, an owner code alone enrolls the first one."""
+    (tmp_path / "fresh").mkdir()
+    state = StateStore(state_dir=tmp_path / "fresh")
+    challenges = ChallengeStore(state=state)
+    server = create_server(bind_host="127.0.0.1", bind_port=0, state=state, bootloader_id="test-bootloader",
+                           challenges=challenges, ssl_context=None, signed_poll_mode="advisory")
+    host, port = server.server_address
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        priv, pub_b64u = _make_keypair()
+        _, poll_pub_b64u = _make_keypair()
+        code, _ = challenges.issue_pairing_code()
+        status, chal = _http(f"http://{host}:{port}/v0.4/registration_challenge?code={code}")
+        assert status == HTTPStatus.OK
+        status, body = _http(f"http://{host}:{port}/v0.4/register", method="POST",
+                             body=_register_body(priv, pub_b64u, poll_pub_b64u, chal["challenge_b64u"], "primary"))
+        assert status == HTTPStatus.CREATED, body
+        assert body["phone_ref"] == _phone_ref(pub_b64u)
+        assert body["poll_public_key_b64u"] == poll_pub_b64u
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_manage_phones_rows_carry_phone_ref(advisory):
@@ -456,9 +479,12 @@ def test_manage_phones_rows_carry_phone_ref(advisory):
         supported_algorithms=("ed25519",),
     )
     advisory["state"].register_phone(other)
+    # The phone list answers only a read whose poll signature verifies, in every signed_poll_mode (hard rule 14.2,
+    # ahead of the flip).
     status, body = _http(
         f"{advisory['base_url']}/v0.4/manage/phones"
-        f"?phone_id={advisory['phone'].phone_id}"
+        f"?phone_id={advisory['phone'].phone_id}",
+        headers=_signed_headers(advisory, "/v0.4/manage/phones"),
     )
     assert status == HTTPStatus.OK
     assert len(body["phones"]) == 1

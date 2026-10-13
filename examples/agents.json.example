@@ -7,13 +7,22 @@
 
   "_token_resolution": "Each agent's token is resolved in priority order: (1) os.environ[token_env] if token_env is set and the env var is non-empty (the supervised-launcher case -- Recto's launcher decrypts each per-agent vault entry and injects under the named env var); (2) dpapi-machine vault fetch from vault_service / vault_secret (the foreground bring-up case -- operator runs the launcher from PowerShell without per-agent token env vars set, the script decrypts in-process). First non-empty wins. Tokens must be 64 hex chars regardless of source.",
 
-  "_two_agents": "Two entries are shown because the manifest exists to register MORE THAN ONE consumer against one bootloader; a single-agent example would not demonstrate the thing the file is for. Each agent gets its own token, its own vault entry, and its own app block -- nothing is shared but the bootloader.",
+  "_two_agents": "Two consumer entries are shown because the manifest exists to register MORE THAN ONE consumer against one bootloader; a single-agent example would not demonstrate the thing the file is for. Each consumer gets its own token, its own vault entry, and its own app block -- nothing is shared but the bootloader. The first entry, operator-console, is not a consumer: it is the operator's own agent, the one that mints OWNER pairing codes (see _may_mint_owner_codes), and it carries no app block.",
 
   "_requestable_actions": "OPTIONAL per-agent field: an array of action keys this agent may ASK for. When present the agent is deny-by-default -- a capability request that names any action outside this list (allow_actions, plus each group's members expanded via the manifest; deny_actions is never subtracted first, so a deny cannot cancel its own allow into a pass) is refused 403 BEFORE it reaches the operator's approval queue, so a misbehaving or compromised agent cannot spend the operator's attention on requests it was never meant to make. When absent the agent is unrestricted at this layer and the operator's approval remains the only gate. Note this is a filter on what may be REQUESTED, never a grant: every listed action still requires the normal per-request approval. If a policed agent sends group-bearing claims the bootloader must have its action manifest loaded (RECTO_CAPABILITY_MANIFEST_FILE), otherwise the request is refused unexpanded, fail-closed. An empty array is a config error and refuses startup: an agent that may request nothing should not be registered.",
 
   "_requestable_audiences": "OPTIONAL per-agent field: an array of audience strings this agent may name in a request's aud claim -- WHERE the grant it asks for may be spent, as requestable_actions bounds WHAT it may do. When present the agent is deny-by-default -- a request whose aud is not an array of strings, is empty, or names any audience outside this list is refused 403 BEFORE it reaches the operator's approval queue. When absent the agent is unrestricted at this layer. The values are YOURS: name each verifier the way it expects to be named (one audience per consumer, per cluster, per executor). Recto ships none, treats aud as opaque, compares it exactly (case included) and never rewrites it; the phone shows it on the approval card. Like requestable_actions this narrows what may be ASKED and grants nothing. An empty array is a config error and refuses startup.",
 
+  "_may_mint_owner_codes": "OPTIONAL per-agent field, a JSON boolean (default false): true lets this agent mint OWNER pairing codes through POST /v0.4/pairing/code (no member_of). Give it to the operator's own agent only - a consumer mints MEMBER codes (member_of), which register beside the owner slots. Any other value refuses startup. Past genesis, adding or replacing an owner phone spends a code on each of its two passes, so it needs a flagged agent; the startup code (RECTO_BOOTLOADER_QUIET unset) is printed only while owner genesis is open - the first owner, or after a host reset. An owner code is still not enough on its own: once the bootloader has an owner, a new owner key needs the approval of an owner phone it does not displace.",
+
   "agents": [
+    {
+      "agent_id": "operator-console",
+      "token_env": "RECTO_AGENT_TOKEN_OPERATOR_CONSOLE",
+      "vault_service": "OperatorConsole",
+      "vault_secret": "RECTO_CAPABILITY_AGENT_TOKEN",
+      "may_mint_owner_codes": true
+    },
     {
       "agent_id": "example-service",
       "token_env": "RECTO_AGENT_TOKEN_EXAMPLE_SERVICE",

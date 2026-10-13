@@ -57,6 +57,12 @@ capability endpoints return 404):
     RECTO_VAULT_SECRET     dpapi-machine vault secret name within the
                            service. Default: "RECTO_CAPABILITY_AGENT_TOKEN"
                            (the canonical Recto convention).
+    RECTO_AGENT_MAY_MINT_OWNER_CODES
+                           "1" lets this agent mint OWNER pairing codes
+                           (POST /v0.4/pairing/code with no member_of);
+                           "0" or unset: member codes only. Any other
+                           value exits 2. The agents.json twin is
+                           "may_mint_owner_codes": true.
 
 AppContext (optional -- without it, the phone shows "Unknown app"
 warning instead of the consumer's branded approval card):
@@ -82,12 +88,19 @@ Pairing-code mint (existing convention):
                             pairing code (foreground convenience). When
                             running supervised, set this to "1" so each
                             restart doesn't issue a throwaway code.
-                            Operators mint codes on demand via
-                            POST /v0.4/pairing/code regardless.
+                            On demand, POST /v0.4/pairing/code mints an
+                            OWNER code only for a flagged agent
+                            (may_mint_owner_codes); any agent mints a
+                            MEMBER code by sending member_of. Past
+                            genesis an owner phone spends a code on each
+                            of its two passes. Unquiet, the startup code
+                            is printed only while owner genesis is open.
 
 Signed polls (hard rule 14.2 -- the phone's reads are signed by its key):
     RECTO_SIGNED_POLL_MODE  "off" | "advisory" (default when unset) |
-                            "required". Advisory admits every read and logs
+                            "required". Advisory admits unsigned reads -
+                            except the phone list and owner-slot cards, which
+                            need a verified signature in every mode - and logs
                             a per-read verdict (signed-valid / signed-invalid
                             / unsigned) on recto.bootloader.signed_polls;
                             required answers an unsigned or invalid read
@@ -319,7 +332,8 @@ import sys
 from typing import Mapping
 
 from recto.bootloader.events import construct_from_env as construct_events_emitter
-from recto.bootloader.server import SIGNED_POLL_MODES, ChallengeStore, create_server
+from recto.bootloader.server import SIGNED_POLL_MODES, BootloaderError, ChallengeStore, create_server
+from recto.bootloader.state import SLOTS
 from recto.bootloader.state import AppContext, StateStore
 from recto.secrets.dpapi_machine import DpapiMachineSource
 
@@ -944,6 +958,30 @@ def _load_agents_manifest(path: str) -> list[dict]:
     return agents
 
 
+def _env_owner_mint_flag() -> bool:
+    raw = os.environ.get("RECTO_AGENT_MAY_MINT_OWNER_CODES", "").strip()
+    if raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    print(f"ERROR: RECTO_AGENT_MAY_MINT_OWNER_CODES must be 1 or 0; got {raw!r}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _owner_code_minters(agents: list[dict]) -> set[str]:
+    """THE OWNER SLOTS: the agents whose entry carries "may_mint_owner_codes": true - a strict JSON boolean; any
+    other value is a config error naming the agent."""
+    minters: set[str] = set()
+    for agent in agents:
+        agent_id = (agent.get("agent_id") or "").strip()
+        may_mint = agent.get("may_mint_owner_codes", False)
+        if not isinstance(may_mint, bool):
+            raise ValueError(f"agent {agent_id!r}: may_mint_owner_codes must be true or false; got {may_mint!r}")
+        if may_mint:
+            minters.add(agent_id)
+    return minters
+
+
 def _resolve_agents() -> list[dict]:
     """Return the unified list of agent dicts (manifest-shape)
     regardless of source.
@@ -977,6 +1015,9 @@ def _resolve_agents() -> list[dict]:
                 "RECTO_VAULT_SECRET",
                 default="RECTO_CAPABILITY_AGENT_TOKEN",
             ),
+            # THE OWNER SLOTS: the single-agent twin of an agents.json entry's
+            # "may_mint_owner_codes" - "1" lets this agent mint OWNER pairing codes.
+            "may_mint_owner_codes": _env_owner_mint_flag(),
             "app": {
                 "app_id": os.environ.get("RECTO_APP_ID", "").strip(),
                 "app_name": os.environ.get("RECTO_APP_NAME", "").strip(),
@@ -1256,6 +1297,13 @@ def main() -> int:
     capability_agent_requestable: dict[str, list[str]] = {}
     capability_agent_audiences: dict[str, list[str]] = {}
     principal_apps: dict[str, AppContext] = {}
+    # THE OWNER SLOTS (hard rule 14.4, amended): only an agent whose entry carries "may_mint_owner_codes": true mints
+    # OWNER pairing codes; every other agent mints member codes only. A strict JSON boolean - anything else refuses.
+    try:
+        owner_code_minters = _owner_code_minters(agents)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     for agent in agents:
         agent_id = (agent.get("agent_id") or "").strip()
@@ -1537,36 +1585,43 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    server = create_server(
-        bind_host=bind_host,
-        bind_port=bind_port,
-        state=state,
-        challenges=challenges,
-        bootloader_id=bootloader_id,
-        signed_poll_mode=signed_poll_mode,
-        capability_manifest_path=capability_manifest_path,
-        capability_agent_tokens=capability_agent_tokens,
-        capability_agent_requestable=capability_agent_requestable or None,
-        capability_agent_audiences=capability_agent_audiences or None,
-        capability_operator_token=operator_write_token,
-        principal_apps=principal_apps,
-        devices_pair_consumer_webhook_tokens=devices_pair_consumer_webhook_tokens,
-        devices_pair_consumer_relay_urls=devices_pair_consumer_relay_urls,
-        devices_pair_signing_key=devices_pair_signing_key,
-        connections_path=connections_path,
-        connections_agent_services=connections_agent_services,
-        connections_agent_keys=connections_agent_keys,
-        connections_key_acl_enforce=connections_key_acl_enforce,
-        connections_secret_source_factory=connections_secret_factory,
-        user_vault_path=user_vault_path,
-        user_vault_agent_platforms=user_vault_agent_platforms,
-        user_vault_secret_source_factory=user_vault_secret_factory,
-        notify_resolved_fn=(
-            events_emitter.notify_resolved if events_emitter is not None else None
-        ),
-        push_dispatcher=push_dispatcher,
-        public_urls=public_urls or None,
-    )
+    try:
+        server = create_server(
+            bind_host=bind_host,
+            bind_port=bind_port,
+            state=state,
+            challenges=challenges,
+            bootloader_id=bootloader_id,
+            signed_poll_mode=signed_poll_mode,
+            capability_manifest_path=capability_manifest_path,
+            capability_agent_tokens=capability_agent_tokens,
+            capability_agent_requestable=capability_agent_requestable or None,
+            capability_agent_audiences=capability_agent_audiences or None,
+            owner_code_minters=owner_code_minters,
+            capability_operator_token=operator_write_token,
+            principal_apps=principal_apps,
+            devices_pair_consumer_webhook_tokens=devices_pair_consumer_webhook_tokens,
+            devices_pair_consumer_relay_urls=devices_pair_consumer_relay_urls,
+            devices_pair_signing_key=devices_pair_signing_key,
+            connections_path=connections_path,
+            connections_agent_services=connections_agent_services,
+            connections_agent_keys=connections_agent_keys,
+            connections_key_acl_enforce=connections_key_acl_enforce,
+            connections_secret_source_factory=connections_secret_factory,
+            user_vault_path=user_vault_path,
+            user_vault_agent_platforms=user_vault_agent_platforms,
+            user_vault_secret_source_factory=user_vault_secret_factory,
+            notify_resolved_fn=(
+                events_emitter.notify_resolved if events_emitter is not None else None
+            ),
+            push_dispatcher=push_dispatcher,
+            public_urls=public_urls or None,
+        )
+    except BootloaderError as exc:
+        # A held or unlockable state dir, or a registry lock that would not come: a named refusal, never a
+        # traceback a supervisor restart-loops on. A port-bind failure or a bug keeps its traceback.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     # ---- Startup banner ------------------------------------------------
 
@@ -1623,7 +1678,17 @@ def main() -> int:
             aud_policy = capability_agent_audiences.get(aid)
             if aud_policy is not None:
                 ctx_str += f" [audiences: {', '.join(aud_policy)}]"
+            if aid in owner_code_minters:
+                ctx_str += " [mints owner codes]"
             print(f"  - {aid} (token = {tok[:8]}...) {ctx_str}")
+    if not owner_code_minters:
+        print(
+            "WARNING: no agent may mint OWNER pairing codes (no entry carries \"may_mint_owner_codes\": true, nor "
+            "RECTO_AGENT_MAY_MINT_OWNER_CODES=1 in single-agent mode). Past "
+            "genesis, adding or replacing an owner phone spends a code on each of its two passes, so it needs a "
+            "flagged agent; the startup code (RECTO_BOOTLOADER_QUIET unset) is printed only while owner genesis is open "
+            "(the first owner, or after a host reset)."
+        )
     # Phase H devices-pair consumer registry (2026-05-19). Same
     # sibling-line shape as Agents: above so the operator can spot
     # misconfigurations at glance. Empty registry => one-line note
@@ -1691,7 +1756,19 @@ def main() -> int:
         print("Agents:        (none registered -- capability endpoints will 404)")
     print()
 
-    if not quiet:
+    if not quiet and state.get_owner_genesis() != "open":
+        # Ruled 2026-10-13: the startup code is minted only while owner genesis is open (the first owner, or after a host
+        # reset). Read after create_server, so its marker decision and repair have landed.
+        if any(p.slot in SLOTS for p in state.list_phones()):
+            print("No pairing code issued at startup: owner genesis is closed (an owner phone is enrolled). An owner "
+                  "phone pairs with codes from a flagged agent and an owner phone's approval; a member pairs with a "
+                  "member code.")
+        else:
+            print("No pairing code issued at startup: owner genesis is closed and no owner phone is enrolled - nothing "
+                  "can approve an owner. Stop this bootloader, run `recto bootloader owner-reset --reopen-genesis` "
+                  "(alone) on the host, then start it again for a startup code.")
+        print()
+    elif not quiet:
         pairing_code, pairing_exp = challenges.issue_pairing_code(ttl_seconds=3600)
         print("=" * 60)
         print(f"PAIRING CODE:  {pairing_code}")
@@ -1704,10 +1781,23 @@ def main() -> int:
         print()
     else:
         print("Quiet mode (RECTO_BOOTLOADER_QUIET=1) -- no pairing code issued at startup.")
-        print(
-            "Mint codes on demand via POST /v0.4/pairing/code (operator-trusted "
-            "agent endpoint), or unset RECTO_BOOTLOADER_QUIET and restart."
-        )
+        if not capability_agent_tokens:
+            print(
+                "No agent is registered, so POST /v0.4/pairing/code answers 404. A startup code (RECTO_BOOTLOADER_QUIET "
+                "unset) is printed only while owner genesis is open (the first owner, or after a host reset)."
+            )
+        elif owner_code_minters:
+            print(
+                f"Mint codes on demand via POST /v0.4/pairing/code: OWNER codes by {', '.join(sorted(owner_code_minters))}; "
+                "any agent mints MEMBER codes by sending member_of."
+            )
+        else:
+            print(
+                "POST /v0.4/pairing/code mints MEMBER codes only (send member_of): no agent is flagged for OWNER codes "
+                "(\"may_mint_owner_codes\": true, or RECTO_AGENT_MAY_MINT_OWNER_CODES=1 in single-agent mode). "
+                "A startup code (RECTO_BOOTLOADER_QUIET unset) is printed only while owner genesis is open (the first "
+                "owner, or after a host reset)."
+            )
         print()
 
     print("Ctrl-C to stop.")

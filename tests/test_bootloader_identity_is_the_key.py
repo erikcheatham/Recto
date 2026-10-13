@@ -144,10 +144,13 @@ def test_the_same_key_registered_twice_is_one_phone(ctx):
 
 def test_two_different_keys_are_two_phones(ctx):
     """The positive control for the merge: it merges on the KEY, not on anything else.
-    Two phones are two SLOTS (rule 14.4): the second names recovery."""
-    k1, p1 = _key()
-    k2, p2 = _key()
-    _, a = _register(ctx, k1, p1, label="pixel")
-    _, b = _register(ctx, k2, p2, label="iphone", slot="recovery")
+    Two phones are two SLOTS (rule 14.4): the second names recovery and, past genesis, enters
+    with the first phone's approval."""
+    from tests.test_bootloader_slots import Phone, _pair_owner
+    first, second = Phone("pixel"), Phone("iphone")
+    s1, a = first.register(ctx, "primary")
+    assert s1 == 201, a
+    s2, b = _pair_owner(ctx, second, "recovery", approver=first)
+    assert s2 == 201, b
     assert a["phone_id"] != b["phone_id"]
     assert len(ctx["state"].list_phones()) == 2

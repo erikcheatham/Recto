@@ -81,17 +81,57 @@ six things:
    `recto-poll-key-v1|{identity pubkey}|{poll pubkey}`. A registration
    without a delegated poll key does not enroll. The poll key authenticates
    the device; it never signs an approval, and the identity key never signs
-   a read.
+   a read. Ahead of the flip, `/v0.4/manage/phones` answers only a read
+   whose poll signature verifies, in every `signed_poll_mode`, and an
+   owner-slot card is served only to such a read.
 3. **Registries key on the key.** The phone registry, the pending queue, the
    push-token map and the consumer webhook map resolve by `phone_ref`.
    Registering a key the registry already holds is the SAME phone: its
    existing id and first-pairing time are kept, its metadata refreshed, and no
    second record exists. Nothing keyed on a phone needs re-pointing when that
-   phone pairs again.
-4. **Two slots, not a list.** A bootloader holds a PRIMARY and a RECOVERY
-   `phone_ref`. Pairing into an occupied slot is a replacement question,
-   answered by a signed claim from the incoming key; the outgoing key's slot
-   is revoked in the same act. A third key cannot pair without displacing one.
+   phone pairs again. A key has one spelling: the unpadded base64url of its
+   raw bytes (ed25519 32 bytes, ecdsa-p256 64 bytes X||Y), for the identity
+   key and the poll key alike; a registration in any other spelling is
+   refused, so no key is ever two phones.
+4. **Two slots, not a list - and a code is not enough to hold one.** A
+   bootloader holds a PRIMARY and a RECOVERY `phone_ref`, the owner's phones.
+   A registration challenge has a kind: an OWNER code buys an owner
+   challenge, a consumer's MEMBER code a member challenge, and no code a
+   plain challenge, which serves revoke and never registers. The challenge's
+   kind, the proof and the poll delegation are checked before any slot
+   question, and nothing about another phone is said before them. While owner
+   genesis is open - a registry started fresh, before its first owner, or one
+   the host reset reopened - an owner code alone enrolls the first owner; a
+   registry from before the marker that already holds a phone or a session
+   starts closed. Once genesis is closed, a new owner key enters a slot only with the
+   APPROVAL of an owner phone it does not displace - with no other owner, the
+   occupant's approval of its own replacement: the bootloader cards the
+   approver with the incoming key's `phone_ref` (the ref the new phone shows),
+   the approver signs the card, and the new phone pairs again with a new code.
+   The approval binds the key, the slot, the approver and the occupant; two
+   keys asking for one slot are both refused. Pairing into an occupied slot
+   still names the occupant to the incoming key, whose signed claim says which
+   phone it displaces; the displaced key is revoked in the same act, and a
+   third key cannot pair without displacing one. The same key re-pairs into
+   the slot it holds by its code alone. A member key never enters an owner
+   slot. A member phone revokes only itself and lists no other phone; an
+   owner phone revokes an owner or a member; the last owner phone is never
+   revoked. A lost sole owner phone is the host's act, never the network's:
+   `recto bootloader owner-reset` on the bootloader host removes only the
+   LAST owner phone and reopens genesis (refused while a server holds a
+   file-backend store); a non-sole owner phone is revoked over the network by
+   an owner phone in hand. When every owner phone is lost, `owner-reset
+   --every-owner-lost`, naming every owner phone held, removes them all and
+   reopens genesis. A state directory or schema lost or started fresh is a registry
+   that never had an owner. Pairing codes are six digits, so wrong codes
+   are counted: a request carrying the edge's client-address header
+   (`CF-Connecting-IP` when fronted by Cloudflare) is public, limited per client (an IPv4 address, an
+   IPv6 /64), and a code that sat through too many public wrong guesses is
+   burned on its next public redemption; a request without the header came
+   over a private route and is never counted, so every other
+   ingress must sit behind a proxy that sets it. Nothing refuses every
+   client at once. The counts are per process and a restart clears them;
+   an edge rate rule on the code path is the bound across instances.
 5. **A consumer binds to the key, not to the id.** A service that stores a
    phone's id stores a cached display value; its truth is the public key it
    verifies signatures against. "Is this still the phone?" is answered at every

@@ -2,15 +2,19 @@
 
 A bootloader holds a PRIMARY and a RECOVERY phone_ref. Pairing into an occupied slot is a
 replacement question: the registry answers 409 slot_occupied with the occupant's model and
-last-seen so the phone can ask the operator; the answer is the incoming IDENTITY key's
-signature over `recto-slot-replace-v1|{slot}|{occupant ref}|{incoming pubkey}`; the occupant
-is revoked in the same act the incoming key is recorded.
+last-seen so the phone can ask the operator; the incoming IDENTITY key's signature over
+`recto-slot-replace-v1|{slot}|{occupant ref}|{incoming pubkey}` says which phone it displaces;
+the occupant is revoked in the same act the incoming key is recorded. Since the owner-slot
+amendment (tests/test_bootloader_owner_slots.py) a second owner key - and every displacement -
+also needs the approval of an owner phone it does not displace: _pair_owner below runs both
+passes.
 
 RED-BUILDS: a third key cannot pair without displacing one; a displaced key's
 queue reads empty (here: the displaced key is unknown to the registry at all -- stronger).
 POSITIVE CONTROLS: two keys fill two slots; the same key re-pairing into its own slot is not
 a replacement (the same-key merge, unchanged); a claim by the wrong key, or over the wrong occupant,
-is refused and displaces nobody.
+is refused and displaces nobody. Since the owner-slot amendment every control but the same-key
+re-pair runs the owner approval flow, so it passes only on a server that has it.
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ def ctx(tmp_path: Path):
         yield {"base_url": f"http://{host}:{port}", "state": state, "challenges": challenges}
     finally:
         server.shutdown()
+        server.server_close()
 
 
 class Phone:
@@ -127,6 +132,29 @@ class Phone:
                      headers={POLL_SIG_HEADER: _b64u(sig), POLL_SIG_TS_HEADER: str(ts)})
 
 
+def _approve_owner_cards(ctx, approver: Phone) -> None:
+    """THE OWNER SLOTS: the approver signs every owner-slot card on its own signed queue."""
+    status, body = approver.read_pending(ctx)
+    assert status == 200, body
+    for card in body.get("requests", []):
+        if str(card.get("secret", "")).startswith("owner-slot:"):
+            raw = card["context"]["payload_hash_b64u"]
+            digest = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+            status, resolved = _http("POST", f"{ctx['base_url']}/v0.4/respond/{card['request_id']}",
+                                     {"decision": "approved", "signature_b64u": _b64u(approver.identity.sign(digest))})
+            assert status == 200, resolved
+
+
+def _pair_owner(ctx, phone: Phone, slot: str, approver: Phone,
+                replace: str | None = None) -> tuple[int, dict[str, Any]]:
+    """Both passes of an owner enrollment past genesis: pass 1 raises the approver's card, the approver signs
+    it, pass 2 (a fresh code) enrolls."""
+    status, body = phone.register(ctx, slot, replace=replace)
+    assert status == 403 and body.get("error") == "owner_approval_required", body
+    _approve_owner_cards(ctx, approver)
+    return phone.register(ctx, slot, replace=replace)
+
+
 def _queue_card(ctx, phone_ref: str) -> None:
     """A card in the occupant's queue, seeded through the store (the shape of the
     request is not what this suite tests; that it is GONE after displacement is)."""
@@ -144,7 +172,7 @@ def _queue_card(ctx, phone_ref: str) -> None:
 def test_two_keys_fill_the_two_slots(ctx):
     a, b = Phone("pixel"), Phone("iphone")
     s1, r1 = a.register(ctx, "primary")
-    s2, r2 = b.register(ctx, "recovery")
+    s2, r2 = _pair_owner(ctx, b, "recovery", approver=a)
     assert (s1, s2) == (201, 201), (r1, r2)
     assert r1["slot"] == "primary" and r2["slot"] == "recovery"
     assert {p.slot for p in ctx["state"].list_phones()} == {"primary", "recovery"}
@@ -172,7 +200,7 @@ def test_a_third_key_cannot_pair_without_displacing_one(ctx):
     """RED-BUILD: drop the occupancy check and a third phone quietly joins a list."""
     a, b, c = Phone("pixel"), Phone("iphone"), Phone("stranger")
     assert a.register(ctx, "primary")[0] == 201
-    assert b.register(ctx, "recovery")[0] == 201
+    assert _pair_owner(ctx, b, "recovery", approver=a)[0] == 201
 
     for slot in ("primary", "recovery"):
         status, body = c.register(ctx, slot)
@@ -204,9 +232,14 @@ def test_a_signed_replacement_displaces_the_occupant_in_the_same_act(ctx):
     _queue_card(ctx, a.ref)
     assert a.read_pending(ctx)[1]["requests"], "the occupant had a card before displacement"
 
-    # ONE pairing code: the question (409) leaves the challenge intact and the
-    # answer rides the same one. A second code would mean the operator's
-    # authority was spent on the question rather than the displacement.
+    # The question (409) leaves the challenge intact and the answer rides the same one. With no other
+    # owner phone the occupant approves its own replacement (the upgrade with the old phone in hand):
+    # pass 1 raises its card, it signs, and pass 2 - a second code - displaces it.
+    status, body = c.register(ctx, "primary")
+    assert status == 409, body
+    status, body = c.register(ctx, "primary", replace=a.ref, challenge=c.last_challenge)
+    assert status == 403 and body["error"] == "owner_approval_required", body
+    _approve_owner_cards(ctx, a)
     status, body = c.register(ctx, "primary")
     assert status == 409, body
     status, body = c.register(ctx, "primary", replace=a.ref, challenge=c.last_challenge)
@@ -229,25 +262,38 @@ def test_a_replacement_signed_by_the_wrong_key_displaces_nobody(ctx):
     a, c = Phone("pixel"), Phone("stranger")
     stranger_signer, _ = _key()
     assert a.register(ctx, "primary")[0] == 201
+    # The approval is on file first, so the refusal below is the CLAIM's, not a missing approval's.
+    status, body = c.register(ctx, "primary", replace=a.ref)
+    assert status == 403 and body["error"] == "owner_approval_required", body
+    _approve_owner_cards(ctx, a)
     status, body = c.register(ctx, "primary", replace=a.ref, replace_signer=stranger_signer)
-    assert status >= 400, body
+    assert status == 400 and "slot_replace_b64u does not verify" in str(body), body
     assert [p.phone_id for p in ctx["state"].list_phones()] == [a.ref]
+    status, body = c.register(ctx, "primary", replace=a.ref)       # the approval was not spent by the bad claim
+    assert status == 201, body
 
 
 def test_a_replacement_over_the_wrong_occupant_displaces_nobody(ctx):
     a, b, c = Phone("pixel"), Phone("iphone"), Phone("stranger")
     assert a.register(ctx, "primary")[0] == 201
-    assert b.register(ctx, "recovery")[0] == 201
+    assert _pair_owner(ctx, b, "recovery", approver=a)[0] == 201
+    # The approval is on file first (b approves c displacing a), so the refusal below is the CLAIM's.
+    status, body = c.register(ctx, "primary", replace=a.ref)
+    assert status == 403 and body["error"] == "owner_approval_required", body
+    _approve_owner_cards(ctx, b)
     # claims to replace b, but into a's slot: the payload names the wrong occupant
     status, body = c.register(ctx, "primary", replace=b.ref)
-    assert status >= 400, body
+    assert status == 400 and "slot_replace_b64u does not verify" in str(body), body
     assert {p.phone_id for p in ctx["state"].list_phones()} == {a.ref, b.ref}
+    status, body = c.register(ctx, "primary", replace=a.ref)
+    assert status == 201, body
+    assert {p.phone_id for p in ctx["state"].list_phones()} == {c.ref, b.ref}
 
 
 def test_manage_phones_rows_carry_the_slot(ctx):
     a, b = Phone("pixel"), Phone("iphone")
     assert a.register(ctx, "primary")[0] == 201
-    assert b.register(ctx, "recovery")[0] == 201
+    assert _pair_owner(ctx, b, "recovery", approver=a)[0] == 201
     path = "/v0.4/manage/phones"
     ts = int(time.time())
     sig = a.poll.sign(f"{POLL_SIG_PREFIX}|{a.ref}|{ts}|{path}".encode("ascii"))

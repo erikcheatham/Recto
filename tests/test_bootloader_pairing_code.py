@@ -63,6 +63,8 @@ def server_with_agent(tmp_path: Path):
         challenges=challenges,
         ssl_context=None,
         capability_agent_tokens={"darwin": "agent-token-fixture"},
+        # THE OWNER SLOTS: only a flagged agent mints OWNER codes (tests/test_bootloader_owner_slots.py pins the refusal).
+        owner_code_minters={"darwin"},
     )
     host, port = server.server_address
     base_url = f"http://{host}:{port}"

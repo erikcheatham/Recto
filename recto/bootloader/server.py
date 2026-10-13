@@ -18,10 +18,12 @@ is internally thread-safe. The handler holds a reference to the store
 and a few config values via class attributes set at server creation.
 
 Threat model notes are in module docstrings of `state.py` and
-`sessions.py`. This module enforces the wire-protocol contract; it does
-NOT do rate limiting, brute-force defense, or replay protection beyond
-the JWT `jti` and challenge expiry. Production hardening is followup
-work tracked in the v0.4 deferred-items list.
+`sessions.py`. This module enforces the wire-protocol contract. Its one
+brute-force defense is the wrong pairing-code limiter (owner_slots.py:
+per public client, and a per-code exposure budget); it does no other
+rate limiting, and no replay protection beyond the JWT `jti` and
+challenge expiry. The rest is followup work tracked in the v0.4
+deferred-items list.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -39,7 +42,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlparse
 import urllib.error
 import urllib.request
 
@@ -58,9 +61,23 @@ from recto.bootloader.sessions import (
     verify_jwt,
     verify_signature,
 )
+from recto.bootloader.owner_slots import (
+    MALFORMED_CLIENT,
+    StoreLockUnavailable,
+    void_owner_enrolls_for,
+    OWNER_APPROVAL_TTL_SECONDS,
+    OWNER_CARD_TTL_SECONDS,
+    OWNER_CONTEST_WINDOW_SECONDS,
+    PUBLIC_CLIENT_HEADER,
+    CodeAttemptLimiter,
+    acquire_server_store_lock,
+    grouped_ref,
+    owner_enroll_digest,
+)
 from recto.bootloader.state import (
     MEMBER_SLOT,
     SLOTS,
+    RegistryLockUnavailable,
     ActorContext,
     AppContext,
     phone_ref_of,
@@ -144,6 +161,30 @@ def _phone_ref(public_key_b64u: str) -> str:
     so the wire and the registry cannot disagree.
     """
     return phone_ref_of(public_key_b64u)
+
+
+_KEY_BYTES = {"ed25519": 32, "ecdsa-p256": 64}
+
+
+def _require_canonical_key(public_key_b64u: Any, algorithm: str, *, name: str = "public_key_b64u") -> None:
+    """THE KEY'S SPELLING (hard rule 14.3): one key, one string - unpadded base64url of the raw key (ed25519 32 bytes,
+    ecdsa-p256 64 bytes X||Y, the form both shipped phones send). A re-spelled key would be a second row for one key
+    and slip past every key comparison the slot rules make."""
+    ok = isinstance(public_key_b64u, str) and re.fullmatch(r"[A-Za-z0-9_-]+", public_key_b64u) is not None
+    raw = b""
+    if ok:
+        try:
+            raw = base64.urlsafe_b64decode(public_key_b64u + "=" * (-len(public_key_b64u) % 4))
+        except ValueError:   # binascii.Error: a length no key has
+            ok = False
+        else:
+            ok = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") == public_key_b64u
+    want = _KEY_BYTES.get(algorithm)
+    if not ok or (want is not None and len(raw) != want):
+        raise BootloaderError(
+            f"registration refused: {name} must be the unpadded base64url of the raw public key "
+            f"({', '.join(f'{a} {n} bytes' for a, n in _KEY_BYTES.items())})"
+        )
 
 
 def _constant_time_compare(a: str, b: str) -> bool:
@@ -612,8 +653,10 @@ class BootloaderConfig:
     user_vault_secret_source_factory: Any = None
 
     # Signed-poll enforcement mode (2026-08-13, phone_id split). Gates
-    # every possession-of-phone_id read surface (GET /v0.4/pending,
-    # GET /v0.4/manage/phones, POST /v0.4/manage/push_token):
+    # the possession-of-phone_id read surfaces (GET /v0.4/pending and
+    # POST /v0.4/manage/push_token). GET /v0.4/manage/phones and
+    # owner-slot cards on /v0.4/pending need a verified poll signature
+    # in EVERY mode (hard rule 14.2):
     #   - "off":      no signature processing at all (pre-split shape).
     #   - "advisory": DEFAULT. All polls allowed; each one is logged as
     #                 signed-valid / signed-invalid / unsigned (verdicts
@@ -627,6 +670,12 @@ class BootloaderConfig:
     # operator ceremony after the advisory evidence window shows every
     # live phone signing (RECURVE pattern).
     signed_poll_mode: str = "advisory"
+    # THE OWNER SLOTS (hard rule 14.4, amended). The agents allowed to mint OWNER pairing codes (an agent entry's
+    # "may_mint_owner_codes": true); every other agent mints member codes only. How long an approval, once given,
+    # waits for the new phone's second pass. The wrong-code limiter (per public client; never a private-network caller).
+    owner_code_minters: frozenset = frozenset()
+    owner_approval_ttl_seconds: int = OWNER_APPROVAL_TTL_SECONDS
+    code_limiter: Any = None
 
 
 class ChallengeStore:
@@ -649,81 +698,141 @@ class ChallengeStore:
 
     def __init__(self, state: "StateStoreBase | None" = None) -> None:
         self._state = state
+        # Set by create_server: told of every pairing code minted here, so the wrong-code limiter can count the public
+        # failures each code sits through (owner_slots.CodeAttemptLimiter.stamp).
+        self.code_minted: "Any" = None
+        # The stateless store's own lock: every read, purge and write of the dicts below runs under it (the state store
+        # has its own). code_minted is called after it is released - the limiter's lock is always taken first.
+        self._lock = threading.RLock()
         self._challenges: dict[str, int] = {}  # value -> expires_at_unix
         self._pairing_codes: dict[str, int] = {}  # code -> expires_at_unix
         self._member_pairing_codes: dict[str, int] = {}  # THE MEMBER PLANE (2026-09-30)
         self._member_challenges: dict[str, int] = {}
+        self._owner_challenges: dict[str, int] = {}  # THE OWNER SLOTS (hard rule 14.4, amended)
 
     def issue_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
         if self._state is not None:
             return self._state.issue_challenge(ttl_seconds)
-        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
-        exp = int(time.time()) + ttl_seconds
-        self._challenges[c] = exp
-        return c, exp
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._purge()
+            self._challenges[c] = exp
+            return c, exp
 
     def consume_challenge(self, c: str) -> bool:
         """Return True if the challenge exists and is unexpired; remove
         it on success (single-use)."""
         if self._state is not None:
             return self._state.consume_challenge(c)
-        self._purge()
-        exp = self._challenges.pop(c, None)
-        return exp is not None and time.time() < exp
+        with self._lock:
+            self._purge()
+            exp = self._challenges.pop(c, None)
+            return exp is not None and time.time() < exp
 
     def issue_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
         if self._state is not None:
-            return self._state.issue_pairing_code(ttl_seconds)
-        # 6-digit human-readable; collision risk acceptable for personal-use.
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        exp = int(time.time()) + ttl_seconds
-        self._pairing_codes[code] = exp
+            code, exp = self._state.issue_pairing_code(ttl_seconds)
+        else:
+            with self._lock:   # draw and insert under one hold, so two mints never draw one code
+                code = self._unique_code()
+                exp = int(time.time()) + ttl_seconds
+                self._pairing_codes[code] = exp
+        self._minted(code, exp)
         return code, exp
+
+    def _minted(self, code: str, expires_at: int) -> None:
+        if self.code_minted is not None:
+            self.code_minted(code, expires_at)
+
+    def _unique_code(self) -> str:
+        # 6-digit human-readable, unique across owner and member codes (the GET tries the owner code first). The caller
+        # holds self._lock.
+        self._purge()
+        for _ in range(64):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            if code not in self._pairing_codes and code not in self._member_pairing_codes:
+                return code
+        raise RuntimeError("no free pairing code after 64 draws")
 
     def consume_pairing_code(self, code: str) -> bool:
         if self._state is not None:
             return self._state.consume_pairing_code(code)
-        self._purge()
-        exp = self._pairing_codes.pop(code, None)
-        return exp is not None and time.time() < exp
+        with self._lock:
+            self._purge()
+            exp = self._pairing_codes.pop(code, None)
+            return exp is not None and time.time() < exp
 
     # THE MEMBER PLANE (2026-09-30): a consumer's member code, and the registration challenge it buys, are their own
     # kind - a member registers BESIDE the business slots and never answers a slot question.
     def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
         if self._state is not None:
-            return self._state.issue_member_pairing_code(ttl_seconds)
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        exp = int(time.time()) + ttl_seconds
-        self._member_pairing_codes[code] = exp
+            code, exp = self._state.issue_member_pairing_code(ttl_seconds)
+        else:
+            with self._lock:   # draw and insert under one hold, so two mints never draw one code
+                code = self._unique_code()
+                exp = int(time.time()) + ttl_seconds
+                self._member_pairing_codes[code] = exp
+        self._minted(code, exp)
         return code, exp
 
     def consume_member_pairing_code(self, code: str) -> bool:
         if self._state is not None:
             return self._state.consume_member_pairing_code(code)
-        self._purge()
-        exp = self._member_pairing_codes.pop(code, None)
-        return exp is not None and time.time() < exp
+        with self._lock:
+            self._purge()
+            exp = self._member_pairing_codes.pop(code, None)
+            return exp is not None and time.time() < exp
 
     def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
         if self._state is not None:
             return self._state.issue_member_challenge(ttl_seconds)
-        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
-        exp = int(time.time()) + ttl_seconds
-        self._member_challenges[c] = exp
-        return c, exp
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._member_challenges[c] = exp
+            return c, exp
 
     def is_member_challenge(self, c: str) -> bool:
         if self._state is not None:
             return self._state.is_member_challenge(c)
-        exp = self._member_challenges.get(c)
-        return exp is not None and time.time() < exp
+        with self._lock:
+            exp = self._member_challenges.get(c)
+            return exp is not None and time.time() < exp
 
     def consume_member_challenge(self, c: str) -> bool:
         if self._state is not None:
             return self._state.consume_member_challenge(c)
-        self._purge()
-        exp = self._member_challenges.pop(c, None)
-        return exp is not None and time.time() < exp
+        with self._lock:
+            self._purge()
+            exp = self._member_challenges.pop(c, None)
+            return exp is not None and time.time() < exp
+
+    # THE OWNER SLOTS (hard rule 14.4, amended): an OWNER code buys an OWNER challenge, and only that kind registers
+    # into an owner slot. A challenge fetched with no code is the plain kind: it serves revoke and never registers.
+    def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_owner_challenge(ttl_seconds)
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._owner_challenges[c] = exp
+            return c, exp
+
+    def is_owner_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.is_owner_challenge(c)
+        with self._lock:
+            exp = self._owner_challenges.get(c)
+            return exp is not None and time.time() < exp
+
+    def consume_owner_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.consume_owner_challenge(c)
+        with self._lock:
+            self._purge()
+            exp = self._owner_challenges.pop(c, None)
+            return exp is not None and time.time() < exp
 
     def _purge(self) -> None:
         now = time.time()
@@ -731,6 +840,7 @@ class ChallengeStore:
         self._pairing_codes = {c: e for c, e in self._pairing_codes.items() if e > now}
         self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
         self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
+        self._owner_challenges = {c: e for c, e in self._owner_challenges.items() if e > now}
 
 
 class BootloaderHandler(BaseHTTPRequestHandler):
@@ -865,7 +975,12 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             url = urlparse(self.path)
-            print(f"[bootloader] GET {url.path}{'?' + url.query if url.query else ''}", flush=True)
+            pairs = [kv for part in re.split(r"[&;]", url.query) for kv in parse_qsl(part, keep_blank_values=True)]
+            shown = "&".join(
+                f"{quote(name, safe='')}=" + ("***" if "code" in name.lower() else quote(value, safe=''))
+                for name, value in pairs
+            )
+            print(f"[bootloader] GET {url.path}{'?' + shown if shown else ''}", flush=True)
             if url.path == "/v0.4/registration_challenge":
                 self._handle_registration_challenge(url)
             elif url.path == "/v0.4/pending":
@@ -910,6 +1025,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_clusters_list()
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        except RegistryLockUnavailable as e:
+            print(f"[bootloader] registry lock unavailable on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "registry_busy", "detail": str(e)})
         except BootloaderError as e:
             print(f"[bootloader] BootloaderError on {url.path}: {e}", flush=True)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bootloader_error", "detail": str(e)})
@@ -988,6 +1106,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_clusters_reap()
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        except RegistryLockUnavailable as e:
+            print(f"[bootloader] registry lock unavailable on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "registry_busy", "detail": str(e)})
         except BootloaderError as e:
             print(f"[bootloader] BootloaderError on {url.path}: {e}", flush=True)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bootloader_error", "detail": str(e)})
@@ -1152,21 +1273,49 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         cfg = self.config
         if cfg.challenges is None:
             raise BootloaderError("challenge store not initialized")
-        # Optional pairing-code gating: if `code=` query param is present,
-        # the operator-issued pairing code must match.
+        # THE KIND (hard rule 14.4, amended). An OWNER code buys an OWNER challenge, a consumer's MEMBER code a MEMBER
+        # challenge, and no code at all a PLAIN challenge - which serves revoke and never registers. Before the kinds,
+        # a request with no code (or an empty `code=`, or `CODE=`) bought the same challenge a code buys.
         params = parse_qs(url.query)
-        member = False
-        if "code" in params:
-            code = params["code"][0]
+        if "code" not in params:
+            challenge, expires_at = cfg.challenges.issue_challenge()
+            self._send_json(HTTPStatus.OK, {"challenge_b64u": challenge, "expires_at_unix": expires_at})
+            return
+        code = params["code"][0]
+        # A request through the public edge carries its client's address; one without it came over a private network
+        # or loopback and is never locked. Check, redeem and count under one lock: a burst cannot outrun the count,
+        # and a refused attempt never spends a good code.
+        sent = self.headers.get_all(PUBLIC_CLIENT_HEADER) or []
+        client = None if not sent else (sent[0].strip() if len(sent) == 1 and sent[0].strip() else MALFORMED_CLIENT)
+        limiter = cfg.code_limiter if cfg.code_limiter is not None else CodeAttemptLimiter()
+        with limiter.lock:
+            if limiter.blocked(client):
+                limiter.record_refusal()
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {
+                    "error": "too_many_wrong_codes",
+                    "detail": "too many wrong pairing codes from this network - wait 15 minutes, or pair over the "
+                              "operator's private route",
+                })
+                return
             if cfg.challenges.consume_pairing_code(code):
-                pass
+                kind = "owner"
             elif cfg.challenges.consume_member_pairing_code(code):
                 # THE MEMBER PLANE (2026-09-30): a consumer's member code buys a MEMBER challenge - never an owner one.
-                member = True
+                kind = "member"
+            elif limiter.was_spent(code):
+                raise RegistrationExpiredError("pairing code already used - get a new code")
             else:
+                limiter.record_failure(client)
                 raise RegistrationExpiredError("pairing code expired or invalid")
+            limiter.record_spent(code)
+            if client is not None and limiter.exposed(code):
+                # THE EXPOSURE BUDGET: a live code that sat through too many public wrong guesses is burned - consumed
+                # and never redeemed over the edge (the private route still redeems it until then).
+                logging.getLogger("recto.bootloader.codes").warning(
+                    "burned a pairing code redeemed over the public edge after too many wrong guesses")
+                raise RegistrationExpiredError("this pairing code was exposed to too many wrong guesses - get a new code")
         challenge, expires_at = (
-            cfg.challenges.issue_member_challenge() if member else cfg.challenges.issue_challenge()
+            cfg.challenges.issue_owner_challenge() if kind == "owner" else cfg.challenges.issue_member_challenge()
         )
         self._send_json(HTTPStatus.OK, {
             "challenge_b64u": challenge,
@@ -1217,63 +1366,18 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 f"protocol version mismatch: server={PROTOCOL_VERSION}, "
                 f"phone={body.get('v0_4_protocol')!r}"
             )
-        # THE SLOT (hard rule 14.4). Two phones, not a list. The question is
-        # asked BEFORE the challenge is consumed: the pairing code was spent
-        # minting that challenge, and the code is the operator's authority for
-        # displacement (the claim below only binds the incoming key's intent).
-        # A 409 here leaves the challenge intact, so the phone answers on the
-        # same one, inside its TTL, with slot_replace_b64u added.
+        # THE ORDER (hard rule 14.4, amended): the challenge's KIND, then the proof and the poll delegation, and only
+        # then any slot question or any word about another phone. Before this order the 409 named the occupant to a
+        # made-up challenge, and the slot's authority was a claim signed by the INCOMING key.
+        _require_canonical_key(public_key_b64u, algos[0])
         incoming_ref = _phone_ref(public_key_b64u)
-        # THE MEMBER PLANE (2026-09-30). A challenge bought with a consumer's MEMBER code carries none of the owner's
-        # authority: the phone registers BESIDE the slots (MEMBER_SLOT), the slot question is never asked, and a
-        # replace claim is refused by name - a member key never displaces a business phone. A key that already HOLDS
-        # a business slot keeps it (the owner's phone scanning a member code is still the owner's phone).
         member = cfg.challenges.is_member_challenge(challenge)
-        if member:
-            if body.get("slot_replace_b64u"):
-                raise BootloaderError(
-                    "registration refused: a member registration answers no slot question - "
-                    "slot_replace_b64u is the business owner's act, never a member code's"
-                )
-            held = cfg.state.get_phone(incoming_ref)
-            slot = held.slot if held is not None and held.slot in SLOTS else MEMBER_SLOT
-            occupant = None
-            replace_sig = None
-        else:
-            slot = body.get("slot") or "primary"
-            if slot not in SLOTS:
-                raise BootloaderError(
-                    f"registration refused: slot must be one of {list(SLOTS)}; got {slot!r}"
-                )
-            occupant = next(
-                (p for p in cfg.state.list_phones()
-                 if p.slot == slot and p.phone_id != incoming_ref),
-                None,
+        owner = not member and cfg.challenges.is_owner_challenge(challenge)
+        if not member and not owner:
+            raise RegistrationExpiredError(
+                "registration challenge unknown or expired, or fetched without a pairing code - a phone registers "
+                "only on a challenge bought with a pairing code; pair again with a new code"
             )
-            replace_sig = body.get("slot_replace_b64u") or None
-        if occupant is not None and not replace_sig:
-            self._send_json(HTTPStatus.CONFLICT, {
-                "error": "slot_occupied",
-                "slot": slot,
-                "occupant": {
-                    "phone_ref": occupant.phone_id,
-                    "device_label": occupant.device_label,
-                    "last_seen_unix": occupant.last_seen_unix,
-                    "registered_at_unix": occupant.registered_at_unix,
-                },
-                "detail": (
-                    f"the {slot} slot holds {occupant.device_label!r}; to replace it, "
-                    "retry the same registration with slot_replace_b64u = the identity "
-                    f"key's signature over {SLOT_REPLACE_PREFIX}|{slot}|{occupant.phone_id}|<public_key_b64u>"
-                ),
-            })
-            return
-        consumed = (
-            cfg.challenges.consume_member_challenge(challenge) if member
-            else cfg.challenges.consume_challenge(challenge)
-        )
-        if not consumed:
-            raise RegistrationExpiredError("registration challenge expired or invalid")
         # Pick the algorithm the phone declared. The registration body's
         # `supported_algorithms` is a list (phone enumerates what it
         # CAN sign with); for v1 we treat the first entry as the algo
@@ -1322,6 +1426,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 "poll_key_delegation_b64u are required (hard rule 14.2). A phone "
                 "that has not delegated a poll key cannot read from this registry."
             )
+        # The poll key has one spelling too (it signs with the identity key's algorithm), so the comparison below is a
+        # comparison of keys.
+        _require_canonical_key(poll_public_key_b64u, chosen_algo, name="poll_public_key_b64u")
         if poll_public_key_b64u == public_key_b64u:
             raise BootloaderError(
                 "registration refused: the poll key must not be the identity key"
@@ -1337,41 +1444,219 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 "registration refused: poll_key_delegation_b64u does not verify "
                 f"against the identity key (algorithm={chosen_algo!r})"
             )
-        if occupant is not None:
-            claimed = verify_signature(
-                payload=slot_replace_payload(slot, occupant.phone_id, public_key_b64u),
-                signature_b64u=replace_sig or "",
+
+        def _new(slot_: str) -> PhoneRegistration:
+            return PhoneRegistration.new(
+                device_label=str(device_label),
                 public_key_b64u=public_key_b64u,
-                algorithm=chosen_algo,
+                supported_algorithms=algos,
+                push_token=push_token,
+                push_platform=push_platform if push_token else None,
+                poll_public_key_b64u=poll_public_key_b64u,
+                slot=slot_,
             )
-            if not claimed:
+
+        # THE MEMBER PLANE (2026-09-30). A challenge bought with a consumer's MEMBER code carries none of the owner's
+        # authority: the phone registers BESIDE the slots (MEMBER_SLOT), the slot question is never asked, and a
+        # replace claim is refused by name - a member key never displaces a business phone. A key that already HOLDS
+        # a business slot keeps it (the owner's phone scanning a member code is still the owner's phone).
+        if member:
+            if body.get("slot_replace_b64u"):
                 raise BootloaderError(
-                    "registration refused: slot_replace_b64u does not verify against "
-                    f"the incoming identity key for occupant {occupant.phone_id!r}"
+                    "registration refused: a member registration answers no slot question - "
+                    "slot_replace_b64u is the business owner's act, never a member code's"
                 )
-        reg = PhoneRegistration.new(
-            device_label=str(device_label),
-            public_key_b64u=public_key_b64u,
-            supported_algorithms=algos,
-            push_token=push_token,
-            push_platform=push_platform if push_token else None,
-            poll_public_key_b64u=poll_public_key_b64u,
-            slot=slot,
-        )
-        if occupant is not None:
-            # The same act: the displaced key's registration, sessions and
-            # pending queue go before the incoming key is recorded, so at no
-            # moment do two keys hold one slot.
-            cfg.state.revoke_phone(occupant.phone_id)
-            logging.getLogger("recto.bootloader.slots").warning(
-                "slot=%s displaced phone_id=%s by phone_id=%s",
-                slot, occupant.phone_id, incoming_ref,
+            with cfg.state.registry_lock():
+                held = next((p for p in cfg.state.list_phones() if p.public_key_b64u == public_key_b64u),
+                            None) or cfg.state.get_phone(incoming_ref)
+                slot = held.slot if held is not None and held.slot in SLOTS else MEMBER_SLOT
+                if not cfg.challenges.consume_member_challenge(challenge):
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                reg = cfg.state.register_phone(_new(slot))
+            self._send_registered(reg, displaced_ref=None)
+            return
+
+        requested = body.get("slot") or "primary"
+        if requested not in SLOTS:
+            raise BootloaderError(
+                f"registration refused: slot must be one of {list(SLOTS)}; got {requested!r}"
             )
-        # THE KEY IS THE IDENTITY (2026-09-21): the store answers with the
-        # record AS STORED -- a key it already held keeps the id it had, so a
-        # re-pair of the same phone is the same phone and nothing carded on
-        # its id goes dark. The wire shape is unchanged.
-        reg = cfg.state.register_phone(reg)
+        replace_sig = body.get("slot_replace_b64u") or None
+        slots_log = logging.getLogger("recto.bootloader.slots")
+        with cfg.state.registry_lock():
+            phones = cfg.state.list_phones()
+            mine = next((p for p in phones if p.public_key_b64u == public_key_b64u), None) or next(
+                (p for p in phones if p.phone_id == incoming_ref), None)
+            if mine is not None and mine.slot not in SLOTS:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "member_key_refused",
+                    "detail": "a member key never moves into an owner slot - this key is registered as a member",
+                })
+                return
+            owners = [p for p in phones if p.slot in SLOTS]
+            # SAME-KEY RE-PAIR (rule 14.3): a key that holds an owner slot is the same phone; it re-pairs into THE SLOT
+            # IT HOLDS by the code alone, whatever the body names (a phone forgets its slot on 'unpair, keep vault').
+            if mine is not None:
+                if not cfg.challenges.consume_owner_challenge(challenge):
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                reg = cfg.state.register_phone(_new(mine.slot))
+                self._send_registered(reg, displaced_ref=None)
+                return
+            # GENESIS: while owner genesis is open (no owner yet, or the host reset reopened it), an owner code alone
+            # enrolls the first owner, and the marker closes in the same locked act. Only the host reset opens it again.
+            if not owners and cfg.state.get_owner_genesis() == "open":
+                if not cfg.challenges.consume_owner_challenge(challenge):
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                reg = cfg.state.register_phone(_new(requested))
+                cfg.state.set_owner_genesis("closed")
+                slots_log.warning("owner genesis: slot=%s enrolled phone_id=%s; genesis closed", requested, reg.phone_id)
+                self._send_registered(reg, displaced_ref=None)
+                return
+            slot = requested
+            occupants = [p for p in owners if p.slot == slot]
+            if occupants and not replace_sig:
+                # The slot question - asked only now, after the kind, the proof and the delegation. The challenge is
+                # not consumed: the phone answers on the same one with slot_replace_b64u.
+                occ = occupants[0]
+                self._send_json(HTTPStatus.CONFLICT, {
+                    "error": "slot_occupied",
+                    "slot": slot,
+                    "occupant": {
+                        "phone_ref": occ.phone_id,
+                        "device_label": occ.device_label,
+                        "last_seen_unix": occ.last_seen_unix,
+                        "registered_at_unix": occ.registered_at_unix,
+                    },
+                    "detail": (
+                        f"the {slot} slot holds {occ.device_label!r}; to replace it, "
+                        "retry the same registration with slot_replace_b64u = the identity "
+                        f"key's signature over {SLOT_REPLACE_PREFIX}|{slot}|{occ.phone_id}|<public_key_b64u>"
+                    ),
+                })
+                return
+            occupant = None
+            if occupants:
+                # The incoming key's replace claim names the occupant it displaces - verified before any approval is
+                # parked or spent. It binds the key's intent; the AUTHORITY is the owner phone's approval below.
+                occupant = next((o for o in occupants if verify_signature(
+                    payload=slot_replace_payload(slot, o.phone_id, public_key_b64u),
+                    signature_b64u=replace_sig or "",
+                    public_key_b64u=public_key_b64u,
+                    algorithm=chosen_algo,
+                )), None)
+                if occupant is None:
+                    raise BootloaderError(
+                        "registration refused: slot_replace_b64u does not verify against the incoming identity key "
+                        f"for the occupant of the {slot} slot"
+                    )
+            # THE APPROVERS: every owner phone this enrollment does not displace (the other slot's holder; a registry
+            # from before the slots can hold two). With none, the occupant approves its own replacement (the upgrade
+            # with the old phone in hand). With no owner at all and genesis closed, only the host reset helps.
+            approvers = [p for p in owners if occupant is None or p.phone_id != occupant.phone_id]
+            if not approvers and occupant is not None:
+                approvers = [occupant]
+            if not approvers:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "no_owner_can_approve",
+                    "detail": "no owner phone can approve - the operator's host reset (recto bootloader owner-reset "
+                              "--reopen-genesis) reopens enrollment",
+                })
+                return
+            approver_refs = sorted(p.phone_id for p in approvers)
+            occupant_ref = occupant.phone_id if occupant is not None else None
+            now = int(time.time())
+            records = cfg.state.list_owner_enrolls()
+            # An approval on file for THIS key, THIS slot, the same occupant, given by a phone that is one of the
+            # approvers the rules name NOW (an occupant's self-approval stops counting once another owner exists):
+            # consume it (atomically) with the challenge, and enroll.
+            approver_now = {p.phone_id for p in approvers}
+            for rec in records:
+                if (rec.get("state") == "approved" and rec.get("incoming_pubkey") == public_key_b64u
+                        and rec.get("slot") == slot and rec.get("occupant_ref") == occupant_ref
+                        and int(rec.get("approved_until", 0)) > now and rec.get("approved_by") in approver_now):
+                    # The challenge first: a lapsed one leaves the approval for the next pass.
+                    if not cfg.challenges.consume_owner_challenge(challenge):
+                        raise RegistrationExpiredError("registration challenge expired or invalid")
+                    if cfg.state.delete_owner_enroll(rec["request_id"]) is None:
+                        raise BootloaderError("registration refused: that approval was already spent - pair again")
+                    if occupant is not None:
+                        # One write: the displaced key's registration, sessions and pending queue go and the incoming
+                        # key lands together, so at no moment do two keys - or none - hold the slot.
+                        reg = cfg.state.replace_phone(occupant.phone_id, _new(slot))
+                        if reg is None:
+                            raise BootloaderError("registration refused: the occupant changed - pair again")
+                        slots_log.warning("slot=%s displaced phone_id=%s by phone_id=%s (approved by %s)",
+                                          slot, occupant.phone_id, incoming_ref, rec.get("approved_by"))
+                        void_owner_enrolls_for(cfg.state, occupant.phone_id)
+                    else:
+                        reg = cfg.state.register_phone(_new(slot))
+                    slots_log.warning("owner enroll: slot=%s phone_id=%s approved by %s",
+                                      slot, reg.phone_id, rec.get("approved_by"))
+                    self._send_registered(reg, displaced_ref=occupant_ref)
+                    return
+            # CONTESTED: another key asked for this slot inside the window - every such request is refused, both
+            # callers are told, and the cards are withdrawn. A person comparing two cards is never the only guard.
+            window = now - OWNER_CONTEST_WINDOW_SECONDS
+            rivals = [r for r in records if r.get("slot") == slot and r.get("incoming_pubkey") != public_key_b64u
+                      and int(r.get("created_unix", 0)) >= window]
+            if rivals:
+                for r in [r for r in records if r.get("slot") == slot and int(r.get("created_unix", 0)) >= window]:
+                    self._refuse_owner_enroll(r)
+                # The caller leaves a refused record too, so EITHER key's next ask inside the window is contested.
+                cfg.state.put_owner_enroll({
+                    "request_id": str(uuid.uuid4()), "cards": {}, "incoming_pubkey": public_key_b64u,
+                    "incoming_ref": incoming_ref, "slot": slot, "approver_refs": approver_refs,
+                    "occupant_ref": occupant_ref, "created_unix": now, "not_after": now, "state": "refused",
+                    "approved_by": None, "approved_until": 0, "expires_at_unix": now + OWNER_CONTEST_WINDOW_SECONDS,
+                })
+                cfg.challenges.consume_owner_challenge(challenge)
+                slots_log.warning("owner enroll: slot=%s contested by phone_id=%s - refused", slot, incoming_ref)
+                minutes = OWNER_CONTEST_WINDOW_SECONDS // 60
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "owner_slot_contested",
+                    "slot": slot,
+                    "phone_ref": incoming_ref,
+                    # A second by which no rival counts (exact when a rival was approved; a pending rival's record
+                    # is gone a second sooner). Another ask from the other phone moves it.
+                    "reopens_at_unix": max(int(r.get("created_unix", 0)) for r in rivals) + OWNER_CONTEST_WINDOW_SECONDS
+                    + 1,
+                    "detail": f"This phone is {grouped_ref(incoming_ref)}. Two phones asked for the {slot} slot - "
+                              f"both are refused. Use ONE phone: wait until {minutes} minutes have passed since the last "
+                              "try from EITHER phone, then start again with a new code. If this repeats, someone else "
+                              "holds an owner code.",
+                })
+                return
+            if not cfg.challenges.consume_owner_challenge(challenge):
+                raise RegistrationExpiredError("registration challenge expired or invalid")
+            # Re-use a pending request only while one of its cards is still on an approver's queue; else a fresh one.
+            pending_rec = next((r for r in records if r.get("state") == "pending"
+                                and r.get("incoming_pubkey") == public_key_b64u and r.get("slot") == slot
+                                and r.get("occupant_ref") == occupant_ref
+                                and sorted(r.get("approver_refs", [])) == approver_refs), None)
+            if pending_rec is not None and not self._owner_cards_queued(pending_rec):
+                cfg.state.delete_owner_enroll(pending_rec["request_id"])
+                pending_rec = None
+            if pending_rec is None:
+                self._queue_owner_enroll(slot=slot, incoming_pubkey=public_key_b64u, incoming_ref=incoming_ref,
+                                         approvers=approvers, occupant_ref=occupant_ref)
+        minutes = max(1, int(cfg.owner_approval_ttl_seconds) // 60)
+        if occupant is not None and len(approvers) == 1 and approvers[0].phone_id == occupant.phone_id:
+            detail = (f"This phone is {grouped_ref(incoming_ref)}. Approve that id on the phone now in the {slot} slot "
+                      f"({grouped_ref(occupant.phone_id)}), then pair again with a new code within {minutes} minutes - "
+                      "that pairing removes the old phone. Lost it? The operator's host reset reopens enrollment.")
+        else:
+            where = " or ".join(f"{p.slot} phone ({grouped_ref(p.phone_id)})" for p in approvers)
+            detail = (f"This phone is {grouped_ref(incoming_ref)}. Approve that id on your {where}, then pair again "
+                      f"with a new code within {minutes} minutes.")
+        self._send_json(HTTPStatus.FORBIDDEN, {
+            "error": "owner_approval_required",
+            "slot": slot,
+            "phone_ref": incoming_ref,
+            "detail": detail,
+        })
+
+    def _send_registered(self, reg: PhoneRegistration, *, displaced_ref: str | None) -> None:
+        cfg = self.config
         resp: dict[str, Any] = {
             "registered": True,
             "phone_id": reg.phone_id,
@@ -1383,7 +1668,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # against. The phone signs reads only with the key echoed here.
             "poll_public_key_b64u": reg.poll_public_key_b64u,
             "slot": reg.slot,
-            **({"displaced_phone_ref": occupant.phone_id} if occupant is not None else {}),
+            **({"displaced_phone_ref": displaced_ref} if displaced_ref is not None else {}),
             "bootloader_id": cfg.bootloader_id,
             # Empty managed_secrets for now; the operator wires services
             # to specific phone_ids via service.yaml's
@@ -1410,6 +1695,151 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # every certificate change is answered by GET /v0.4/attest.
             resp["devices_pair_pubkey"] = cfg.devices_pair_signing_pubkey_hex
         self._send_json(HTTPStatus.CREATED, resp)
+
+    # ------------------------------------------------------------------
+    # THE OWNER SLOTS - the approval card and its record
+    # ------------------------------------------------------------------
+
+    def _queue_owner_enroll(self, *, slot: str, incoming_pubkey: str, incoming_ref: str,
+                            approvers: list[PhoneRegistration], occupant_ref: str | None) -> None:
+        """One record, one card per approver. The card's text opens with the incoming key's ref - the same ref the new
+        phone shows - and carries no caller-chosen label; its hash binds the key, the slot, the approver, the
+        occupant, the card and its deadline. Caller holds the registry lock."""
+        cfg = self.config
+        now = int(time.time())
+        not_after = now + OWNER_CARD_TTL_SECONDS
+        record_id = str(uuid.uuid4())
+        minutes = max(1, int(cfg.owner_approval_ttl_seconds) // 60)
+        cards: list[PendingRequest] = []
+        for approver in approvers:
+            if occupant_ref is not None and approver.phone_id == occupant_ref:
+                effect = (f"If it pairs again within {minutes} minutes it takes the slot and "
+                          f"{grouped_ref(occupant_ref)} - THIS phone - is removed. Keep this phone until the new one "
+                          "shows paired.")
+            elif occupant_ref is not None:
+                effect = (f"When it pairs again (within {minutes} minutes) it replaces {grouped_ref(occupant_ref)} in "
+                          "that slot.")
+            else:
+                effect = "The slot is empty."
+            text = (f"{grouped_ref(incoming_ref)} wants the {slot} slot. Approve ONLY if the new phone in your hand "
+                    f"shows exactly this id. {effect} Not pairing a phone right now? Leave this card - it expires in "
+                    "5 minutes; Deny cannot remove it.")
+            card = PendingRequest.new(
+                kind="single_sign", service="recto", secret=f"owner-slot:{slot}", phone_id=approver.phone_id,
+                operation_description=text, payload_hash_b64u="", child_pid=0, child_argv0="(bootloader)",
+                ttl_seconds=OWNER_CARD_TTL_SECONDS,
+            )
+            digest = owner_enroll_digest(
+                bootloader_id=cfg.bootloader_id, slot=slot, incoming_pubkey=incoming_pubkey,
+                incoming_ref=incoming_ref, approver_ref=approver.phone_id, occupant_ref=occupant_ref,
+                request_id=card.request_id, not_after=not_after,
+            )
+            from dataclasses import replace as _replace
+            cards.append(_replace(card, payload_hash_b64u=base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")))
+        cfg.state.put_owner_enroll({
+            "request_id": record_id,
+            "cards": {c.request_id: c.phone_id for c in cards},
+            "incoming_pubkey": incoming_pubkey,
+            "incoming_ref": incoming_ref,
+            "slot": slot,
+            "approver_refs": sorted(a.phone_id for a in approvers),
+            "occupant_ref": occupant_ref,
+            "created_unix": now,
+            "not_after": not_after,
+            "state": "pending",
+            "approved_by": None,
+            "approved_until": 0,
+            "expires_at_unix": now + max(OWNER_CONTEST_WINDOW_SECONDS, OWNER_CARD_TTL_SECONDS),
+        })
+        for card in cards:
+            cfg.state.add_pending(card)
+            self._notify_push(card)
+        logging.getLogger("recto.bootloader.slots").warning(
+            "owner enroll requested: slot=%s phone_id=%s approvers=%s occupant=%s",
+            slot, incoming_ref, [a.phone_id for a in approvers], occupant_ref)
+
+    def _owner_cards_queued(self, rec: dict[str, Any]) -> bool:
+        cfg = self.config
+        for card_id, phone_id in (rec.get("cards") or {}).items():
+            if any(p.request_id == card_id for p in cfg.state.list_pending_for_phone(phone_id)):
+                return True
+        return False
+
+    def _refuse_owner_enroll(self, rec: dict[str, Any]) -> None:
+        """Withdraw the record's cards and mark it refused (it stays until it expires, so a contest stays visible)."""
+        cfg = self.config
+        for card_id in (rec.get("cards") or {}):
+            cfg.state.take_pending(card_id)
+        rec = dict(rec)
+        rec["state"] = "refused"
+        cfg.state.put_owner_enroll(rec)
+
+    def _owner_enroll_for_card(self, request_id: str) -> dict[str, Any] | None:
+        cfg = self.config
+        if cfg.state is None:
+            return None
+        return next((r for r in cfg.state.list_owner_enrolls() if request_id in (r.get("cards") or {})), None)
+
+    def _respond_owner_enroll(self, request_id: str, body: dict[str, Any]) -> None:
+        """An owner-slot card is answered only by a VERIFIED approve: peek, check the deadline, verify the approver's
+        identity signature over the card's hash, and only then take the card. A deny - unsigned on today's phones,
+        so it cannot be told from a stranger's - or an approve that does not verify leaves card and record as they
+        were; the card expires on its own."""
+        cfg = self.config
+        decision = body.get("decision", "")
+        if decision != "approved":
+            self._send_json(HTTPStatus.CONFLICT, {
+                "error": "owner_enroll_not_denied_unsigned",
+                "detail": "an owner-slot card cannot be denied from the phone - leave it and it expires in 5 minutes "
+                          "(an unsigned deny cannot be told from a stranger's)",
+            })
+            return
+        with cfg.state.registry_lock():
+            rec = self._owner_enroll_for_card(request_id)
+            if rec is None:
+                raise PendingRequestNotFoundError(f"request_id {request_id!r} not found")
+            approver_id = rec["cards"][request_id]
+            card = next((p for p in cfg.state.list_pending_for_phone(approver_id) if p.request_id == request_id), None)
+            if card is None or card.is_expired or int(time.time()) >= int(rec.get("not_after", 0)):
+                raise PendingRequestNotFoundError(f"request_id {request_id!r} not found or expired")
+            if rec.get("state") != "pending":
+                self._send_json(HTTPStatus.CONFLICT, {"error": "owner_enroll_closed",
+                                                      "detail": f"this request is {rec.get('state')}"})
+                return
+            approver = cfg.state.get_phone(approver_id)
+            if approver is None or approver.slot not in SLOTS:
+                raise UnknownPhoneError(f"phone {approver_id!r} no longer holds an owner slot")
+            padding = "=" * (-len(card.payload_hash_b64u) % 4)
+            digest = base64.urlsafe_b64decode(card.payload_hash_b64u + padding)
+            ok = verify_signature(
+                payload=digest,
+                signature_b64u=body.get("signature_b64u", ""),
+                public_key_b64u=approver.public_key_b64u,
+                algorithm=_registered_algorithm(approver, approver.phone_id),
+            )
+            if not ok:
+                raise BootloaderError("approved-response signature invalid")
+            occupant_ref = rec.get("occupant_ref")
+            if occupant_ref is not None:
+                occ = cfg.state.get_phone(occupant_ref)
+                if occ is None or occ.slot != rec.get("slot"):
+                    self._refuse_owner_enroll(rec)
+                    self._send_json(HTTPStatus.CONFLICT, {"error": "owner_enroll_closed",
+                                                          "detail": "the slot's occupant changed - pair again"})
+                    return
+            for card_id in rec["cards"]:
+                cfg.state.take_pending(card_id)
+            now = int(time.time())
+            rec = dict(rec)
+            rec["state"] = "approved"
+            rec["approved_by"] = approver.phone_id
+            rec["approved_until"] = now + int(cfg.owner_approval_ttl_seconds)
+            rec["expires_at_unix"] = max(int(rec.get("expires_at_unix", 0)), rec["approved_until"])
+            cfg.state.put_owner_enroll(rec)
+        logging.getLogger("recto.bootloader.slots").warning(
+            "owner enroll approved: slot=%s phone_id=%s by %s", rec.get("slot"), rec.get("incoming_ref"),
+            approver.phone_id)
+        self._send_json(HTTPStatus.OK, {"resolved": True})
 
     def _notify_push(self, req: PendingRequest) -> None:
         """Fire a best-effort silent wake push for a just-queued
@@ -1486,36 +1916,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # A half-supplied pair (sig without ts, or ts without sig) can
         # never verify; classify it as invalid rather than unsigned so
         # the advisory log surfaces broken clients distinctly.
-        verdict = "signed-invalid"
-        if sig and ts_raw:
-            try:
-                ts = int(ts_raw)
-            except ValueError:
-                ts = None
-            if ts is not None and abs(int(time.time()) - ts) <= POLL_SIG_FRESHNESS_SECONDS:
-                payload = f"{POLL_SIG_PREFIX}|{phone.phone_id}|{ts}|{path}"
-                phone_algo = _registered_algorithm(phone, phone.phone_id)
-                # Rule 14.2: reads are signed by the delegated POLL key and
-                # only that key. The identity key is never accepted here, so a
-                # leaked identity signature over a poll is not replayable. A
-                # record with no poll key (only reachable by seeding the store
-                # directly) cannot verify anything: that is a verdict.
-                ok = False
-                if phone.poll_public_key_b64u:
-                    try:
-                        ok = verify_signature(
-                            payload=payload.encode("ascii"),
-                            signature_b64u=sig,
-                            public_key_b64u=phone.poll_public_key_b64u,
-                            algorithm=phone_algo,
-                        )
-                    except BootloaderError:
-                        # Undecodable pubkey / unsupported algo: the signature
-                        # cannot be validated, which is a verdict, not a
-                        # server error.
-                        ok = False
-                if ok:
-                    verdict = "signed-valid"
+        verdict = "signed-valid" if self._poll_signature_valid(phone, path) else "signed-invalid"
 
         if verdict == "signed-valid":
             log.info(
@@ -1537,6 +1938,39 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             mode, path, phone.phone_id,
         )
         return True
+
+    def _poll_signature_valid(self, phone: PhoneRegistration, path: str) -> bool:
+        """True only for a fresh signature by the phone's delegated POLL key over this read - whatever the mode."""
+        sig = (self.headers.get(POLL_SIG_HEADER) or "").strip()
+        ts_raw = (self.headers.get(POLL_SIG_TS_HEADER) or "").strip()
+        if not (sig and ts_raw):
+            return False
+        try:
+            ts = int(ts_raw)
+        except ValueError:
+            return False
+        if abs(int(time.time()) - ts) > POLL_SIG_FRESHNESS_SECONDS:
+            return False
+        payload = f"{POLL_SIG_PREFIX}|{phone.phone_id}|{ts}|{path}"
+        # Rule 14.2: reads are signed by the delegated POLL key and
+        # only that key. The identity key is never accepted here, so a
+        # leaked identity signature over a poll is not replayable. A
+        # record with no poll key (only reachable by seeding the store
+        # directly) cannot verify anything: that is a verdict.
+        if not phone.poll_public_key_b64u:
+            return False
+        try:
+            return verify_signature(
+                payload=payload.encode("ascii"),
+                signature_b64u=sig,
+                public_key_b64u=phone.poll_public_key_b64u,
+                algorithm=_registered_algorithm(phone, phone.phone_id),
+            )
+        except BootloaderError:
+            # Undecodable pubkey / unsupported algo: the signature
+            # cannot be validated, which is a verdict, not a
+            # server error.
+            return False
 
     # ------------------------------------------------------------------
     # POST /v0.4/manage/push_token
@@ -1571,14 +2005,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # string stops being the credential once required-mode flips.
         if not self._check_poll_signature(phone, "/v0.4/manage/push_token"):
             return
-        from dataclasses import replace as _replace
-        updated = _replace(
-            phone,
-            push_token=push_token,
-            push_platform=push_platform,
-            last_seen_unix=int(time.time()),
-        )
-        cfg.state.register_phone(updated)  # upsert semantics
+        # The push fields of a phone the store STILL holds - never an upsert. A phone displaced or revoked between the
+        # read above and this write stays removed (the upsert this replaced put it back in its slot).
+        with cfg.state.registry_lock():
+            if not cfg.state.update_phone_push(phone_id, push_token, push_platform):
+                raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
         self._send_json(HTTPStatus.OK, {
             "updated": True,
             "phone_id": phone_id,
@@ -1656,6 +2087,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # had to). Restamping runs first, so a grant_ttl card's window is
         # judged AFTER card-open sets it, never on the queue-time claims.
         pending = [p for p in pending if not self._withdraw_if_authority_expired(p)]
+        # THE OWNER SLOTS: an owner-slot approval card is served only to a read whose poll signature verifies, in every
+        # mode - an unsigned read names a ref anyone knows, and the card's id would let a stranger work at it.
+        if not self._poll_signature_valid(phone, "/v0.4/pending"):
+            owner_cards = {cid for r in cfg.state.list_owner_enrolls() for cid in (r.get("cards") or {})}
+            pending = [p for p in pending if p.request_id not in owner_cards]
         body: dict[str, Any] = {
             "requests": [self._pending_to_wire(p) for p in pending],
         }
@@ -1819,6 +2255,19 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # Signed-poll gate (phone_id split): possession of the phone_id
         # string stops being the credential once required-mode flips.
         if not self._check_poll_signature(requester, "/v0.4/manage/phones"):
+            return
+        # Rule 14.2 reads, ahead of the flip: the list of phones answers only a read whose poll signature verifies,
+        # in every signed_poll_mode, as an owner card does.
+        if not self._poll_signature_valid(requester, "/v0.4/manage/phones"):
+            sent = bool((self.headers.get(POLL_SIG_HEADER) or "").strip())
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "poll_signature_invalid" if sent else "poll_signature_required",
+                "detail": "/v0.4/manage/phones answers only a read signed by the phone's poll key",
+            })
+            return
+        # THE MEMBER PLANE: a member lists no business phone (and no other member).
+        if requester.slot not in SLOTS:
+            self._send_json(HTTPStatus.OK, {"phones": []})
             return
         others = [
             p for p in cfg.state.list_phones()
@@ -2038,6 +2487,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         cfg = self.config
         if cfg.state is None:
             raise BootloaderError("server not initialized")
+        if self._owner_enroll_for_card(request_id) is not None:
+            self._respond_owner_enroll(request_id, body)
+            return
         req = cfg.state.take_pending(request_id)
         if req is None:
             raise PendingRequestNotFoundError(
@@ -4959,7 +5411,12 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         matching the rest of the agent-trusted surface (an operator
         who hasn't issued any agent tokens has no need for fresh-
         code minting via HTTP -- the launcher's stdout-printed
-        startup code is sufficient).
+        startup code is sufficient). THE OWNER SLOTS: past genesis an
+        owner enrollment spends a code on each of its two passes, so
+        adding or replacing an owner phone needs an agent flagged
+        may_mint_owner_codes; the launcher prints a startup code only
+        while owner genesis is open (the first owner, or after a host
+        reset).
 
         Body (optional): ``{"ttl_seconds": int}``
           - default: 300 (5 minutes)
@@ -5022,6 +5479,15 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"code": code, "expires_at_unix": exp, "ttl_seconds": ttl_seconds,
                                             "plane": "member"})
             return
+        # THE OWNER SLOTS: an OWNER code is the operator's - only an agent whose entry carries
+        # "may_mint_owner_codes": true mints one. Every other agent mints member codes (member_of above).
+        if agent_id not in cfg.owner_code_minters:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "owner_code_mint_not_allowed",
+                "detail": f"agent {agent_id!r} may mint member codes only (member_of); an owner code needs "
+                          "\"may_mint_owner_codes\": true on the agent's entry",
+            })
+            return
         # Mint via the in-process ChallengeStore primitive
         code, exp = cfg.challenges.issue_pairing_code(ttl_seconds=ttl_seconds)
         # Operator-friendly stdout for the foreground-bootloader case
@@ -5039,69 +5505,32 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _handle_revoke_phone(self, body: dict[str, Any]) -> None:
-        """Revoke a paired phone (self-revoke OR sibling-revoke).
+        """Revoke a paired phone: a phone retiring itself (self-revoke) or another phone (sibling-revoke).
 
-        Single endpoint handles both flows:
-          - self-revoke: revoker_phone_id == target_phone_id (the
-            phone is retiring itself; "Unpair" button on the phone UI).
-          - sibling-revoke: revoker_phone_id != target_phone_id (phone A
-            removes phone B; "Revoke" button on the registered-phones
-            list when the target is a sibling). Trust model: any genuine
-            paired phone has implicit authority over its siblings (the
-            "phones-as-master-quorum" model). Phase 5
-            v3 multi-device-per-user architecture will tighten this with
-            capability-JWT-gating; for v1 the signed-challenge from a
-            registered phone IS the authority.
+        THE REVOKE PLANE (hard rule 14.4, amended):
+          - a member phone revokes only itself;
+          - an owner phone revokes an owner phone or a member, 1-of-N (a quorum is v2);
+          - the last owner phone is never revoked - a lost sole phone is the host's act
+            (`recto bootloader owner-reset`).
+        Decided under the registry lock, so two owners revoking each other leave one.
 
-        Auth: signed-challenge from the source phone, NOT capability-
-        agent-token (this endpoint's caller is a paired phone, not an
-        external agent). Mirrors the registration flow's challenge-
-        signature shape:
+        Auth: a signed challenge from the revoking phone, not an agent token. The caller fetches a
+        challenge with GET /v0.4/registration_challenge (no code: a plain challenge), signs the ASCII
+        bytes of ``f"{challenge_b64u}:{target_phone_id}"`` with its identity key (the colon binding
+        keeps a signature for one target from being replayed against another), and POSTs:
 
-          1. Caller fetches a fresh challenge via the existing
-             ``GET /v0.4/registration_challenge`` endpoint.
-          2. Caller signs the ASCII bytes of
-             ``f"{challenge_b64u}:{target_phone_id}"`` with its enclave
-             key. The colon-binding prevents replay -- a captured
-             signature for one target can't be reused against a different
-             target because the payload bytes differ.
-          3. Caller POSTs to this endpoint with the body shape below.
-          4. Bootloader verifies the signature against the revoker's
-             registered pubkey, consumes the challenge (single-use),
-             and removes the target via StateStore.revoke_phone (which
-             cascades to sessions + pending in one transaction).
-
-        Body:
-          ``{"revoker_phone_id": str,
-             "target_phone_id": str,
-             "challenge_b64u": str,
-             "signature_b64u": str}``
+          ``{"revoker_phone_id": str, "target_phone_id": str,
+             "challenge_b64u": str, "signature_b64u": str}``
 
         Response (200):
-          ``{"revoked": true,
-             "revoked_phone_id": str,
-             "was_self_revoke": bool,
-             "remaining_phones_count": int}``
+          ``{"revoked": true, "revoked_phone_id": str,
+             "was_self_revoke": bool, "remaining_phones_count": int}``
 
-        Error responses:
-          - 400 (BootloaderError): missing/malformed body fields,
-            expired challenge, unknown algorithm
-          - 400 (UnknownPhoneError): unknown revoker_phone_id or
-            target_phone_id
-          - 401 (BootloaderError): signature verification failed
-
-        v1 deferred to v2:
-          - capability-JWT-gated sibling-revoke (Phase 5 v3 multi-
-            device-per-user architecture). Today any genuine paired
-            phone can revoke any sibling; v2 ties revocation authority
-            to a capability JWT signed by the operator's BIP-39 key
-            so an attacker who compromises ONE phone can't necessarily
-            revoke OTHER phones.
-          - Quorum-protect-master rule: if revoking a phone would drop
-            the master-tier quorum below the operator-configured
-            threshold (default 1, recommended 2), require additional
-            confirmation. Today we trust the caller to know what
-            they're doing.
+        Errors:
+          - 400: a missing or malformed field, an expired challenge, an unknown revoker or target
+          - 401 revoke_signature_invalid: the signature does not verify against the revoker's key
+          - 403 revoke_plane: a member phone named another phone
+          - 403 last_owner: the target is the last owner phone
         """
         cfg = self.config
         if cfg.state is None or cfg.challenges is None:
@@ -5161,16 +5590,43 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             )
             return
         was_self_revoke = (revoker_phone_id == target_phone_id)
-        removed = cfg.state.revoke_phone(target_phone_id)
-        # Should always be True since we verified target exists above,
-        # but be defensive: a concurrent revoke from another caller
-        # could race us between the get_phone check and this delete.
-        if not removed:
-            raise UnknownPhoneError(
-                f"target phone_id {target_phone_id!r} no longer registered "
-                "(concurrent revoke from another caller?)"
-            )
-        remaining = len(cfg.state.list_phones())
+        # THE REVOKE PLANE (hard rule 14.4, amended): a slot holder revokes a slot holder or a member; a member revokes
+        # only itself; the LAST owner phone is never revoked - a lost sole phone is the operator's host reset. Decided
+        # and done under the registry lock, so two phones revoking each other leave one owner, never none.
+        with cfg.state.registry_lock():
+            revoker = cfg.state.get_phone(revoker_phone_id)
+            target = cfg.state.get_phone(target_phone_id)
+            if revoker is None or target is None:
+                raise UnknownPhoneError("revoker or target phone_id no longer registered")
+            if revoker.slot not in SLOTS and not was_self_revoke:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "revoke_plane",
+                    "detail": "a member phone revokes only itself",
+                })
+                return
+            if target.slot in SLOTS and len([p for p in cfg.state.list_phones() if p.slot in SLOTS]) <= 1:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "last_owner",
+                    "detail": "This is the only owner phone, so it is never revoked. To move to a new phone: pair it "
+                              "with an owner code, approve its card here, and pair it again - that removes this one. "
+                              "Lost phone: on the bootloader host, `recto bootloader owner-reset --slot <slot> "
+                              "--confirm <phone_ref> --reopen-genesis`.",
+                })
+                return
+            removed = cfg.state.revoke_phone(target_phone_id)
+            if removed:
+                # Its approvals, and the requests naming it as the occupant, die with it (a re-pair of the same key
+                # never revives them).
+                void_owner_enrolls_for(cfg.state, target_phone_id)
+            # Should always be True since we verified target exists above,
+            # but be defensive: a concurrent revoke from another caller
+            # could race us between the get_phone check and this delete.
+            if not removed:
+                raise UnknownPhoneError(
+                    f"target phone_id {target_phone_id!r} no longer registered "
+                    "(concurrent revoke from another caller?)"
+                )
+            remaining = len(cfg.state.list_phones())
         print(
             f"[bootloader] phone revoked: target={target_phone_id} "
             f"by revoker={revoker_phone_id} "
@@ -6583,6 +7039,20 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         return
 
 
+class _LockedHTTPServer(ThreadingHTTPServer):
+    """The bootloader's HTTP server: releases the store lock when it closes."""
+
+    store_lock: Any = None
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            if self.store_lock is not None:
+                self.store_lock.release()
+                self.store_lock = None
+
+
 def create_server(
     *,
     bind_host: str,
@@ -6629,6 +7099,7 @@ def create_server(
     clusters_spawn_token: str | None = None,
     clusters_lease_ttl_seconds: int = 180,
     signed_poll_mode: str = "advisory",
+    owner_code_minters: "set[str] | frozenset[str] | list[str] | None" = None,
 ) -> ThreadingHTTPServer:
     """Construct (but do not start) a bootloader HTTPServer.
 
@@ -6729,7 +7200,25 @@ def create_server(
     injection entirely; PendingRequests carry app_context=None and
     the phone shows an "Unknown app" warning banner.
     """
-    server = ThreadingHTTPServer((bind_host, bind_port), BootloaderHandler)
+    # THE STORE LOCK (hard rule 14.4, amended): a serving process holds an exclusive lock on its file-backend state dir
+    # for its lifetime, so the host CLI's owner-reset never edits a registry this process would overwrite from memory.
+    try:
+        store_lock = acquire_server_store_lock(state.state_dir) if isinstance(state, StateStore) else None
+    except StoreLockUnavailable as exc:
+        raise BootloaderError(f"cannot take the store lock: {exc.strerror or exc}") from exc
+    if isinstance(state, StateStore) and store_lock is None:
+        raise BootloaderError(
+            f"another process holds {state.state_dir} (a second bootloader, or the host's `recto bootloader "
+            "owner-reset`) - two servers never share one file-backend store, and owner-reset runs only while the "
+            "bootloader is stopped"
+        )
+    try:
+        server = _LockedHTTPServer((bind_host, bind_port), BootloaderHandler)
+    except BaseException:
+        if store_lock is not None:
+            store_lock.release()
+        raise
+    server.store_lock = store_lock
     if ssl_context is not None:
         server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
     BootloaderHandler.config = BootloaderConfig()
@@ -6801,6 +7290,7 @@ def create_server(
             "change how this process is launched."
         )
     elif _sealed_operator_pubkey != capability_operator_pubkey:
+        server.server_close()   # a refused start leaves no socket and no store lock behind
         raise BootloaderError(
             "REFUSING TO START: the operator pubkey in config disagrees with "
             "the value sealed in this bootloader's vault_root.json. "
@@ -6991,15 +7481,20 @@ def create_server(
     # The pairing-result signing key: refused at startup if the signer
     # cannot run, so a misconfigured bootloader never relays unsigned.
     if devices_pair_signing_key is not None:
-        if len(devices_pair_signing_key) != 32:
-            raise ValueError(
-                f"devices_pair_signing_key must be 32 bytes, got {len(devices_pair_signing_key)}"
-            )
-        from recto.capability.signing import public_key_hex, require_signing
+        try:
+            if len(devices_pair_signing_key) != 32:
+                raise ValueError(
+                    f"devices_pair_signing_key must be 32 bytes, got {len(devices_pair_signing_key)}"
+                )
+            from recto.capability.signing import public_key_hex, require_signing
 
-        require_signing()
+            require_signing()
+            _pair_pubkey_hex = public_key_hex(devices_pair_signing_key)
+        except BaseException:
+            server.server_close()   # a refused start leaves no socket and no store lock behind
+            raise
         BootloaderHandler.config.devices_pair_signing_key = bytes(devices_pair_signing_key)
-        BootloaderHandler.config.devices_pair_signing_pubkey_hex = public_key_hex(devices_pair_signing_key)
+        BootloaderHandler.config.devices_pair_signing_pubkey_hex = _pair_pubkey_hex
     else:
         BootloaderHandler.config.devices_pair_signing_key = None
         BootloaderHandler.config.devices_pair_signing_pubkey_hex = None
@@ -7104,21 +7599,54 @@ def create_server(
     # at first poll: an enforcement mode that silently falls back to a
     # default is a boundary nobody chose.
     if signed_poll_mode not in SIGNED_POLL_MODES:
+        server.server_close()
         raise ValueError(
             f"signed_poll_mode must be one of {SIGNED_POLL_MODES}; "
             f"got {signed_poll_mode!r}"
         )
     BootloaderHandler.config.signed_poll_mode = signed_poll_mode
+    # THE OWNER SLOTS: who mints owner codes, the wrong-code limiter, and the genesis marker - an absent marker (a
+    # store from before it) is decided ONCE: open only on a store with no phone and no session at all.
+    BootloaderHandler.config.owner_code_minters = frozenset(owner_code_minters or ())
+    BootloaderHandler.config.code_limiter = CodeAttemptLimiter()
+    if isinstance(BootloaderHandler.config.challenges, ChallengeStore):
+        # The store actually served - a caller's, or the one built above - so every code minted here is stamped.
+        BootloaderHandler.config.challenges.code_minted = BootloaderHandler.config.code_limiter.stamp
+    _slots_log = logging.getLogger("recto.bootloader.slots")
+    try:
+        with state.registry_lock():
+            genesis = state.get_owner_genesis()
+            if genesis is None:
+                empty = not state.list_phones() and not state.has_any_session()
+                state.set_owner_genesis("open" if empty else "closed")
+            elif genesis == "open" and any(p.slot in SLOTS for p in state.list_phones()):
+                # An open marker beside an owner phone means a genesis close did not land: close it now.
+                state.set_owner_genesis("closed")
+                _slots_log.warning("owner genesis was open beside an owner phone - closed")
+            decided = state.get_owner_genesis()   # read here, under the guard: nothing below touches the store
+    except RegistryLockUnavailable as exc:
+        server.server_close()
+        raise BootloaderError(f"cannot decide the owner genesis marker at startup: {exc}") from exc
+    except BaseException:
+        server.server_close()   # a refused start leaves no socket and no store lock behind
+        raise
+    _slots_log.info("owner genesis: %s; owner-code minters: %s", decided,
+                    sorted(BootloaderHandler.config.owner_code_minters) or "none")
+    if decided == "open":
+        _slots_log.warning("owner genesis is OPEN: the next owner pairing code alone enrolls the first owner phone - "
+                           "pair it now, over the operator's own route")
     _poll_log = logging.getLogger("recto.bootloader.signed_polls")
     if signed_poll_mode == "advisory":
         _poll_log.info(
             "signed_poll_mode=advisory: possession-of-phone_id reads are "
-            "ALLOWED and each poll's verdict (signed-valid / "
+            "ALLOWED (not the phone list or owner-slot cards, which need a "
+            "verified signature in every mode) and each poll's verdict (signed-valid / "
             "signed-invalid / unsigned) is logged. Flip to 'required' "
             "once the evidence window shows every live phone signing."
         )
     elif signed_poll_mode == "off":
         _poll_log.info(
-            "signed_poll_mode=off: poll signatures are not processed."
+            "signed_poll_mode=off: poll signatures are not checked, except on the phone list and owner-slot "
+            "cards, which need a verified signature in every mode."
         )
     return server

@@ -47,15 +47,22 @@ first (banked follow-on in docs/production-scale-brief.md).
 from __future__ import annotations
 
 import base64
+import hashlib
+import logging
 import secrets
+import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from recto.bootloader.state import (
     GENESIS_LEGACY_ALGORITHM,
+    OWNER_GENESIS_STATES,
     AppContext,
+    RegistryLockUnavailable,
     CapabilityResult,
     GenesisMember,
     PendingRequest,
@@ -144,6 +151,12 @@ CREATE TABLE IF NOT EXISTS {schema}.challenges (
     expires_at_unix bigint NOT NULL,
     PRIMARY KEY (kind, value)
 );
+
+-- THE OWNER SLOTS (hard rule 14.4, amended): small registry facts, one row each (the owner-genesis marker).
+CREATE TABLE IF NOT EXISTS {schema}.registry_meta (
+    key        text PRIMARY KEY,
+    value      jsonb NOT NULL
+);
 """
 
 # Result-table ``kind`` discriminators. One table, four result families
@@ -154,15 +167,39 @@ _KIND_CAPABILITY = "capability"
 _KIND_PROFILE_CREATE = "profile_create"
 _KIND_PROFILE_ADD_DEVICE = "profile_add_device"
 _KIND_PROFILE_REVOKE_DEVICE = "profile_revoke_device"
+# THE OWNER SLOTS: an approval card's record (what it binds and where it stands) - the results table's TTL and its
+# DELETE ... RETURNING take serve it unchanged.
+# How long registry_lock waits for the lock - for another thread of this process and another instance together, one
+# deadline - before it refuses. (Checking out the lock's pooled connection may add the pool's own timeout.)
+REGISTRY_LOCK_WAIT_SECONDS = 30
+_KIND_OWNER_ENROLL = "owner_enroll"
+_META_OWNER_GENESIS = "owner_genesis"
 
 
 class PostgresStateStore(StateStoreBase):
     """StateStoreBase on PostgreSQL (psycopg3 + connection pool).
 
     Thread-safe by construction: every operation borrows a pooled
-    connection and runs in its own transaction; no process-level lock.
-    Safe to share across the ThreadingHTTPServer's request threads AND
-    across bootloader instances pointed at the same database.
+    connection and runs in its own transaction. Safe to share across the
+    ThreadingHTTPServer's request threads AND across bootloader instances
+    pointed at the same database. The one exception is registry_lock():
+    a process lock plus a transaction-scoped advisory lock held in one
+    pooled connection's open transaction for the length of an owner-slot
+    decision. The DSN may be a direct connection or a session-mode pooler;
+    a transaction-mode pooler (PgBouncer, Supavisor) needs prepared-
+    statement support (PgBouncer 1.21+ with max_prepared_statements > 0).
+    The lock is waited for at most REGISTRY_LOCK_WAIT_SECONDS - in this
+    process and in the database, one deadline - then refused
+    (RegistryLockUnavailable). The lock connection overrides a role's
+    statement, idle-in-transaction and transaction timeouts for its own
+    transaction only. A holder whose host vanished keeps it until
+    the server ends that session: it shows in pg_locks (locktype
+    'advisory') and in pg_stat_activity as 'idle in transaction', and
+    pg_terminate_backend(pid) frees it. A LIVE holder also shows 'idle in
+    transaction': before pg_terminate_backend, check that
+    pg_stat_activity.xact_start is far older than any act, or stop the
+    servers first - terminating a live holder frees the lock while its act
+    continues on other connections.
     """
 
     #: Identifier-safe schema name guard -- the schema is interpolated
@@ -192,6 +229,14 @@ class PostgresStateStore(StateStoreBase):
             )
         self._schema = schema
         self._dir = state_dir if state_dir is not None else default_state_dir()
+        self._registry_rlock = threading.RLock()
+        # registry_lock's own state, touched only while _registry_rlock is held: the nesting depth and the pooled
+        # connection whose open transaction holds the advisory lock for the outermost holder.
+        self._registry_depth = 0
+        self._registry_conn_cm: Any = None
+        # One advisory-lock key per schema: instances on the same schema share it, other schemas never contend.
+        self._registry_lock_key = int.from_bytes(
+            hashlib.sha256(f"recto-registry:{schema}".encode("ascii")).digest()[:8], "big", signed=True)
         self._pool = ConnectionPool(
             dsn,
             min_size=pool_min,
@@ -203,8 +248,12 @@ class PostgresStateStore(StateStoreBase):
         # construction time (launcher fail-loud posture), not 30s into
         # the first request. wait() blocks until min_size connections
         # are live or raises PoolTimeout.
-        self._pool.wait(timeout=connect_timeout_seconds)
-        self._ensure_schema()
+        try:
+            self._pool.wait(timeout=connect_timeout_seconds)
+            self._ensure_schema()
+        except BaseException:
+            self._pool.close()   # a store that failed to open leaves no pool behind
+            raise
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -724,6 +773,7 @@ class PostgresStateStore(StateStoreBase):
     # THE MEMBER PLANE (2026-09-30): the same table, two more kinds - no schema change.
     _CHALLENGE_KIND_MEMBER_PAIRING_CODE = "member_pairing_code"
     _CHALLENGE_KIND_MEMBER_REGISTRATION = "member_registration"
+    _CHALLENGE_KIND_OWNER_REGISTRATION = "owner_registration"
 
     def _issue_one_time(self, kind: str, value: str, ttl_seconds: int) -> int:
         exp = int(time.time()) + ttl_seconds
@@ -781,11 +831,29 @@ class PostgresStateStore(StateStoreBase):
         )
 
     def issue_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
-        code = f"{secrets.randbelow(1_000_000):06d}"
+        code = self._unique_code()
         exp = self._issue_one_time(
             self._CHALLENGE_KIND_PAIRING_CODE, code, ttl_seconds
         )
         return code, exp
+
+    def _unique_code(self) -> str:
+        # Owner and member codes share one 6-digit space and the challenge GET tries the owner code first: a new code
+        # is unique across both live kinds.
+        now = int(time.time())
+        with self._pool.connection() as conn:
+            for _ in range(64):
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                row = conn.execute(
+                    self._q(
+                        "SELECT 1 FROM {schema}.challenges WHERE value = %s AND kind IN (%s, %s) "
+                        "AND expires_at_unix > %s"
+                    ),
+                    (code, self._CHALLENGE_KIND_PAIRING_CODE, self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, now),
+                ).fetchone()
+                if row is None:
+                    return code
+        raise RuntimeError("no free pairing code after 64 draws")
 
     def consume_pairing_code(self, code: str) -> bool:
         return self._consume_one_time(
@@ -793,7 +861,7 @@ class PostgresStateStore(StateStoreBase):
         )
 
     def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
-        code = f"{secrets.randbelow(1_000_000):06d}"
+        code = self._unique_code()
         return code, self._issue_one_time(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code, ttl_seconds)
 
     def consume_member_pairing_code(self, code: str) -> bool:
@@ -814,3 +882,174 @@ class PostgresStateStore(StateStoreBase):
 
     def consume_member_challenge(self, challenge: str) -> bool:
         return self._consume_one_time(self._CHALLENGE_KIND_MEMBER_REGISTRATION, challenge)
+
+    # THE OWNER SLOTS (hard rule 14.4, amended): an owner code's challenge is its own kind - the same table, no schema
+    # change. The genesis marker lives in registry_meta; the owner-enroll records in results (kind owner_enroll).
+    def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+        return c, self._issue_one_time(self._CHALLENGE_KIND_OWNER_REGISTRATION, c, ttl_seconds)
+
+    def is_owner_challenge(self, challenge: str) -> bool:
+        now = int(time.time())
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q("SELECT expires_at_unix FROM {schema}.challenges WHERE kind = %s AND value = %s"),
+                (self._CHALLENGE_KIND_OWNER_REGISTRATION, challenge),
+            ).fetchone()
+        return row is not None and now < row[0]
+
+    def consume_owner_challenge(self, challenge: str) -> bool:
+        return self._consume_one_time(self._CHALLENGE_KIND_OWNER_REGISTRATION, challenge)
+
+    def get_owner_genesis(self) -> str | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q("SELECT value->>'state' FROM {schema}.registry_meta WHERE key = %s"),
+                (_META_OWNER_GENESIS,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[0] not in OWNER_GENESIS_STATES:
+            raise ValueError(f"registry_meta owner_genesis holds {row[0]!r}; expected one of {OWNER_GENESIS_STATES}")
+        return row[0]
+
+    def set_owner_genesis(self, state: str) -> None:
+        if state not in OWNER_GENESIS_STATES:
+            raise ValueError(f"owner genesis must be one of {OWNER_GENESIS_STATES}; got {state!r}")
+        with self._pool.connection() as conn:
+            conn.execute(
+                self._q(
+                    "INSERT INTO {schema}.registry_meta (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                ),
+                (_META_OWNER_GENESIS, Jsonb({"state": state})),
+            )
+
+    def put_owner_enroll(self, record: dict[str, Any]) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                self._q(
+                    "INSERT INTO {schema}.results (kind, request_id, doc, expires_at_unix) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (kind, request_id) DO UPDATE "
+                    "SET doc = EXCLUDED.doc, expires_at_unix = EXCLUDED.expires_at_unix"
+                ),
+                (_KIND_OWNER_ENROLL, record["request_id"], Jsonb(dict(record)), int(record["expires_at_unix"])),
+            )
+
+    def get_owner_enroll(self, request_id: str) -> dict[str, Any] | None:
+        return self._get_result(_KIND_OWNER_ENROLL, request_id)
+
+    def list_owner_enrolls(self) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            self._purge_expired(conn, "results")
+            rows = conn.execute(
+                self._q("SELECT doc FROM {schema}.results WHERE kind = %s ORDER BY request_id"),
+                (_KIND_OWNER_ENROLL,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def delete_owner_enroll(self, request_id: str) -> dict[str, Any] | None:
+        return self._take_result(_KIND_OWNER_ENROLL, request_id)
+
+    def update_phone_push(self, phone_id: str, push_token: str, push_platform: str) -> bool:
+        # One UPDATE on a row that exists: a removed phone is never written back (the INSERT ... ON CONFLICT upsert
+        # register_phone does would re-insert it).
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q(
+                    "UPDATE {schema}.phones SET doc = doc || %s WHERE phone_id = %s RETURNING phone_id"
+                ),
+                (Jsonb({"push_token": push_token, "push_platform": push_platform,
+                        "last_seen_unix": int(time.time())}), phone_id),
+            ).fetchone()
+        return row is not None
+
+    def replace_phone(self, occupant_phone_id: str, reg: PhoneRegistration) -> PhoneRegistration | None:
+        # The displacement in ONE transaction: the occupant's row, sessions and queue go and the incoming row lands, or
+        # nothing changes.
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                deleted = conn.execute(
+                    self._q("DELETE FROM {schema}.phones WHERE phone_id = %s RETURNING phone_id"),
+                    (occupant_phone_id,),
+                ).fetchone()
+                if deleted is None:
+                    return None
+                conn.execute(self._q("DELETE FROM {schema}.sessions WHERE doc->>'phone_id' = %s"), (occupant_phone_id,))
+                conn.execute(self._q("DELETE FROM {schema}.pending WHERE phone_id = %s"), (occupant_phone_id,))
+                row = conn.execute(
+                    self._q("SELECT doc FROM {schema}.phones WHERE doc->>'public_key_b64u' = %s LIMIT 1"),
+                    (reg.public_key_b64u,),
+                ).fetchone()
+                stored = _merge_onto_existing(self._phone_from_doc(row[0]) if row else None, reg)
+                conn.execute(
+                    self._q(
+                        "INSERT INTO {schema}.phones (phone_id, doc) VALUES (%s, %s) "
+                        "ON CONFLICT (phone_id) DO UPDATE SET doc = EXCLUDED.doc"
+                    ),
+                    (stored.phone_id, Jsonb(self._phone_to_doc(stored))),
+                )
+        return stored
+
+    def has_any_session(self) -> bool:
+        with self._pool.connection() as conn:
+            row = conn.execute(self._q("SELECT 1 FROM {schema}.sessions LIMIT 1")).fetchone()
+        return row is not None
+
+    @contextmanager
+    def registry_lock(self) -> Iterator[None]:
+        # The process lock first; then, for the OUTERMOST holder only, one pooled connection opens a transaction and
+        # takes a transaction-scoped advisory lock on the schema's key, so every instance sharing the database
+        # serializes. The lock ends with that transaction - at commit or rollback, or when the server ends the session
+        # - so no unlock statement can miss or land on another server session behind a pooler. The locked work runs on
+        # its own pooled connections, never inside this transaction. Nested holds on the same thread reuse the one
+        # hold: a second connection would wait on the first for ever. Both waits are bounded.
+        deadline = time.monotonic() + REGISTRY_LOCK_WAIT_SECONDS
+        if not self._registry_rlock.acquire(timeout=REGISTRY_LOCK_WAIT_SECONDS):
+            raise RegistryLockUnavailable(
+                f"the registry lock of schema {self._schema!r} is held by another thread of this process")
+        try:
+            if self._registry_depth == 0:
+                # What is left of the one deadline, in milliseconds. Never 0: in Postgres a lock_timeout of 0 means
+                # no timeout at all.
+                left_ms = int((deadline - time.monotonic()) * 1000)
+                if left_ms < 1:
+                    raise RegistryLockUnavailable(
+                        f"the registry lock of schema {self._schema!r} is held by another thread of this process")
+                cm = self._pool.connection()
+                conn = cm.__enter__()
+                try:
+                    # This transaction is idle by design while the body works, and its one statement may wait: no
+                    # role timeout cuts it off - lock_timeout is the only bound on the wait.
+                    conn.execute("SET LOCAL idle_in_transaction_session_timeout = 0")
+                    conn.execute("SET LOCAL statement_timeout = 0")
+                    if conn.info.server_version >= 170000:
+                        conn.execute("SET LOCAL transaction_timeout = 0")
+                    conn.execute(f"SET LOCAL lock_timeout = '{left_ms}ms'")
+                    conn.execute("SELECT pg_advisory_xact_lock(%s)", (self._registry_lock_key,))
+                except BaseException as exc:
+                    cm.__exit__(*sys.exc_info())   # rolls back (ending any lock taken) and returns the connection
+                    if getattr(exc, "sqlstate", None) == "55P03":   # lock_not_available
+                        raise RegistryLockUnavailable(
+                            f"the registry lock of schema {self._schema!r} was not granted within "
+                            f"{REGISTRY_LOCK_WAIT_SECONDS} s - another holder keeps it (see pg_locks)") from exc
+                    raise
+                self._registry_conn_cm = cm
+            self._registry_depth += 1
+            try:
+                yield
+            finally:
+                self._registry_depth -= 1
+                if self._registry_depth == 0:
+                    cm, self._registry_conn_cm = self._registry_conn_cm, None
+                    try:
+                        cm.__exit__(None, None, None)   # commits: the lock ends with the transaction
+                    except Exception:
+                        # The locked work already landed on its own connections.
+                        logging.getLogger("recto.bootloader.state").error(
+                            "registry lock: ending the lock's transaction failed - the lock is held until the server "
+                            "ends that session (at once after a rollback or a clean close; later if the server has "
+                            "not noticed a lost client)", exc_info=True)
+        finally:
+            self._registry_rlock.release()

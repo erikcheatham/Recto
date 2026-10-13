@@ -88,8 +88,9 @@ def main() -> None:
     # launcher has no way to mint a code on it, and pairing is impossible
     # without first hitting some out-of-band code-issue endpoint (which
     # the bare bootloader doesn't ship). Owning the ChallengeStore here
-    # is the canonical fix.
-    challenges = ChallengeStore()
+    # is the canonical fix, backed by the same state store the server
+    # uses, as the consumer launcher does.
+    challenges = ChallengeStore(state=state)
 
     # Locate the bundled v1 action manifest -- ships with the Recto
     # package at recto/capability/manifest_v1.json. The bootloader's
@@ -138,7 +139,10 @@ def main() -> None:
     # URL. The default ttl_seconds is 300 (5 min) which is too tight
     # for the typical "find phone, unlock, open app, type" sequence on
     # a fresh-pair flow -- bump to 3600 for breathing room.
-    pairing_code, pairing_exp = challenges.issue_pairing_code(ttl_seconds=3600)
+    # The startup code is minted only while owner genesis is open (the first owner, or after a host reset).
+    pairing_code, pairing_exp = (
+        challenges.issue_pairing_code(ttl_seconds=3600) if state.get_owner_genesis() == "open" else (None, None)
+    )
 
     pubkey = state.get_operator_pubkey()
     pubkey_status = (
@@ -153,15 +157,24 @@ def main() -> None:
     print(f"{pubkey_status}")
     print(f"Agents:    myservice-agent (token = {agent_token[:8]}...)")
     print()
-    print("=" * 60)
-    print(f"PAIRING CODE:  {pairing_code}")
-    print(f"               (valid 60 min; expires unix {pairing_exp})")
-    print("=" * 60)
-    print()
-    print("From your phone, open the Recto MAUI app -> Pair screen, enter:")
-    print(f"   bootloader URL = http://<this-machine-LAN-ip>:{BIND_PORT}")
-    print(f"   pairing code   = {pairing_code}")
-    print()
+    if pairing_code is None:
+        if any(p.slot in ("primary", "recovery") for p in state.list_phones()):
+            print("No pairing code issued at startup: owner genesis is closed (an owner phone is enrolled).")
+        else:
+            print("No pairing code issued at startup: owner genesis is closed and no owner phone is enrolled - stop this "
+                  "bootloader, run `recto bootloader owner-reset --reopen-genesis` (alone) on the host, then start it "
+                  "again.")
+        print()
+    else:
+        print("=" * 60)
+        print(f"PAIRING CODE:  {pairing_code}")
+        print(f"               (valid 60 min; expires unix {pairing_exp})")
+        print("=" * 60)
+        print()
+        print("From your phone, open the Recto MAUI app -> Pair screen, enter:")
+        print(f"   bootloader URL = http://<this-machine-LAN-ip>:{BIND_PORT}")
+        print(f"   pairing code   = {pairing_code}")
+        print()
     print("From MyService DevTools, hit the Recto tab and click Round-trip.")
     print("Ctrl-C to stop.")
     print()

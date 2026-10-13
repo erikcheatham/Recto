@@ -225,8 +225,10 @@ def test_a_configured_id_is_IGNORED_when_the_vault_is_sealed(tmp_path, caplog):
             "the warning must name BOTH -- someone debugging a phone that "
             "stopped verifying needs to see the old name and the new identity"
         )
+        # The identity logger only: a fresh store also logs, by design, that owner genesis is open.
         assert any(
             r.levelno >= logging.WARNING for r in caplog.records
+            if r.name == "recto.bootloader.identity"
         ), "a disagreeing config is inert, not harmless -- it must WARN"
     finally:
         try:
@@ -252,7 +254,9 @@ def test_an_AGREEING_config_is_not_reported_as_a_problem(tmp_path, caplog):
     try:
         from recto.bootloader.server import BootloaderHandler
         assert BootloaderHandler.config.bootloader_id == derived
-        assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+        # The identity logger only: a fresh store also logs, by design, that owner genesis is open.
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records
+                       if r.name == "recto.bootloader.identity"), (
             "restating the derived id is redundant, not hostile"
         )
     finally:
