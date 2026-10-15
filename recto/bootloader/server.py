@@ -1092,6 +1092,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_connections_enable(body)
             elif url.path == "/v0.4/connections/delete":
                 self._handle_connections_delete(body)
+            elif url.path == "/v0.4/connections/act":
+                self._handle_connections_act(body)
             elif url.path == "/v0.4/user-vault/set":
                 self._handle_user_vault_set(body)
             elif url.path == "/v0.4/user-vault/delete":
@@ -3939,6 +3941,43 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             raise BootloaderError(
                 f"claims failed CapabilityClaims validation: {exc}"
             ) from exc
+        # A connection act (enable / disable / delete one connection) is
+        # carded only for the exact tuple it will act on, and only with the
+        # bootloader's own rendering of that tuple as its purpose - the card
+        # shows the purpose, not the pinned fingerprint. The same verifier
+        # runs again at POST /v0.4/connections/act. The grant window is never
+        # re-stamped at card-open: the tuple's not_after IS the grant's exp.
+        from recto.connections.act_record import (
+            ActRecord as _ActRecord,
+            ActRefused as _ActRefused,
+            names_connection_act as _names_connection_act,
+            verify_act_grant as _verify_act_grant,
+        )
+        act_raw = body.get("connections_act")
+        if act_raw is not None or _names_connection_act(claims):
+            if act_raw is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "act_record_required",
+                    "detail": "a connections:* request carries its connections_act record",
+                })
+                return
+            if grant_ttl_seconds is not None:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "grant_ttl_not_admitted",
+                    "detail": "a connection act's window is its record's not_after; it is never re-stamped",
+                })
+                return
+            try:
+                act_record = _ActRecord.from_dict(act_raw)
+                _verify_act_grant(claims, act_record, bootloader_id=cfg.bootloader_id)
+            except _ActRefused as e:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+                return
+            if claims.exp <= int(time.time()):
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "expired", "detail": "the act's window has already closed",
+                })
+                return
         # Requestable-action policy: evaluated BEFORE carding, so a
         # request outside the agent's declared surface is refused here
         # and never spends the operator's attention. Deny-by-default
@@ -6790,6 +6829,118 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             "deleted": removed is not None,
             "connection": removed.to_dict() if removed else None,
         })
+
+    def _handle_connections_act(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/connections/act -- enable, disable or delete ONE
+        connection on the operator's phone-signed grant. Body
+        ``{jws, record}``; ``record`` is ``{bootloader_id, service, key,
+        verb, not_after}`` (``recto.connections.act_record``).
+
+        The grant is the only authority: no operator token is read here.
+        In order, each a named refusal: the JWS verifies against the
+        operator's key, names this bootloader and is inside its window
+        (``grant_signature_invalid``); its jti is not yet spent
+        (``grant_replayed``); then the jti is SPENT, so a grant that fails
+        any later check is dead too; then ``verify_act_grant`` (one
+        connections action, single use, the record's fingerprint and
+        purpose, the service in scope); then the row exists
+        (``connection_not_found``); then the act. Each act and refusal
+        is logged by name (verb, service, key, jti, outcome), never a value.
+
+        Disabled (404) when connections are not configured; 503 when no
+        operator key is configured to verify against.
+        """
+        cfg = self.config
+        if not cfg.connections_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        if cfg.capability_operator_pubkey is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "operator_pubkey_not_configured",
+                "detail": "a connection act verifies against capability_operator_pubkey",
+            })
+            return
+        jws = body.get("jws")
+        record_raw = body.get("record")
+        if not isinstance(jws, str) or not jws.strip():
+            raise BootloaderError("jws is required")
+        if not isinstance(record_raw, dict):
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "record_required",
+                "detail": "body.record {bootloader_id, service, key, verb, not_after} is required",
+            })
+            return
+
+        from pathlib import Path as _Path
+        from recto.capability.jwt import verify_jws as _verify_jws
+        from recto.connections.act_record import ActRecord, ActRefused, verify_act_grant
+        from recto.connections.manage import delete_connection, get_connection_meta, set_enabled
+        logger = logging.getLogger("recto.bootloader.connections")
+
+        def refuse(status: HTTPStatus, error: str, detail: str, record: Any = None, jti: str | None = None) -> None:
+            logger.warning(
+                "connections act REFUSED %s: verb=%r service=%r key=%r jti=%r",
+                error, getattr(record, "verb", None), getattr(record, "service", None),
+                getattr(record, "key", None), jti,
+            )
+            self._send_json(status, {"error": error, "detail": detail})
+
+        try:
+            record = ActRecord.from_dict(record_raw)
+        except ActRefused as e:
+            refuse(HTTPStatus.BAD_REQUEST, e.name, e.detail)
+            return
+        try:
+            claims = _verify_jws(
+                jws,
+                expected_pubkey=cfg.capability_operator_pubkey,
+                expected_aud=cfg.bootloader_id,
+            )
+        except ValueError as e:
+            refuse(HTTPStatus.FORBIDDEN, "grant_signature_invalid", str(e), record)
+            return
+        if cfg.state.is_revoked(claims.jti):
+            refuse(HTTPStatus.FORBIDDEN, "grant_replayed", "jti already spent or revoked", record, claims.jti)
+            return
+        now = int(time.time())
+        cfg.state.add_revocation(RevocationEntry(
+            jti=claims.jti,
+            revoked_at_unix=now,
+            original_exp_unix=int(claims.exp),
+            reason=f"spent: connections:{record.verb}",
+        ))
+        try:
+            verify_act_grant(claims, record, bootloader_id=cfg.bootloader_id)
+        except ActRefused as e:
+            refuse(HTTPStatus.FORBIDDEN, e.name, e.detail, record, claims.jti)
+            return
+
+        path = _Path(cfg.connections_path)
+        if get_connection_meta(path, record.service, record.key) is None:
+            refuse(HTTPStatus.NOT_FOUND, "connection_not_found", "no such connection", record, claims.jti)
+            return
+        try:
+            if record.verb == "delete":
+                secret_kwargs: dict[str, Any] = {}
+                if cfg.connections_secret_source_factory is not None:
+                    secret_kwargs["secret_source_factory"] = cfg.connections_secret_source_factory
+                removed = delete_connection(path, service=record.service, key=record.key, **secret_kwargs)
+                answer: dict[str, Any] = {
+                    "deleted": removed is not None,
+                    "connection": removed.to_dict() if removed else None,
+                }
+            else:
+                meta = set_enabled(path, record.service, record.key, record.verb == "enable")
+                answer = {"connection": meta.to_dict()}
+        except ValueError as exc:
+            refuse(HTTPStatus.BAD_REQUEST, "act_failed", str(exc), record, claims.jti)
+            return
+        logger.info(
+            "connections act DONE: verb=%r service=%r key=%r jti=%r",
+            record.verb, record.service, record.key, claims.jti,
+        )
+        answer.update({"verb": record.verb, "jti": claims.jti})
+        self._send_json(HTTPStatus.OK, answer)
 
     # ------------------------------------------------------------------
     # /v0.4/user-vault/* -- Recto User Vault Substrate (2026-07-25)
