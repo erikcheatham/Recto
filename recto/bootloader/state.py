@@ -1978,6 +1978,16 @@ class StateStoreBase(ABC):
     @abstractmethod
     def list_revocations(self) -> list[RevocationEntry]: ...
 
+    # THE USER-VAULT GRANTS (2026-10-17, R-series step 2). A grant is a dict: grant_id, record (the signed
+    # GrantRecord fields), signature_b64u, signer_phone_ref, admitted_at_unix. One live grant per (consumer, subject,
+    # agent_handle, key): a newer one replaces it. Revocation rides the revocation list (jti "uvgrant:<grant_id>").
+    @abstractmethod
+    def put_user_vault_grant(self, grant: dict[str, Any]) -> None: ...
+    @abstractmethod
+    def get_user_vault_grant(self, grant_id: str) -> dict[str, Any] | None: ...
+    @abstractmethod
+    def list_user_vault_grants(self, consumer: str, subject: str) -> list[dict[str, Any]]: ...
+
     # One-time challenges (registration challenges + pairing codes).
     # Part of the state contract so multi-instance backends can share
     # them: the file backend keeps them in-memory (restart invalidates
@@ -3014,6 +3024,35 @@ class StateStore(StateStoreBase):
     def has_any_session(self) -> bool:
         with self._lock:
             return bool(self._sessions)
+
+    # THE USER-VAULT GRANTS (file backend): user_vault_grants.json in the state dir, read and rewritten under the lock.
+    def _load_grants(self) -> list[dict[str, Any]]:
+        path = self._dir / "user_vault_grants.json"
+        if not path.exists():
+            return []
+        with _naming(path):
+            return list(json.loads(path.read_text(encoding="utf-8")).get("grants", []))
+
+    def put_user_vault_grant(self, grant: dict[str, Any]) -> None:
+        r = grant["record"]
+        slot = (r["consumer"], r["subject"], r["agent_handle"], r["key"])
+        now = int(time.time())
+        with self._lock:
+            kept = [g for g in self._load_grants()
+                    if (g["record"]["consumer"], g["record"]["subject"], g["record"]["agent_handle"],
+                        g["record"]["key"]) != slot
+                    and int(g["record"]["not_after"]) > now]
+            kept.append(dict(grant))
+            self._atomic_write(self._dir / "user_vault_grants.json", {"grants": kept})
+
+    def get_user_vault_grant(self, grant_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return next((g for g in self._load_grants() if g["grant_id"] == grant_id), None)
+
+    def list_user_vault_grants(self, consumer: str, subject: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [g for g in self._load_grants()
+                    if g["record"]["consumer"] == consumer and g["record"]["subject"] == subject]
 
     @contextmanager
     def registry_lock(self) -> Iterator[None]:

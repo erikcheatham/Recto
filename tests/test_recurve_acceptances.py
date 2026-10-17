@@ -25,6 +25,8 @@ Pinned elsewhere, named here so the map is whole:
        test_bootloader_devices_pair.py::TestRule15PairRecordCarriesAHandle
   15.p the auth-only kind reaches the server, and a malformed one stops startup:
        test_capability_consumer_actions.py::test_an_auth_only_agent_reaches_the_server (and its three siblings)
+  15.w the grant store, both backends (one live grant per slot; an expired one dropped):
+       test_state_postgres.py::test_a_grant_is_stored_found_and_listed and its two siblings
   15.q the relay log carries the status only:
        test_bootloader_devices_pair.py::TestRule15PairRecordCarriesAHandle
        ::test_the_relay_log_carries_the_status_only
@@ -426,3 +428,232 @@ class TestRule15rADeviceLabelIsGenerated:
         assert status in (200, 201), body
         assert rule15_ctx["state"].get_phone(a.ref).device_label == generated_device_label(a.ref)
         assert generated_device_label(a.ref).startswith("phone-") and len(generated_device_label(a.ref)) == 10
+
+
+# ---------------------------------------------------------------------------
+# 15.s - 15.w: the user-vault grant and its revocation (2026-10-17, R-series step 2)
+# ---------------------------------------------------------------------------
+
+_UVA_ID, _UVA_TOKEN = "rule15-uv-platform", "rule15-uv-platform-token"
+_PLATFORM = "Rule15Platform"
+
+
+@pytest.fixture
+def uv_ctx(tmp_path: Path):
+    """A bootloader with the user vault ON (in-memory values) and the member plane, so a phone can be bound to a
+    subject and sign grants for it."""
+    import threading
+
+    from recto.bootloader.server import create_server
+    from recto.bootloader.state import StateStore
+    from tests.test_bootloader_user_vault import _MemoryVault
+
+    state = StateStore(state_dir=tmp_path)
+    challenges = ChallengeStore(state=state)
+    vault = _MemoryVault()
+    server = create_server(
+        bind_host="127.0.0.1", bind_port=0, state=state, bootloader_id="rule15-test",
+        challenges=challenges, ssl_context=None, signed_poll_mode="required",
+        capability_agent_tokens={_AGENT_ID: _AGENT_TOKEN, _UVA_ID: _UVA_TOKEN},
+        user_vault_path=str(tmp_path / "user_vault.json"),
+        user_vault_agent_platforms={_UVA_ID: _PLATFORM},
+        user_vault_secret_source_factory=vault.factory,
+    )
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {"base_url": f"http://{host}:{port}", "state": state, "challenges": challenges, "dir": tmp_path}
+    finally:
+        server.shutdown()
+
+
+def _bound(ctx, name: str = "a", member: str = "member-1"):
+    """A phone registered on a member code for _handle(member) - bound to (_CONSUMER, that subject)."""
+    from tests.test_bootloader_slots import Phone
+
+    phone, subject = Phone(name), _handle(member)
+    assert _register(ctx, phone, _member_challenge(ctx, subject))[0] in (200, 201)
+    return phone, subject
+
+
+def _grant_dict(subject: str, **over) -> dict:
+    d = {"bootloader_id": "rule15-test", "consumer": _CONSUMER, "subject": subject,
+         "agent_handle": _handle("agent-1"), "key": "user-ai-xai", "scope": "AgentChat",
+         "not_after": int(time.time()) + 30 * 86400, "nonce": "nonce-" + uuid.uuid4().hex[:16]}
+    d.update(over)
+    return d
+
+
+def _signed(phone, message: bytes) -> str:
+    from tests.test_bootloader_slots import _b64u
+
+    return _b64u(phone.identity.sign(message))
+
+
+def _post(ctx, verb: str, record: dict, sig: str) -> tuple[int, dict]:
+    from tests.test_bootloader_slots import _http
+
+    return _http("POST", f"{ctx['base_url']}/v0.4/user-vault/{verb}", {"record": record, "signature_b64u": sig})
+
+
+def _grant(ctx, phone, record: dict) -> tuple[int, dict]:
+    from recto.user_vault.grant_record import GrantRecord
+
+    return _post(ctx, "grant", record, _signed(phone, GrantRecord.from_dict(record).signed_message()))
+
+
+def _revoke(ctx, phone, subject: str, grant_id: str) -> tuple[int, dict]:
+    from recto.user_vault.grant_record import RevokeRecord
+
+    rec = {"bootloader_id": "rule15-test", "consumer": _CONSUMER, "subject": subject, "grant_id": grant_id,
+           "nonce": "revoke-" + uuid.uuid4().hex[:16]}
+    return _post(ctx, "revoke", rec, _signed(phone, RevokeRecord.from_dict(rec).signed_message()))
+
+
+class TestRule15sAGrantVerifiesOnlyAgainstTheBoundPhone:
+    """Hard rule 15.s: a grant is admitted only under the signature of the phone its (consumer, subject) is bound
+    to. Another registered phone's signature, a subject bound to no phone, or a signature over the bare record (no
+    domain tag) is refused by name."""
+
+    def test_the_bound_phone_admits_a_grant(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _grant(uv_ctx, a, _grant_dict(s))
+        assert status == 200 and body["status"] == "admitted", body
+        stored = uv_ctx["state"].get_user_vault_grant(body["grant_id"])
+        assert stored is not None and stored["signer_phone_ref"] == a.ref
+
+    def test_another_phones_signature_is_refused(self, uv_ctx) -> None:
+        _, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        status, body = _grant(uv_ctx, b, _grant_dict(s))
+        assert status == 403 and body["error"] == "grant_signature_invalid", body
+
+    def test_a_subject_bound_to_no_phone_is_refused(self, uv_ctx) -> None:
+        a, _ = _bound(uv_ctx)
+        status, body = _grant(uv_ctx, a, _grant_dict(_handle("nobody")))
+        assert status == 403 and body["error"] == "grant_subject_unbound", body
+
+    def test_a_signature_without_the_domain_tag_is_refused(self, uv_ctx) -> None:
+        from recto.user_vault.grant_record import GrantRecord
+
+        a, s = _bound(uv_ctx)
+        rec = _grant_dict(s)
+        status, body = _post(uv_ctx, "grant", rec, _signed(a, GrantRecord.from_dict(rec).canonical_bytes()))
+        assert status == 403 and body["error"] == "grant_signature_invalid", body
+
+
+class TestRule15tAGrantPastOrTooLongIsRefused:
+    """Hard rule 15.t: a grant already past its not_after, reaching further than GRANT_MAX_SECONDS, or naming
+    another bootloader is refused at admission - the clock is the bootloader's."""
+
+    def test_an_expired_grant_is_refused(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _grant(uv_ctx, a, _grant_dict(s, not_after=int(time.time()) - 1))
+        assert status == 403 and body["error"] == "grant_expired", body
+
+    def test_a_grant_past_the_cap_is_refused(self, uv_ctx) -> None:
+        from recto.user_vault.grant_record import GRANT_MAX_SECONDS
+
+        a, s = _bound(uv_ctx)
+        status, body = _grant(uv_ctx, a, _grant_dict(s, not_after=int(time.time()) + GRANT_MAX_SECONDS + 3600))
+        assert status == 403 and body["error"] == "grant_too_long", body
+
+    def test_a_grant_for_another_bootloader_is_refused(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _grant(uv_ctx, a, _grant_dict(s, bootloader_id="another-bootloader"))
+        assert status == 403 and body["error"] == "grant_bootloader_mismatch", body
+
+
+class TestRule15uARevokedGrantNeverGrantsAgain:
+    """Hard rule 15.u: the bound phone's revoke puts the grant on the revocation list at once; the same signed grant
+    re-sent is refused. A grant REPLACED by a newer one for the same slot is revoked in the same step, so replaying
+    it never displaces the newer one. Only the bound phone revokes; an unknown grant is refused by name."""
+
+    def test_a_replaced_grant_replayed_is_refused_and_the_newer_stays(self, uv_ctx) -> None:
+        """hecate 72fe: grant A (90 days), then grant B (7 days) for the same slot, then A re-sent - refused."""
+        a, s = _bound(uv_ctx)
+        rec_a = _grant_dict(s, not_after=int(time.time()) + 90 * 86400)
+        status, body = _grant(uv_ctx, a, rec_a)
+        assert status == 200, body
+        id_a = body["grant_id"]
+        status, body = _grant(uv_ctx, a, _grant_dict(s, not_after=int(time.time()) + 7 * 86400))
+        assert status == 200, body
+        id_b = body["grant_id"]
+        assert uv_ctx["state"].is_revoked("uvgrant:" + id_a)
+        status, body = _grant(uv_ctx, a, rec_a)  # the replay, signature verbatim
+        assert status == 403 and body["error"] == "grant_revoked", body
+        held = uv_ctx["state"].list_user_vault_grants(_CONSUMER, s)
+        assert [g["grant_id"] for g in held] == [id_b]
+
+    def test_the_same_grant_resent_is_not_a_replacement(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rec = _grant_dict(s)
+        gid = _grant(uv_ctx, a, rec)[1]["grant_id"]
+        status, body = _grant(uv_ctx, a, rec)
+        assert status == 200 and body["grant_id"] == gid, body
+        assert not uv_ctx["state"].is_revoked("uvgrant:" + gid)
+
+    def test_a_revoked_grant_resent_is_refused(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rec = _grant_dict(s)
+        status, body = _grant(uv_ctx, a, rec)
+        assert status == 200, body
+        gid = body["grant_id"]
+        status, body = _revoke(uv_ctx, a, s, gid)
+        assert status == 200 and body["revoked"] is True, body
+        assert uv_ctx["state"].is_revoked("uvgrant:" + gid)
+        status, body = _grant(uv_ctx, a, rec)
+        assert status == 403 and body["error"] == "grant_revoked", body
+
+    def test_only_the_bound_phone_revokes(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        gid = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        status, body = _revoke(uv_ctx, b, s, gid)
+        assert status == 403 and body["error"] == "grant_signature_invalid", body
+        assert not uv_ctx["state"].is_revoked("uvgrant:" + gid)
+
+    def test_an_unknown_grant_is_refused(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _revoke(uv_ctx, a, s, "0" * 64)
+        assert status == 404 and body["error"] == "grant_unknown", body
+
+
+class TestRule15vAGrantNamesOneAgent:
+    """Hard rule 15.v: a grant names ONE agent by its opaque handle. A wildcard, an empty value or a raw id is
+    refused before any signature is read ("all my agents" is not in v1)."""
+
+    @pytest.mark.parametrize("bad", ["*", "", _A_GUID, "all"])
+    def test_anything_but_one_agent_handle_is_refused(self, uv_ctx, bad: str) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _post(uv_ctx, "grant", _grant_dict(s, agent_handle=bad), "x")
+        assert status == 400 and body["error"] in ("grant_agent_handle_invalid", "grant_record_invalid"), body
+
+
+class TestRule15wAdmissionIsNotRelease:
+    """Hard rule 15.w: storing or revoking a grant changes no release answer until step 4's switch turns the gate
+    on - release does not read grants at all today."""
+
+    def test_release_answers_the_same_with_and_without_a_grant(self, uv_ctx) -> None:
+        from tests.test_bootloader_slots import _http
+
+        a, s = _bound(uv_ctx)
+        hdr = {"X-Recto-Agent-Id": _UVA_ID, "X-Recto-Agent-Token": _UVA_TOKEN, "X-Recto-Subject": s}
+        status, _ = _http("POST", f"{uv_ctx['base_url']}/v0.4/user-vault/set",
+                          {"key": "user-ai-xai", "secret": "v1"}, headers=hdr)
+        assert status == 200
+        before = _http("GET", f"{uv_ctx['base_url']}/v0.4/user-vault/release?key=user-ai-xai", headers=hdr)
+        gid = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        during = _http("GET", f"{uv_ctx['base_url']}/v0.4/user-vault/release?key=user-ai-xai", headers=hdr)
+        assert _revoke(uv_ctx, a, s, gid)[0] == 200
+        after = _http("GET", f"{uv_ctx['base_url']}/v0.4/user-vault/release?key=user-ai-xai", headers=hdr)
+        assert before == during == after
+        assert before[1]["status"] == "released"
+
+    def test_a_newer_grant_for_the_same_slot_replaces_the_older(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        first = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        second = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        held = uv_ctx["state"].list_user_vault_grants(_CONSUMER, s)
+        assert [g["grant_id"] for g in held] == [second] and first != second

@@ -246,6 +246,34 @@ fails in the tree before a reader has to find it again
   label gets `phone-<4 hex>`, derived from its own key's reference; the phone
   may rename itself, and the registry never prompts a person for a name.
   Pinned: `TestRule15rADeviceLabelIsGenerated`.
+- **s. A grant verifies against the subject's bound phone, and only that
+  phone.** A user-vault grant - one agent (an opaque agent handle) may use one
+  of the user's keys until a date - is admitted only under the identity-key
+  signature of the phone its (consumer, subject) is bound to, over
+  `recto-user-vault-grant-v1|` and the record's canonical bytes. Another
+  phone's signature, a subject bound to no phone, or a signature without the
+  domain tag is refused by name. The phone submits it; no agent token is the
+  authority. Pinned: `TestRule15sAGrantVerifiesOnlyAgainstTheBoundPhone`.
+- **t. A grant past its date, or longer than the cap, is refused at
+  admission.** The bootloader's clock decides: `not_after` already past, or
+  more than `GRANT_MAX_SECONDS` (365 days) ahead, or another bootloader named,
+  is refused before anything is stored. Pinned:
+  `TestRule15tAGrantPastOrTooLongIsRefused`.
+- **u. A revoked grant never grants again.** The bound phone's revoke (signed
+  over `recto-user-vault-revoke-v1|` and its record) puts the grant's id on
+  the revocation list at once; the same signed grant re-sent is refused. A
+  grant REPLACED by a newer one for the same agent and key is revoked in the
+  same step, so a superseded grant replayed never displaces the newer one.
+  Only the bound phone revokes. Pinned: `TestRule15uARevokedGrantNeverGrantsAgain`.
+- **v. A grant names one agent.** The agent is one opaque handle; a wildcard,
+  an empty value or a raw id is refused before any signature is read. "All my
+  agents" is not a grant. Pinned: `TestRule15vAGrantNamesOneAgent`.
+- **w. Admission is not release.** Storing or revoking a grant changes no
+  release answer until the release gate is switched on; until then release
+  does not read grants at all. One live grant per (consumer, subject, agent,
+  key): a newer one replaces the older. Pinned:
+  `TestRule15wAdmissionIsNotRelease`; the store in both backends:
+  `test_state_postgres.py::test_a_newer_grant_for_the_same_slot_replaces_the_older`.
 
 **The reader's residue.** Findings that name a design here are not re-argued;
 they are answered by the rule's letter and the test's name. A finding this

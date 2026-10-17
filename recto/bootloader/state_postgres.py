@@ -158,6 +158,19 @@ CREATE TABLE IF NOT EXISTS {schema}.challenges (
 ALTER TABLE {schema}.challenges
     ADD COLUMN IF NOT EXISTS binding jsonb;
 
+-- THE USER-VAULT GRANTS (2026-10-17, R-series step 2): one live grant per (consumer, subject, agent_handle, key).
+-- The subject and the agent are opaque handles; doc holds the signed record, the signature and the signer's ref.
+CREATE TABLE IF NOT EXISTS {schema}.user_vault_grants (
+    grant_id     text PRIMARY KEY,
+    consumer     text NOT NULL,
+    subject      text NOT NULL,
+    agent_handle text NOT NULL,
+    key          text NOT NULL,
+    not_after    bigint NOT NULL,
+    doc          jsonb NOT NULL,
+    UNIQUE (consumer, subject, agent_handle, key)
+);
+
 -- THE OWNER SLOTS (hard rule 14.4, amended): small registry facts, one row each (the owner-genesis marker).
 CREATE TABLE IF NOT EXISTS {schema}.registry_meta (
     key        text PRIMARY KEY,
@@ -1040,6 +1053,39 @@ class PostgresStateStore(StateStoreBase):
         with self._pool.connection() as conn:
             row = conn.execute(self._q("SELECT 1 FROM {schema}.sessions LIMIT 1")).fetchone()
         return row is not None
+
+    # THE USER-VAULT GRANTS (Postgres backend).
+    def put_user_vault_grant(self, grant: dict[str, Any]) -> None:
+        r = grant["record"]
+        with self._pool.connection() as conn:
+            conn.execute(
+                self._q("DELETE FROM {schema}.user_vault_grants WHERE not_after <= %s"), (int(time.time()),))
+            conn.execute(
+                self._q(
+                    "INSERT INTO {schema}.user_vault_grants "
+                    "(grant_id, consumer, subject, agent_handle, key, not_after, doc) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (consumer, subject, agent_handle, key) DO UPDATE "
+                    "SET grant_id = EXCLUDED.grant_id, not_after = EXCLUDED.not_after, doc = EXCLUDED.doc"
+                ),
+                (grant["grant_id"], r["consumer"], r["subject"], r["agent_handle"], r["key"],
+                 int(r["not_after"]), Jsonb(dict(grant))),
+            )
+
+    def get_user_vault_grant(self, grant_id: str) -> dict[str, Any] | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q("SELECT doc FROM {schema}.user_vault_grants WHERE grant_id = %s"), (grant_id,)).fetchone()
+        return None if row is None else dict(row[0])
+
+    def list_user_vault_grants(self, consumer: str, subject: str) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                self._q("SELECT doc FROM {schema}.user_vault_grants WHERE consumer = %s AND subject = %s "
+                        "ORDER BY grant_id"),
+                (consumer, subject),
+            ).fetchall()
+        return [dict(r[0]) for r in rows]
 
     @contextmanager
     def registry_lock(self) -> Iterator[None]:

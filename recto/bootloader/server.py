@@ -1144,6 +1144,10 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_user_vault_set(body)
             elif url.path == "/v0.4/user-vault/delete":
                 self._handle_user_vault_delete(body)
+            elif url.path == "/v0.4/user-vault/grant":
+                self._handle_user_vault_grant(body)
+            elif url.path == "/v0.4/user-vault/revoke":
+                self._handle_user_vault_revoke(body)
             elif url.path == "/v0.5/clusters/register":
                 self._handle_clusters_register(body)
             elif url.path == "/v0.5/clusters/heartbeat":
@@ -7280,6 +7284,122 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             "deleted": removed is not None,
             "entry": removed.to_dict() if removed else None,
         })
+
+    # ------------------------------------------------------------------
+    # /v0.4/user-vault/grant + /revoke -- THE GRANT (R-series step 2, 2026-10-17)
+    #
+    # The user's BOUND phone (hard rule 15.n) signs a standing grant: one agent (an opaque agent handle) may use one
+    # of the user's keys until a date. The PHONE submits it here - no agent token: the signature by the phone the
+    # (consumer, subject) is bound to is the whole authority, so the platform can neither forge a grant nor hold one
+    # back. A revoke is the same phone's signature naming the grant; it joins the revocation list at once.
+    # Admission is not release (hard rule 15.w): until step 4's switch, release does not read grants at all.
+    # ------------------------------------------------------------------
+
+    _UV_GRANT_JTI_PREFIX = "uvgrant:"
+
+    def _bound_phone_for(self, consumer: str, subject: str) -> Any:
+        """The phone (consumer, subject) is bound to, or None."""
+        return next((p for p in self.config.state.list_phones() if (consumer, subject) in p.member_bindings), None)
+
+    def _bound_verifier(self, phone: Any) -> Any:
+        algorithm = _registered_algorithm(phone, "user-vault-grant")
+        return lambda message, sig: verify_signature(
+            payload=message, signature_b64u=sig, public_key_b64u=phone.public_key_b64u, algorithm=algorithm)
+
+    def _handle_user_vault_grant(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant - body {record: GrantRecord, signature_b64u}. 200 {status: admitted,
+        grant_id, not_after}; refusals by name: 404 when the user vault is off, 400 grant_record_* /
+        grant_agent_handle_invalid, 403 grant_subject_unbound / grant_bootloader_mismatch / grant_expired /
+        grant_too_long / grant_signature_invalid / grant_revoked."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRecord, GrantRefused, verify_grant
+        try:
+            record = GrantRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a grant comes only from the subject's bound phone",
+            })
+            return
+        try:
+            grant_id = verify_grant(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                                    now=int(time.time()), verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        # A revoked grant never grants again (hard rule 15.u): the same signed record re-sent is refused.
+        if cfg.state.is_revoked(self._UV_GRANT_JTI_PREFIX + grant_id):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_revoked", "detail": "this grant was revoked; the phone signs a new one"})
+            return
+        # A REPLACED grant is revoked in the same step (hard rule 15.u): the verb takes no token, so a superseded grant
+        # left merely dropped could be re-sent by anyone holding a copy and displace the newer one (an agent narrowed
+        # from 90 days to 7, the old 90 replayed back in). Superseded is as dead as revoked.
+        for old in cfg.state.list_user_vault_grants(record.consumer, record.subject):
+            r = old["record"]
+            if (r["agent_handle"], r["key"]) == (record.agent_handle, record.key) and old["grant_id"] != grant_id:
+                cfg.state.add_revocation(RevocationEntry(
+                    jti=self._UV_GRANT_JTI_PREFIX + old["grant_id"],
+                    revoked_at_unix=int(time.time()),
+                    original_exp_unix=int(r["not_after"]),
+                    reason="revoked: user-vault grant replaced by a newer one for the same slot",
+                ))
+        cfg.state.put_user_vault_grant({
+            "grant_id": grant_id,
+            "record": record.to_dict(),
+            "signature_b64u": body["signature_b64u"],
+            "signer_phone_ref": phone.phone_id,
+            "admitted_at_unix": int(time.time()),
+        })
+        self._send_json(HTTPStatus.OK, {"status": "admitted", "grant_id": grant_id, "not_after": record.not_after})
+
+    def _handle_user_vault_revoke(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/revoke - body {record: RevokeRecord, signature_b64u}. 200 {revoked: true, grant_id};
+        refusals by name: 404 when the user vault is off or the grant is unknown to this subject, 400 grant_record_*,
+        403 grant_subject_unbound / grant_bootloader_mismatch / grant_signature_invalid."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, RevokeRecord, verify_revoke
+        try:
+            record = RevokeRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a revoke comes only from the subject's bound phone",
+            })
+            return
+        try:
+            grant_id = verify_revoke(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                                     verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        grant = cfg.state.get_user_vault_grant(grant_id)
+        if grant is None or (grant["record"]["consumer"], grant["record"]["subject"]) != (record.consumer,
+                                                                                            record.subject):
+            self._send_json(HTTPStatus.NOT_FOUND, {
+                "error": "grant_unknown", "detail": "no grant of this subject carries that id"})
+            return
+        cfg.state.add_revocation(RevocationEntry(
+            jti=self._UV_GRANT_JTI_PREFIX + grant_id,
+            revoked_at_unix=int(time.time()),
+            original_exp_unix=int(grant["record"]["not_after"]),
+            reason="revoked: user-vault grant, by the bound phone",
+        ))
+        self._send_json(HTTPStatus.OK, {"revoked": True, "grant_id": grant_id})
 
     # ------------------------------------------------------------------
     # Helpers

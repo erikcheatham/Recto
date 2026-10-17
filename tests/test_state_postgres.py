@@ -533,6 +533,41 @@ def test_a_member_code_carries_its_binding_into_the_challenge(store):
     assert cs.consume_member_challenge(c) == _BINDING
 
 
+# THE USER-VAULT GRANTS (2026-10-17, R-series step 2): one live grant per (consumer, subject, agent_handle, key), in
+# both backends; a newer one replaces the older, and an expired one is dropped on the next write.
+def _grant(grant_id: str, agent: str = "AGENTAGENTAGENTAGENTAGENTAGENTAGENTAGENTAGE", not_after: int | None = None) -> dict:
+    return {
+        "grant_id": grant_id,
+        "record": {"bootloader_id": "b", "consumer": "https://consumer.example", "subject": _BINDING[1],
+                   "agent_handle": agent, "key": "user-ai-xai", "scope": "AgentChat",
+                   "not_after": not_after or int(time.time()) + 3600, "nonce": "n" * 16},
+        "signature_b64u": "sig", "signer_phone_ref": "pk_x", "admitted_at_unix": int(time.time()),
+    }
+
+
+def test_a_grant_is_stored_found_and_listed(store):
+    store.put_user_vault_grant(_grant("a" * 64))
+    assert store.get_user_vault_grant("a" * 64)["signer_phone_ref"] == "pk_x"
+    assert [g["grant_id"] for g in store.list_user_vault_grants("https://consumer.example", _BINDING[1])] == ["a" * 64]
+    assert store.list_user_vault_grants("https://consumer.example", "Z" * 43) == []
+    assert store.get_user_vault_grant("b" * 64) is None
+
+
+def test_a_newer_grant_for_the_same_slot_replaces_the_older(store):
+    store.put_user_vault_grant(_grant("a" * 64))
+    store.put_user_vault_grant(_grant("b" * 64))
+    store.put_user_vault_grant(_grant("c" * 64, agent="OTHEROTHEROTHEROTHEROTHEROTHEROTHEROTHEROTH"))
+    held = sorted(g["grant_id"] for g in store.list_user_vault_grants("https://consumer.example", _BINDING[1]))
+    assert held == ["b" * 64, "c" * 64]
+    assert store.get_user_vault_grant("a" * 64) is None
+
+
+def test_an_expired_grant_is_dropped_on_the_next_write(store):
+    store.put_user_vault_grant(_grant("a" * 64, not_after=int(time.time()) - 1))
+    store.put_user_vault_grant(_grant("c" * 64, agent="OTHEROTHEROTHEROTHEROTHEROTHEROTHEROTHEROTH"))
+    assert store.get_user_vault_grant("a" * 64) is None
+
+
 def test_challenge_store_adapter_delegates_to_state(store):
     """Regression pin for the 2026-07-20 prod finding: a ChallengeStore
     constructed WITH a state store must share challenge visibility with
