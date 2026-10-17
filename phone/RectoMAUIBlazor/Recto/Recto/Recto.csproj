@@ -486,7 +486,13 @@
 		<AndroidSigningKeyStore>$(HOME)/keystores/recto-upload.keystore</AndroidSigningKeyStore>
 		<AndroidSigningKeyAlias>upload</AndroidSigningKeyAlias>
 		<AndroidPackageFormat>aab</AndroidPackageFormat>
+		<!-- R8 shrinks and optimizes the Java/DEX side (Play's DEX optimization item, docs/backlog.md); the keep rules
+		     for what a binding reaches by name are in Platforms/Android/proguard.cfg. -->
+		<AndroidLinkTool>r8</AndroidLinkTool>
 	</PropertyGroup>
+	<ItemGroup Condition="$(TargetFramework.Contains('-android'))">
+		<ProguardConfiguration Include="Platforms\Android\proguard.cfg" />
+	</ItemGroup>
 	<ItemGroup>
 		<!-- App Icon -->
 		<MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#1E1B4B" />

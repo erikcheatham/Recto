@@ -300,7 +300,7 @@ public sealed class BootloaderClient : IBootloaderClient
         if (request.Record is null
             || string.IsNullOrWhiteSpace(request.Record.Code)
             || string.IsNullOrWhiteSpace(request.Record.PhonePubkey)
-            || string.IsNullOrWhiteSpace(request.Record.UserId)
+            || string.IsNullOrWhiteSpace(request.Record.Subject)
             || string.IsNullOrWhiteSpace(request.Record.BootloaderId)
             || request.Record.NotAfter <= 0)
         {
@@ -315,6 +315,46 @@ public sealed class BootloaderClient : IBootloaderClient
 
         var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/devices/pair";
         return SendAsync<DevicesPairResponse>(HttpMethod.Post, url, request, ct);
+    }
+
+    public Task<Result<UserVaultGrantAdmitted>> PostUserVaultGrantAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct)
+        => PostUserVaultAsync<UserVaultGrantAdmitted>(bootloaderUrl, "grant", request, ct);
+
+    public Task<Result<UserVaultRevokeResponse>> PostUserVaultRevokeAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct)
+        => PostUserVaultAsync<UserVaultRevokeResponse>(bootloaderUrl, "revoke", request, ct);
+
+    public Task<Result<UserVaultRevokeKeyResponse>> PostUserVaultRevokeKeyAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct)
+        => PostUserVaultAsync<UserVaultRevokeKeyResponse>(bootloaderUrl, "revoke-key", request, ct);
+
+    public Task<Result<UserVaultGrantsListResponse>> ListUserVaultGrantsAsync(
+        string bootloaderUrl, UserVaultGrantsListRequest request, CancellationToken ct)
+        => PostUserVaultAsync<UserVaultGrantsListResponse>(bootloaderUrl, "grants", request, ct);
+
+    public Task<Result<UserVaultDenyResponse>> DenyUserVaultGrantRequestAsync(
+        string bootloaderUrl, string requestId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(requestId))
+        {
+            return Task.FromResult(Result.Failure<UserVaultDenyResponse>(
+                Error.Validation([new ValidationErrors("requestId", "Request id is required.")])));
+        }
+        return PostUserVaultAsync<UserVaultDenyResponse>(
+            bootloaderUrl, "grant-request/deny", new { request_id = requestId }, ct);
+    }
+
+    private Task<Result<T>> PostUserVaultAsync<T>(string bootloaderUrl, string verb, object request, CancellationToken ct)
+        where T : class
+    {
+        if (string.IsNullOrWhiteSpace(bootloaderUrl))
+        {
+            return Task.FromResult(Result.Failure<T>(
+                Error.Validation([new ValidationErrors("bootloaderUrl", "Bootloader URL is required.")])));
+        }
+        var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/user-vault/{verb}";
+        return SendAsync<T>(HttpMethod.Post, url, request, ct);
     }
 
     public Task<Result<DevicesUnpairResponse>> UnpairDeviceAsync(

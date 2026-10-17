@@ -279,15 +279,15 @@ public static class PairDeepLinkParser
         }
 
         // Record fields (Service-kind only). Both or neither: a half record signs nothing.
-        string? userIdForPayload = null;
+        string? subjectForPayload = null;
         long? notAfterForPayload = null;
         if (kind == PairDeepLinkKind.Service
-            && queryDict.TryGetValue(PairDeepLinkConstants.UserIdParamName, out var uidVal)
+            && queryDict.TryGetValue(PairDeepLinkConstants.SubjectParamName, out var subjectVal)
             && queryDict.TryGetValue(PairDeepLinkConstants.NotAfterParamName, out var naVal)
-            && !string.IsNullOrWhiteSpace(uidVal)
+            && !string.IsNullOrWhiteSpace(subjectVal)
             && long.TryParse(naVal.Trim(), out var notAfter) && notAfter > 0)
         {
-            userIdForPayload = uidVal.Trim();
+            subjectForPayload = subjectVal.Trim();
             notAfterForPayload = notAfter;
         }
 
@@ -297,7 +297,7 @@ public static class PairDeepLinkParser
             kind,
             bootstrapBootloaderForPayload,
             bootstrapPairCodeForPayload,
-            userIdForPayload,
+            subjectForPayload,
             notAfterForPayload);
     }
 

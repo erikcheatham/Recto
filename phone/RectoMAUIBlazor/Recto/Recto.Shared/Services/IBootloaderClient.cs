@@ -141,4 +141,24 @@ public interface IBootloaderClient
     /// </summary>
     Task<Result<DevicesUnpairResponse>> UnpairDeviceAsync(
         string bootloaderUrl, DevicesUnpairRequest request, CancellationToken ct);
+
+    /// <summary>POST <c>/v0.4/user-vault/grant</c>: the phone-signed grant (hard rule 15.s). No agent token.</summary>
+    Task<Result<UserVaultGrantAdmitted>> PostUserVaultGrantAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct);
+
+    /// <summary>POST <c>/v0.4/user-vault/revoke</c>: the phone-signed revoke of one grant (hard rule 15.u).</summary>
+    Task<Result<UserVaultRevokeResponse>> PostUserVaultRevokeAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct);
+
+    /// <summary>POST <c>/v0.4/user-vault/revoke-key</c>: "stop all" for one key, phone-signed (hard rule 15.aa).</summary>
+    Task<Result<UserVaultRevokeKeyResponse>> PostUserVaultRevokeKeyAsync(
+        string bootloaderUrl, UserVaultSignedRecord request, CancellationToken ct);
+
+    /// <summary>POST <c>/v0.4/user-vault/grants</c>: this phone's subjects' live grants, read by its own signature.</summary>
+    Task<Result<UserVaultGrantsListResponse>> ListUserVaultGrantsAsync(
+        string bootloaderUrl, UserVaultGrantsListRequest request, CancellationToken ct);
+
+    /// <summary>POST <c>/v0.4/user-vault/grant-request/deny</c>: Deny takes the card off the phone; nothing is signed.</summary>
+    Task<Result<UserVaultDenyResponse>> DenyUserVaultGrantRequestAsync(
+        string bootloaderUrl, string requestId, CancellationToken ct);
 }

@@ -44,7 +44,7 @@ CLOCK_SKEW_SECONDS = 60
 PAIR_WINDOW_CEILING_SECONDS = 3600
 
 # The signed fields, sorted.
-PAIR_RECORD_FIELDS = ("bootloader_id", "code", "not_after", "phone_pubkey", "user_id")
+PAIR_RECORD_FIELDS = ("bootloader_id", "code", "not_after", "phone_pubkey", "subject")
 
 _PUBKEY_HEX = re.compile(r"^[0-9a-f]{128}$")
 
@@ -75,20 +75,20 @@ GRANT_AUDIENCE_NOT_BOOTLOADER = "grant_audience_not_bootloader"
 @dataclass(frozen=True)
 class PairRecord:
     """``phone_pubkey``: 128 lowercase hex (X||Y, no 0x04). ``not_after``:
-    unix seconds. ``code``: the typed alias, case-preserved. ``user_id``:
+    unix seconds. ``code``: the typed alias, case-preserved. ``subject``:
     the consumer's OPAQUE subject handle for the user (recto.subject_handle),
     never its user id (hard rules 15.m, 15.o); the bootloader refuses another
-    shape. The field keeps its wire name until the phone app's next release
-    renames it."""
+    shape. A record that still names the field ``subject`` carries no subject
+    and is refused."""
 
     bootloader_id: str
-    user_id: str
+    subject: str
     phone_pubkey: str
     code: str
     not_after: int
 
     def __post_init__(self) -> None:
-        for name in ("bootloader_id", "user_id", "code"):
+        for name in ("bootloader_id", "subject", "code"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise PairRefused(RECORD_FIELD_EMPTY, name)
@@ -106,7 +106,7 @@ class PairRecord:
             "code": self.code,
             "not_after": self.not_after,
             "phone_pubkey": self.phone_pubkey,
-            "user_id": self.user_id,
+            "subject": self.subject,
         }
 
     def canonical_bytes(self) -> bytes:
@@ -133,7 +133,7 @@ class PairRecord:
             not_after = int(not_after)
         return cls(
             bootloader_id=d.get("bootloader_id"),  # type: ignore[arg-type]
-            user_id=d.get("user_id"),  # type: ignore[arg-type]
+            subject=d.get("subject"),  # type: ignore[arg-type]
             phone_pubkey=pubkey,  # type: ignore[arg-type]
             code=d.get("code"),  # type: ignore[arg-type]
             not_after=not_after,  # type: ignore[arg-type]

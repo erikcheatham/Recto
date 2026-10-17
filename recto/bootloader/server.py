@@ -681,6 +681,13 @@ class BootloaderConfig:
     # (Windows host); containers inject a file-backed factory; tests
     # inject an in-memory double.
     user_vault_secret_source_factory: Any = None
+    # Map of user-vault PLATFORM namespace -> the CONSUMER url its users' phones are bound under (R-series step 3).
+    # Entries key by platform; grants and member bindings key by consumer. A platform with no entry raises no grant
+    # request: the bootloader never guesses which binding a platform means.
+    user_vault_platform_consumers: dict[str, str] = {}
+    # The open grant requests (recto.user_vault.grant_request.GrantRequestBook) - in memory only, never the state
+    # store (hard rule 15.z). Set by create_server when the user vault is on.
+    user_vault_grant_requests: Any = None
 
     # Signed-poll enforcement mode (2026-08-13, phone_id split). Gates
     # the possession-of-phone_id read surfaces (GET /v0.4/pending and
@@ -1067,6 +1074,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_user_vault_list(url)
             elif url.path == "/v0.4/user-vault/release":
                 self._handle_user_vault_release(url)
+            elif url.path == "/v0.4/user-vault/grant-request":
+                self._handle_user_vault_grant_request_status(url)
             elif url.path == "/v0.5/clusters":
                 self._handle_clusters_list()
             else:
@@ -1148,6 +1157,14 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_user_vault_grant(body)
             elif url.path == "/v0.4/user-vault/revoke":
                 self._handle_user_vault_revoke(body)
+            elif url.path == "/v0.4/user-vault/revoke-key":
+                self._handle_user_vault_revoke_key(body)
+            elif url.path == "/v0.4/user-vault/grants":
+                self._handle_user_vault_grants_list(body)
+            elif url.path == "/v0.4/user-vault/grant-request":
+                self._handle_user_vault_grant_request(body)
+            elif url.path == "/v0.4/user-vault/grant-request/deny":
+                self._handle_user_vault_grant_request_deny(body)
             elif url.path == "/v0.5/clusters/register":
                 self._handle_clusters_register(body)
             elif url.path == "/v0.5/clusters/heartbeat":
@@ -2201,6 +2218,12 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         body: dict[str, Any] = {
             "requests": [self._pending_to_wire(p) for p in pending],
         }
+        # THE GRANT REQUESTS (hard rule 15.z): held in memory, served only to the phone they ring, inside the same
+        # server-signed envelope as every other card. Only a read whose poll signature verifies sees them - the
+        # platform's words about its user never reach a reader who merely knows a phone_id.
+        if cfg.user_vault_grant_requests is not None and self._poll_signature_valid(phone, "/v0.4/pending"):
+            body["requests"].extend(self._grant_request_to_wire(r)
+                                    for r in cfg.user_vault_grant_requests.open_for_phone(phone_id))
         # SERVER-SIGNED CARDS (2026-09-16). The phone dropped its TLS leaf pin
         # for the bootloader's own key; attest proves WHO the server is but
         # binds no channel, so an interposer holding a CA-issued cert could
@@ -4242,7 +4265,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         Body:
           ``consumer_base_url``: target consumer; must be a key in
             ``cfg.devices_pair_consumer_webhook_tokens``.
-          ``record``: ``{bootloader_id, user_id, phone_pubkey, code,
+          ``record``: ``{bootloader_id, subject, phone_pubkey, code,
             not_after}`` — see ``recto.capability.pair_record``.
           ``user_jws``: the phone's ES256K grant. Must recover to
             ``record.phone_pubkey``, name this bootloader in ``aud``,
@@ -4286,7 +4309,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {"error": "record_required",
-                 "detail": "body.record {bootloader_id, user_id, phone_pubkey, code, not_after} is required"},
+                 "detail": "body.record {bootloader_id, subject, phone_pubkey, code, not_after} is required"},
             )
             return
 
@@ -4311,16 +4334,16 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                  "detail": "the record names another bootloader"},
             )
             return
-        # THE PLACEHOLDER RULE (2026-10-17, hard rules 15.m/15.o): the record's `user_id` field carries the consumer's
+        # THE PLACEHOLDER RULE (2026-10-17, hard rules 15.m/15.o): the record's `subject` field carries the consumer's
         # OPAQUE subject handle, never its user id - Recto signs and relays handles only. Another shape is refused.
         from recto.subject_handle import normalize_subject as _normalize_subject
         try:
-            _normalize_subject(record.user_id)
+            _normalize_subject(record.subject)
         except ValueError:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
                 {"error": "record_subject_invalid",
-                 "detail": "record.user_id must carry the consumer's opaque subject handle "
+                 "detail": "record.subject must carry the consumer's opaque subject handle "
                            "(43 base64url characters), never a user id"},
             )
             return
@@ -4379,7 +4402,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
 
             result_claims = CapabilityClaims(
                 iss=f"bootloader:{cfg.bootloader_id}",
-                sub=f"user:{record.user_id}",
+                sub=f"user:{record.subject}",
                 aud=[a for a in claims.aud if a != cfg.bootloader_id] or [consumer_base_url.rstrip("/")],
                 iat=now,
                 nbf=now - 60,   # CLOCK_SKEW_SECONDS: the consumer's clock is not ours either
@@ -7358,6 +7381,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             "signer_phone_ref": phone.phone_id,
             "admitted_at_unix": int(time.time()),
         })
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_grant(record.consumer, record.subject, record.agent_handle,
+                                                        record.key, grant_id, record.not_after)
         self._send_json(HTTPStatus.OK, {"status": "admitted", "grant_id": grant_id, "not_after": record.not_after})
 
     def _handle_user_vault_revoke(self, body: dict[str, Any]) -> None:
@@ -7399,7 +7425,253 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             original_exp_unix=int(grant["record"]["not_after"]),
             reason="revoked: user-vault grant, by the bound phone",
         ))
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_revoke({grant_id})
         self._send_json(HTTPStatus.OK, {"revoked": True, "grant_id": grant_id})
+
+    # ------------------------------------------------------------------
+    # A REVOKE NEVER NEEDS THE PLATFORM (hard rule 15.aa, R-series step 3)
+    #
+    # The phone keeps no grants (hard rule 15.y), so it reads its subjects' live grants from here by its own
+    # signature, and revokes one - or every grant of one key ("stop all") - straight to this bootloader. A platform that
+    # never raises a revoke card cannot keep an agent's use alive.
+    # ------------------------------------------------------------------
+
+    _UV_REVOKE_KEY_JTI_PREFIX = "uvrevokekey:"
+
+    def _live_grants(self, consumer: str, subject: str) -> list[dict[str, Any]]:
+        now = int(time.time())
+        return [g for g in self.config.state.list_user_vault_grants(consumer, subject)
+                if int(g["record"]["not_after"]) > now
+                and not self.config.state.is_revoked(self._UV_GRANT_JTI_PREFIX + g["grant_id"])]
+
+    def _handle_user_vault_grants_list(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grants - body {request: GrantsListRequest, signature_b64u}. 200 {grants: [...]}, every
+        live grant of every (consumer, subject) bound to the asking phone: handles, key, scope, dates - nothing the
+        platform said in words (Recto never holds a display name)."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, GrantsListRequest, verify_grants_list
+        try:
+            req = GrantsListRequest.from_dict(body.get("request"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = cfg.state.get_phone(req.phone_id)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "grant_signature_invalid",
+                                                   "detail": "the asking phone is not registered"})
+            return
+        try:
+            verify_grants_list(req, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                               now=int(time.time()), verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        grants = []
+        for consumer, subject in phone.member_bindings:
+            for g in self._live_grants(consumer, subject):
+                r = g["record"]
+                grants.append({
+                    "grant_id": g["grant_id"], "consumer": consumer, "subject": subject,
+                    "agent_handle": r["agent_handle"], "key": r["key"], "scope": r["scope"],
+                    "not_after": r["not_after"], "admitted_at_unix": g.get("admitted_at_unix"),
+                })
+        grants.sort(key=lambda g: (g["consumer"], g["key"], g["agent_handle"]))
+        self._send_json(HTTPStatus.OK, {"grants": grants, "bootloader_id": cfg.bootloader_id})
+
+    def _handle_user_vault_revoke_key(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/revoke-key - body {record: RevokeKeyRecord, signature_b64u}. 200 {revoked: [ids]}:
+        every grant of (consumer, subject, key) live when it arrives goes on the revocation list. The act is marked used
+        until its not_after, so the same signature re-sent ends nothing granted since (403 grant_act_used)."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, RevokeKeyRecord, verify_revoke_key
+        try:
+            record = RevokeKeyRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a stop-all comes only from the subject's bound phone",
+            })
+            return
+        now = int(time.time())
+        try:
+            act_id = verify_revoke_key(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id, now=now,
+                                       verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        if cfg.state.is_revoked(self._UV_REVOKE_KEY_JTI_PREFIX + act_id):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "grant_act_used",
+                                                   "detail": "this stop-all was already carried out"})
+            return
+        cfg.state.add_revocation(RevocationEntry(
+            jti=self._UV_REVOKE_KEY_JTI_PREFIX + act_id, revoked_at_unix=now,
+            original_exp_unix=record.not_after, reason="used: user-vault stop-all for one key",
+        ))
+        revoked = []
+        for g in self._live_grants(record.consumer, record.subject):
+            if g["record"]["key"] != record.key:
+                continue
+            cfg.state.add_revocation(RevocationEntry(
+                jti=self._UV_GRANT_JTI_PREFIX + g["grant_id"], revoked_at_unix=now,
+                original_exp_unix=int(g["record"]["not_after"]),
+                reason="revoked: user-vault grant, stop-all for its key by the bound phone",
+            ))
+            revoked.append(g["grant_id"])
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_revoke(set(revoked))
+        self._send_json(HTTPStatus.OK, {"revoked": revoked})
+
+    # ------------------------------------------------------------------
+    # /v0.4/user-vault/grant-request -- THE PLATFORM RINGS THE PHONE (hard rule 15.z, R-series step 3)
+    #
+    # The one card a user-vault agent may raise - auth-only agents still raise no capability card (15.p). It rings
+    # only the subject's bound phone; its words (purpose, agent name) live in memory and nowhere else.
+    # ------------------------------------------------------------------
+
+    def _grant_request_to_wire(self, r: Any) -> dict[str, Any]:
+        uv: dict[str, Any] = {
+            "action": r.action, "bootloader_id": self.config.bootloader_id, "consumer": r.consumer,
+            "subject": r.subject, "agent_handle": r.agent_handle, "key": r.key, "scope": r.scope,
+            "not_after": r.not_after, "expires_at_unix": r.expires_at,
+        }
+        if r.grant_id is not None:
+            uv["grant_id"] = r.grant_id
+        if r.admitted_at is not None:
+            uv["admitted_at_unix"] = r.admitted_at
+        if r.purpose is not None:
+            uv["purpose"] = r.purpose
+        if r.agent_name is not None:
+            uv["agent_name"] = r.agent_name
+        context: dict[str, Any] = {
+            "child_pid": 0, "child_argv0": "", "requested_at_unix": r.requested_at,
+            "operation_description": f"user-vault {r.action}", "user_vault_grant": uv,
+        }
+        ac = self.config.principal_apps.get(r.agent_id)
+        if ac is not None:
+            ac_obj: dict[str, Any] = {"app_id": ac.app_id, "app_name": ac.app_name,
+                                      "app_description": ac.app_description}
+            for name in ("app_url", "app_icon_url", "app_version"):
+                if getattr(ac, name) is not None:
+                    ac_obj[name] = getattr(ac, name)
+            context["app_context"] = ac_obj
+        kind = "user_vault_grant" if r.action == "grant" else "user_vault_revoke"
+        return {"request_id": r.request_id, "kind": kind, "service": r.consumer, "secret": r.key,
+                "context": context}
+
+    def _handle_user_vault_grant_request(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant-request (agent headers + X-Recto-Subject) - body {action: grant|revoke,
+        agent_handle, key, scope, not_after, purpose?, agent_name?} or {action: revoke, grant_id, purpose?,
+        agent_name?}. 200 {request_id, expires_at_unix}. Refusals by name: 403 grant_request_consumer_unmapped /
+        grant_subject_unbound, 400 grant_request_invalid / grant_record_*, 404 grant_unknown, 409 grant_request_open,
+        429 grant_request_rate_limited."""
+        cfg = self.config
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        from recto.user_vault import grant_request as gr
+        from recto.user_vault.grant_record import GRANT_MAX_SECONDS, GrantRecord, GrantRefused
+        consumer = cfg.user_vault_platform_consumers.get(platform)
+        if not consumer:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_request_consumer_unmapped",
+                "detail": "this platform has no consumer mapped; the bootloader never guesses the binding",
+            })
+            return
+        phone = self._bound_phone_for(consumer, subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a grant request rings only the subject's bound phone",
+            })
+            return
+        action = body.get("action", gr.ACTION_GRANT)
+        now = int(time.time())
+        try:
+            purpose = gr.clean_text(body.get("purpose"), "purpose", gr.PURPOSE_MAX)
+            agent_name = gr.clean_text(body.get("agent_name"), "agent_name", gr.AGENT_NAME_MAX)
+            if action == gr.ACTION_GRANT:
+                # The proposal is shaped as the grant it asks for (the phone adds the nonce, may shorten the date).
+                proposal = GrantRecord.from_dict({
+                    "bootloader_id": cfg.bootloader_id, "consumer": consumer, "subject": subject,
+                    "agent_handle": body.get("agent_handle"), "key": body.get("key"), "scope": body.get("scope"),
+                    "not_after": body.get("not_after"), "nonce": "proposal-" + uuid.uuid4().hex[:16],
+                })
+                if proposal.not_after <= now or proposal.not_after > now + GRANT_MAX_SECONDS:
+                    raise GrantRefused(gr.REQUEST_INVALID,
+                                       f"not_after must be ahead and within {GRANT_MAX_SECONDS // 86400} days")
+                fields = dict(agent_handle=proposal.agent_handle, key=proposal.key, scope=proposal.scope,
+                              not_after=proposal.not_after)
+            elif action == gr.ACTION_REVOKE:
+                grant_id = body.get("grant_id")
+                held = next((g for g in self._live_grants(consumer, subject) if g["grant_id"] == grant_id), None)
+                if held is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {
+                        "error": "grant_unknown", "detail": "no live grant of this subject carries that id"})
+                    return
+                r = held["record"]
+                fields = dict(agent_handle=r["agent_handle"], key=r["key"], scope=r["scope"],
+                              not_after=int(r["not_after"]), grant_id=grant_id,
+                              admitted_at=held.get("admitted_at_unix"))
+            else:
+                raise GrantRefused(gr.REQUEST_INVALID, "action must be grant or revoke")
+            req = cfg.user_vault_grant_requests.raise_request(
+                action=action, phone_id=phone.phone_id, agent_id=self.headers.get("X-Recto-Agent-Id", "").strip(),
+                consumer=consumer, subject=subject, purpose=purpose, agent_name=agent_name, **fields)
+        except GrantRefused as e:
+            status = {gr.REQUEST_OPEN: HTTPStatus.CONFLICT,
+                      gr.RATE_LIMITED: HTTPStatus.TOO_MANY_REQUESTS}.get(e.name, HTTPStatus.BAD_REQUEST)
+            self._send_json(status, {"error": e.name, "detail": e.detail})
+            return
+        self._send_json(HTTPStatus.OK, {"request_id": req.request_id, "expires_at_unix": req.expires_at})
+
+    def _handle_user_vault_grant_request_status(self, url: Any) -> None:
+        """GET /v0.4/user-vault/grant-request?request_id= (agent headers + X-Recto-Subject) - the platform reads the
+        outcome of its own request: open | admitted (grant_id, not_after) | denied | revoked | expired. Another
+        platform's or another subject's request answers 404 as if unknown."""
+        cfg = self.config
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        rid = (parse_qs(url.query).get("request_id") or [""])[0]
+        r = cfg.user_vault_grant_requests.get(rid) if rid else None
+        if r is None or r.subject != subject or r.consumer != cfg.user_vault_platform_consumers.get(platform):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "grant_request_unknown"})
+            return
+        out: dict[str, Any] = {"request_id": r.request_id, "action": r.action, "status": r.status}
+        if r.status == "admitted":
+            # The phone may have shortened the date, which changes the grant id: key on agent and key, never the id.
+            out.update(grant_id=r.resolved_grant_id, not_after=r.resolved_not_after)
+        self._send_json(HTTPStatus.OK, out)
+
+    def _handle_user_vault_grant_request_deny(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant-request/deny - body {request_id}. The phone's Deny (or the platform withdrawing
+        its own request): the request leaves the phone and its words are dropped. The id is the 128-bit name only the
+        phone's signed poll and the raising platform hold; a deny grants nothing, so it needs no signature."""
+        cfg = self.config
+        if not cfg.user_vault_path or cfg.user_vault_grant_requests is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        rid = body.get("request_id")
+        ok = isinstance(rid, str) and cfg.user_vault_grant_requests.deny(rid)
+        self._send_json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND,
+                        {"denied": True} if ok else {"error": "grant_request_unknown"})
 
     # ------------------------------------------------------------------
     # Helpers
@@ -7490,6 +7762,7 @@ def create_server(
     user_vault_path: str | None = None,
     user_vault_agent_platforms: dict[str, str] | None = None,
     user_vault_secret_source_factory: Any = None,
+    user_vault_platform_consumers: dict[str, str] | None = None,
     push_dispatcher: Any = None,
     public_urls: tuple[str, ...] | list[str] | None = None,
     clusters_registry_path: str | None = None,
@@ -7982,6 +8255,14 @@ def create_server(
     BootloaderHandler.config.user_vault_secret_source_factory = (
         user_vault_secret_source_factory
     )
+    BootloaderHandler.config.user_vault_platform_consumers = (
+        dict(user_vault_platform_consumers) if user_vault_platform_consumers else {}
+    )
+    if user_vault_path:
+        from recto.user_vault.grant_request import GrantRequestBook
+        BootloaderHandler.config.user_vault_grant_requests = GrantRequestBook()
+    else:
+        BootloaderHandler.config.user_vault_grant_requests = None
     # Silent-push wake dispatcher (wave C). None = poll-only. Build via
     # recto.bootloader.push.PushDispatcher([ApnsPushSender(...),
     # FcmPushSender(...)]); provider credentials (APNs .p8 key, FCM

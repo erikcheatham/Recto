@@ -85,12 +85,12 @@ public sealed record PairDeepLinkPayload(
     PairDeepLinkKind Kind = PairDeepLinkKind.Service,
     string? BootstrapBootloaderUrl = null,
     string? BootstrapPairCode = null,
-    string? UserId = null,
+    string? Subject = null,
     long? NotAfter = null)
 {
-    /// <summary>True when the QR carried the record fields (user_id + not_after) the phone
+    /// <summary>True when the QR carried the record fields (subject + not_after) the phone
     /// needs to sign the pairing act rather than the code alone.</summary>
-    public bool HasRecord => !string.IsNullOrEmpty(UserId) && NotAfter is > 0;
+    public bool HasRecord => !string.IsNullOrEmpty(Subject) && NotAfter is > 0;
 }
 
 /// <summary>

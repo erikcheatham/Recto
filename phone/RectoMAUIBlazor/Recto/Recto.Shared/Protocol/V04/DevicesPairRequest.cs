@@ -25,7 +25,7 @@ public sealed record DevicesPairRequest(
 /// hex (X||Y); <see cref="NotAfter"/> is unix seconds.</summary>
 public sealed record DevicesPairRecord(
     [property: JsonPropertyName("bootloader_id")] string BootloaderId,
-    [property: JsonPropertyName("user_id")] string UserId,
+    [property: JsonPropertyName("subject")] string Subject,
     [property: JsonPropertyName("phone_pubkey")] string PhonePubkey,
     [property: JsonPropertyName("code")] string Code,
     [property: JsonPropertyName("not_after")] long NotAfter)
@@ -40,7 +40,7 @@ public sealed record DevicesPairRecord(
             ["code"] = Code,
             ["not_after"] = NotAfter,
             ["phone_pubkey"] = PhonePubkey,
-            ["user_id"] = UserId,
+            ["subject"] = Subject,
         };
         var bytes = Recto.Shared.Capability.CanonicalJson.Encode(dict);
         return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();

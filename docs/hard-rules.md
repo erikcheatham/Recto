@@ -236,8 +236,9 @@ fails in the tree before a reader has to find it again
   `"capability_requests": false` authenticates to a substrate (the user vault,
   say) and is refused by name (403 `agent_auth_only`) before any capability
   card is raised. An empty request policy stays a config error: "may request
-  nothing" is this kind, not an empty list. Pinned:
-  `TestRule15pAnAuthOnlyAgentRaisesNoCard`.
+  nothing" is this kind, not an empty list. A user-vault agent's grant
+  request (z) is not a capability card and is the one card it may raise.
+  Pinned: `TestRule15pAnAuthOnlyAgentRaisesNoCard`.
 - **q. The relay log carries the status only.** When a consumer answers a
   relayed device pairing or unpairing with an HTTP error, the bootloader logs
   the status code; the consumer's headers and body can carry its users' data
@@ -274,6 +275,36 @@ fails in the tree before a reader has to find it again
   key): a newer one replaces the older. Pinned:
   `TestRule15wAdmissionIsNotRelease`; the store in both backends:
   `test_state_postgres.py::test_a_newer_grant_for_the_same_slot_replaces_the_older`.
+- **x. A card that cannot render a signed field refuses to sign.** The phone's
+  grant and revoke cards show every field of the record it signs: the agent
+  handle, key, scope, until, subject, bootloader and consumer, and the nonce
+  and grant id. A card missing a field, or holding one it cannot show, offers
+  no Approve. The agent's name and the purpose are the service's words,
+  labelled that way and never signed. The window chips only shorten what the
+  service proposed, and none reaches past the 365-day cap. Pinned (phone):
+  `Recto.Shared.Tests/Capability/UserVaultCardTests.cs::Rule15x*`.
+- **y. Nothing from a card persists after the tap.** The service's words and
+  the proposed record live in the card's model only. Approve, Deny, expiry or
+  closing drops them. The phone stores no grant, no history and no
+  handle-to-name map; its grants view reads the bootloader each time (aa).
+  Pinned (phone): `Recto.Shared.Tests/Capability/UserVaultCardTests.cs::Rule15y*`.
+- **z. A grant request rings only the subject's bound phone, and its words
+  never touch disk.** A user-vault agent may ask, by
+  `POST /v0.4/user-vault/grant-request`, for a grant or a revoke. The card
+  rings only the phone its (consumer, subject) is bound to; the consumer comes
+  from the operator's platform-to-consumer map, never from the caller. One
+  request is open per (agent, key), raises are rate-limited per subject, and a
+  request lives five minutes. The purpose (280 characters) and the agent's name
+  (64) are held in memory and nowhere else: control and format characters are
+  refused, and resolve, deny, expiry or restart drops them. Pinned:
+  `TestRule15zAGrantRequestRingsOnlyTheBoundPhone`.
+- **aa. A revoke never needs the platform.** The bound phone reads its
+  subjects' live grants from the bootloader by its own identity signature
+  (`recto-user-vault-grants-v1|`, fresh within two minutes) and revokes one,
+  or every grant of one key (`recto-user-vault-revoke-key-v1|`, "stop all"),
+  straight to the bootloader. A stop-all lives at most ten minutes and is used
+  once, so the same signature re-sent ends nothing granted since. Pinned:
+  `TestRule15aaARevokeNeverNeedsThePlatform`.
 
 **The reader's residue.** Findings that name a design here are not re-argued;
 they are answered by the rule's letter and the test's name. A finding this

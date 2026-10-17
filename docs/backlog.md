@@ -26,7 +26,10 @@ capability on Play.
    - `Recto.csproj` does not set `AndroidLinkTool`. Confirm against a built Release AAB whether R8 is shrinking the Java/DEX
      side; the expectation is that it is not.
    - Set `<AndroidLinkTool>r8</AndroidLinkTool>` for Release Android builds, with keep rules for Firebase Messaging, ML Kit
-     barcode scanning and the CameraX bindings.
+     barcode scanning and the CameraX bindings. **Carried by the R-series step 3 release (2026-10-17):** r8 is set and
+     `Platforms/Android/proguard.cfg` keeps Firebase Messaging and AndroidX Biometric. ML Kit and CameraX are not
+     referenced by `Recto.csproj` (commented out), so they get rules when they come back. The device re-test and the Play
+     Console read below are still owed.
    - Upload the bundle to an internal track, then read Play Console's new DEX optimization insights for it.
    - Re-run the camera and QR, push wake and StrongBox signing paths on a device: R8 failures show up at runtime, not at build.
 2. **Dynamic memory (anonymous RSS + swap) and bitmap memory.**
@@ -43,7 +46,9 @@ capability on Play.
    - Related, and worth fixing either way: `AndroidManifest.xml` sets `android:allowBackup="true"`. A device-to-device restore
      can bring back pairing records whose keystore aliases do not exist on the new phone. Test the restore, and either exclude
      the pairing store from backup (`dataExtractionRules` / `fullBackupContent`) or make the app treat a record without its key
-     as unpaired, with a clear prompt to pair again.
+     as unpaired, with a clear prompt to pair again. **Carried by the R-series step 3 release (2026-10-17):**
+     `allowBackup="false"`, with `data_extraction_rules.xml` (API 31+, cloud backup and device transfer) and
+     `backup_rules.xml` (API 24-30) excluding every domain. The restore test on a device is still owed.
 
 ## Passkeys on both platforms versus Recto's own keys (researched 2026-10-17)
 

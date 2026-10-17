@@ -56,7 +56,7 @@ public class DevicesPairProtocolTests
         Assert.Contains("\"consumer_base_url\":", json);
         Assert.Contains("\"record\":", json);
         Assert.Contains("\"bootloader_id\":", json);
-        Assert.Contains("\"user_id\":", json);
+        Assert.Contains("\"subject\":", json);
         Assert.Contains("\"phone_pubkey\":", json);
         Assert.Contains("\"code\":", json);
         Assert.Contains("\"not_after\":", json);
@@ -88,7 +88,7 @@ public class DevicesPairProtocolTests
         // The same tuple the bootloader's suite pins (tests/test_capability_pair_record.py):
         // canonical bytes are sorted keys, no whitespace; the fingerprint is their SHA-256.
         var expectedBytes = "{\"bootloader_id\":\"bl-test\",\"code\":\"A1B2C3D4\",\"not_after\":1800000600," +
-                            "\"phone_pubkey\":\"" + Phone + "\",\"user_id\":\"user-1\"}";
+                            "\"phone_pubkey\":\"" + Phone + "\",\"subject\":\"user-1\"}";
         var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
             System.Text.Encoding.UTF8.GetBytes(expectedBytes))).ToLowerInvariant();
         Assert.Equal(expected, Record().Fingerprint());
@@ -96,7 +96,7 @@ public class DevicesPairProtocolTests
 
     [Theory]
     [InlineData("bootloader_id")]
-    [InlineData("user_id")]
+    [InlineData("subject")]
     [InlineData("phone_pubkey")]
     [InlineData("code")]
     [InlineData("not_after")]
@@ -106,7 +106,7 @@ public class DevicesPairProtocolTests
         var changed = field switch
         {
             "bootloader_id" => r with { BootloaderId = "bl-other" },
-            "user_id" => r with { UserId = "user-2" },
+            "subject" => r with { Subject = "user-2" },
             "phone_pubkey" => r with { PhonePubkey = string.Concat(Enumerable.Repeat("cd", 64)) },
             "code" => r with { Code = "Z9Y8X7W6" },
             _ => r with { NotAfter = r.NotAfter + 1 },

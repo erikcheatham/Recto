@@ -108,7 +108,7 @@ def phone():
 def _record(phone, **overrides) -> PairRecord:
     base = dict(
         bootloader_id=_BOOTLOADER_ID,
-        user_id=_subject("user-1"),  # the field carries the consumer's opaque handle (hard rule 15.o)
+        subject=_subject("user-1"),  # the consumer's opaque handle (hard rule 15.o)
         phone_pubkey=phone["pub"],
         code=_VALID_CODE,
         not_after=int(time.time()) + 600,
@@ -353,7 +353,7 @@ class TestDevicesPairRefusals:
         url = fake_consumer["base_url"]
         ctx = bootloader(consumer_tokens={url: "tok"})
         rec = _record(phone)
-        other = _record(phone, user_id=_subject("user-2"))
+        other = _record(phone, subject=_subject("user-2"))
         jws = _grant(phone, rec, scope=CapabilityScope(payload_sha256=other.fingerprint()))
         status, body = _http_post_json(_pair_url(ctx), _body(url, phone, rec, jws))
         assert status == HTTPStatus.FORBIDDEN
@@ -568,14 +568,14 @@ class TestBootloaderAttest:
 
 
 class TestRule15PairRecordCarriesAHandle:
-    """Hard rules 15.m and 15.q on devices/pair (named in tests/test_recurve_acceptances.py): the record's `user_id`
+    """Hard rules 15.m and 15.q on devices/pair (named in tests/test_recurve_acceptances.py): the record's `subject`
     field carries the consumer's OPAQUE subject handle - a user id in it is refused before anything is relayed - and
     a consumer's HTTP error is logged by its status alone, never its headers or body."""
 
     def test_a_user_id_in_the_record_is_refused_and_nothing_is_relayed(self, bootloader, fake_consumer, phone):
         url = fake_consumer["base_url"]
         ctx = bootloader(consumer_tokens={url: "tok"})
-        record = _record(phone, user_id="11111111-2222-3333-4444-555555555555")
+        record = _record(phone, subject="11111111-2222-3333-4444-555555555555")
         status, body = _http_post_json(_pair_url(ctx), _body(url, phone, record=record, jws=_grant(phone, record)))
         assert status == HTTPStatus.BAD_REQUEST
         assert body["error"] == "record_subject_invalid"

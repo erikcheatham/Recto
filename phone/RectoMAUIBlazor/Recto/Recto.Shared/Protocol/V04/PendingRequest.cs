@@ -200,6 +200,21 @@ public static class PendingRequestKind
     public const string CapabilityRequest = "capability_request";
 
     /// <summary>
+    /// R-series step 3: a platform asks this phone's person to let one agent
+    /// use one user-vault key until a date (hard rule 15.z). The phone signs
+    /// the grant with its identity key and POSTs it to
+    /// <c>/v0.4/user-vault/grant</c> itself; Deny only takes the card away.
+    /// </summary>
+    public const string UserVaultGrant = "user_vault_grant";
+
+    /// <summary>
+    /// R-series step 3: a platform asks that one grant end. The phone signs
+    /// the revoke and POSTs it to <c>/v0.4/user-vault/revoke</c>. The phone
+    /// can also revoke without any card, from its grants view (hard rule 15.aa).
+    /// </summary>
+    public const string UserVaultRevoke = "user_vault_revoke";
+
+    /// <summary>
     /// Phase 2.0.B integration: multi-profile identity creation. A
     /// caller (CLI, SCIM glue, automation) POSTs a candidate Profile
     /// shape (kind / display_name / theme_hint / scim_provider) plus a

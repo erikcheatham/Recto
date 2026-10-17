@@ -1516,6 +1516,12 @@ def main() -> int:
         var_name="RECTO_USER_VAULT_AGENT_PLATFORMS",
     )
     user_vault_secret_factory = _build_user_vault_secret_factory()
+    # RECTO_USER_VAULT_PLATFORM_CONSUMERS -- JSON {platform: consumer url}: which member binding a platform's grant
+    # requests ring (R-series step 3). A platform with no entry raises none.
+    user_vault_platform_consumers = _parse_connections_agent_services(
+        os.environ.get("RECTO_USER_VAULT_PLATFORM_CONSUMERS", ""),
+        var_name="RECTO_USER_VAULT_PLATFORM_CONSUMERS",
+    )
 
     quiet = os.environ.get("RECTO_BOOTLOADER_QUIET", "").strip() == "1"
 
@@ -1628,6 +1634,7 @@ def main() -> int:
             user_vault_path=user_vault_path,
             user_vault_agent_platforms=user_vault_agent_platforms,
             user_vault_secret_source_factory=user_vault_secret_factory,
+            user_vault_platform_consumers=user_vault_platform_consumers,
             notify_resolved_fn=(
                 events_emitter.notify_resolved if events_emitter is not None else None
             ),

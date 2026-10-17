@@ -270,7 +270,11 @@ public sealed record PendingRequestContext(
     // never a claim — shown beside the signed subject only when its
     // actor_id equals the subject's acting-agent half (ActorContextCheck).
     // Null when the consumer sent no `actor`; the card renders as before.
-    [property: JsonPropertyName("actor_context")] ActorContext? ActorContext = null);
+    [property: JsonPropertyName("actor_context")] ActorContext? ActorContext = null,
+    // User-vault grant request (user_vault_grant / user_vault_revoke, R-series step 3, hard rule 15.z): the
+    // platform's proposal and its words. The phone signs a record built from it; the words are never signed and
+    // leave with the card (hard rule 15.y).
+    [property: JsonPropertyName("user_vault_grant")] UserVaultGrantContext? UserVaultGrant = null);
 
 public static class PgpOperation
 {

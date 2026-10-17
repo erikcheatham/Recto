@@ -458,6 +458,7 @@ def uv_ctx(tmp_path: Path):
         user_vault_path=str(tmp_path / "user_vault.json"),
         user_vault_agent_platforms={_UVA_ID: _PLATFORM},
         user_vault_secret_source_factory=vault.factory,
+        user_vault_platform_consumers={_PLATFORM: _CONSUMER},
     )
     host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -657,3 +658,235 @@ class TestRule15wAdmissionIsNotRelease:
         second = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
         held = uv_ctx["state"].list_user_vault_grants(_CONSUMER, s)
         assert [g["grant_id"] for g in held] == [second] and first != second
+
+
+# ---------------------------------------------------------------------------
+# 15.z - 15.aa: the grant request rings the bound phone; a revoke never needs the platform (R-series step 3)
+# ---------------------------------------------------------------------------
+
+def _uv_headers(subject: str) -> dict[str, str]:
+    return {"X-Recto-Agent-Id": _UVA_ID, "X-Recto-Agent-Token": _UVA_TOKEN, "X-Recto-Subject": subject}
+
+
+def _raise(ctx, subject: str, **over) -> tuple[int, dict]:
+    from tests.test_bootloader_slots import _http
+
+    body = {"action": "grant", "agent_handle": _handle("agent-1"), "key": "user-ai-xai", "scope": "AgentChat",
+            "not_after": int(time.time()) + 90 * 86400}
+    body.update(over)
+    return _http("POST", f"{ctx['base_url']}/v0.4/user-vault/grant-request", body, headers=_uv_headers(subject))
+
+
+def _status(ctx, subject: str, request_id: str) -> tuple[int, dict]:
+    from tests.test_bootloader_slots import _http
+
+    return _http("GET", f"{ctx['base_url']}/v0.4/user-vault/grant-request?request_id={request_id}",
+                 headers=_uv_headers(subject))
+
+
+def _uv_cards(ctx, phone) -> list[dict]:
+    status, body = phone.read_pending(ctx)
+    assert status == 200, body
+    return [r for r in body["requests"] if r["kind"] in ("user_vault_grant", "user_vault_revoke")]
+
+
+def _list_grants(ctx, phone, *, signer=None, issued_at: int | None = None) -> tuple[int, dict]:
+    from recto.user_vault.grant_record import GrantsListRequest
+
+    req = {"bootloader_id": "rule15-test", "phone_id": phone.ref,
+           "issued_at": issued_at if issued_at is not None else int(time.time()),
+           "nonce": "list-" + uuid.uuid4().hex[:16]}
+    sig = _signed(signer or phone, GrantsListRequest.from_dict(req).signed_message())
+    return _post_body(ctx, "grants", {"request": req, "signature_b64u": sig})
+
+
+def _post_body(ctx, verb: str, body: dict) -> tuple[int, dict]:
+    from tests.test_bootloader_slots import _http
+
+    return _http("POST", f"{ctx['base_url']}/v0.4/user-vault/{verb}", body)
+
+
+def _revoke_key(ctx, phone, subject: str, key: str = "user-ai-xai", *, window: int = 300) -> tuple[int, dict, dict]:
+    from recto.user_vault.grant_record import RevokeKeyRecord
+
+    rec = {"bootloader_id": "rule15-test", "consumer": _CONSUMER, "subject": subject, "key": key,
+           "not_after": int(time.time()) + window, "nonce": "stopall-" + uuid.uuid4().hex[:16]}
+    body = {"record": rec, "signature_b64u": _signed(phone, RevokeKeyRecord.from_dict(rec).signed_message())}
+    status, out = _post_body(ctx, "revoke-key", body)
+    return status, out, body
+
+
+class TestRule15zAGrantRequestRingsOnlyTheBoundPhone:
+    """Hard rule 15.z: a user-vault agent's grant request rings only the phone its subject is bound to, one open
+    request per (agent, key), rate-limited per subject; its words - purpose and agent name - are held in memory, capped,
+    refused with control or format characters, and never written to disk."""
+
+    def test_the_bound_phone_sees_the_card_and_no_other_phone_does(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        status, body = _raise(uv_ctx, s, purpose="answers with your own key", agent_name="Agent One")
+        assert status == 200, body
+        cards = _uv_cards(uv_ctx, a)
+        assert [c["request_id"] for c in cards] == [body["request_id"]]
+        uv = cards[0]["context"]["user_vault_grant"]
+        assert (uv["consumer"], uv["subject"], uv["key"], uv["scope"]) == (_CONSUMER, s, "user-ai-xai", "AgentChat")
+        assert uv["bootloader_id"] == "rule15-test" and uv["agent_name"] == "Agent One"
+        assert _uv_cards(uv_ctx, b) == []
+
+    def test_an_unbound_subject_rings_nothing(self, uv_ctx) -> None:
+        _bound(uv_ctx)
+        status, body = _raise(uv_ctx, _handle("nobody"))
+        assert status == 403 and body["error"] == "grant_subject_unbound", body
+
+    def test_a_platform_with_no_consumer_mapped_rings_nothing(self, uv_ctx) -> None:
+        from recto.bootloader.server import BootloaderHandler
+
+        _, s = _bound(uv_ctx)
+        saved = BootloaderHandler.config.user_vault_platform_consumers
+        BootloaderHandler.config.user_vault_platform_consumers = {}
+        try:
+            status, body = _raise(uv_ctx, s)
+        finally:
+            BootloaderHandler.config.user_vault_platform_consumers = saved
+        assert status == 403 and body["error"] == "grant_request_consumer_unmapped", body
+
+    def test_the_words_never_touch_disk(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        purpose, name = "PURPOSE-" + uuid.uuid4().hex, "NAME-" + uuid.uuid4().hex[:12]
+        assert _raise(uv_ctx, s, purpose=purpose, agent_name=name)[0] == 200
+        assert _uv_cards(uv_ctx, a)[0]["context"]["user_vault_grant"]["purpose"] == purpose
+        assert uv_ctx["state"].list_pending_for_phone(a.ref) == []
+        for f in uv_ctx["dir"].rglob("*"):
+            if f.is_file() and f.suffix != ".lock":  # the store lock is held open by the server
+                raw = f.read_bytes()
+                assert purpose.encode() not in raw and name.encode() not in raw, f
+
+    def test_one_open_request_per_agent_and_key(self, uv_ctx) -> None:
+        _, s = _bound(uv_ctx)
+        assert _raise(uv_ctx, s)[0] == 200
+        status, body = _raise(uv_ctx, s)
+        assert status == 409 and body["error"] == "grant_request_open", body
+
+    def test_raises_per_subject_are_rate_limited(self, uv_ctx) -> None:
+        from recto.user_vault.grant_request import RAISES_PER_HOUR
+
+        _, s = _bound(uv_ctx)
+        for i in range(RAISES_PER_HOUR):
+            assert _raise(uv_ctx, s, key=f"user-ai-k{i}")[0] == 200
+        status, body = _raise(uv_ctx, s, key="user-ai-one-more")
+        assert status == 429 and body["error"] == "grant_request_rate_limited", body
+
+    @pytest.mark.parametrize("field,value", [
+        ("purpose", "reads one way‮yaw rehtona"), ("purpose", "x" * 281),
+        ("agent_name", "Agent\nOne"), ("agent_name", "n" * 65),
+    ])
+    def test_words_over_the_cap_or_with_control_characters_are_refused(self, uv_ctx, field, value) -> None:
+        a, s = _bound(uv_ctx)
+        status, body = _raise(uv_ctx, s, **{field: value})
+        assert status == 400 and body["error"] == "grant_request_invalid", body
+        assert _uv_cards(uv_ctx, a) == []
+
+    def test_the_phones_grant_resolves_the_request_and_drops_its_words(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rid = _raise(uv_ctx, s, purpose="p", agent_name="n")[1]["request_id"]
+        shorter = int(time.time()) + 7 * 86400  # the person picked a shorter chip; the grant id differs from any proposal
+        gid = _grant(uv_ctx, a, _grant_dict(s, not_after=shorter))[1]["grant_id"]
+        status, body = _status(uv_ctx, s, rid)
+        assert status == 200 and body["status"] == "admitted" and body["grant_id"] == gid, body
+        assert body["not_after"] == shorter
+        assert _uv_cards(uv_ctx, a) == []
+        from recto.bootloader.server import BootloaderHandler
+        r = BootloaderHandler.config.user_vault_grant_requests.get(rid)
+        assert r.purpose is None and r.agent_name is None
+
+    def test_deny_takes_the_card_off_the_phone(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        assert _post_body(uv_ctx, "grant-request/deny", {"request_id": rid})[0] == 200
+        assert _status(uv_ctx, s, rid)[1]["status"] == "denied"
+        assert _uv_cards(uv_ctx, a) == []
+
+    def test_another_subjects_request_reads_as_unknown(self, uv_ctx) -> None:
+        _, s = _bound(uv_ctx, "a")
+        _, s2 = _bound(uv_ctx, "b", member="member-2")
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        status, body = _status(uv_ctx, s2, rid)
+        assert status == 404 and body["error"] == "grant_request_unknown", body
+
+
+class TestRule15aaARevokeNeverNeedsThePlatform:
+    """Hard rule 15.aa: the bound phone reads its subjects' live grants from the bootloader by its own signature and
+    revokes one, or every grant of one key ("stop all"), straight to the bootloader - no platform call anywhere. A
+    stop-all is used once: re-sent, it ends nothing granted since."""
+
+    def test_the_phone_lists_its_live_grants_by_its_own_signature(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        gid = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        status, body = _list_grants(uv_ctx, a)
+        assert status == 200, body
+        assert [(g["grant_id"], g["subject"], g["key"]) for g in body["grants"]] == [(gid, s, "user-ai-xai")]
+        assert "agent_name" not in body["grants"][0] and "purpose" not in body["grants"][0]
+
+    def test_another_phones_signature_reads_nothing(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        _grant(uv_ctx, a, _grant_dict(s))
+        status, body = _list_grants(uv_ctx, a, signer=b)
+        assert status == 403 and body["error"] == "grant_signature_invalid", body
+
+    def test_a_stale_list_request_is_refused(self, uv_ctx) -> None:
+        a, _ = _bound(uv_ctx)
+        status, body = _list_grants(uv_ctx, a, issued_at=int(time.time()) - 600)
+        assert status == 403 and body["error"] == "grant_list_stale", body
+
+    def test_a_revoke_from_the_list_needs_no_platform(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        _grant(uv_ctx, a, _grant_dict(s))
+        listed = _list_grants(uv_ctx, a)[1]["grants"][0]
+        status, body = _revoke(uv_ctx, a, listed["subject"], listed["grant_id"])
+        assert status == 200 and body["revoked"] is True, body
+        assert _list_grants(uv_ctx, a)[1]["grants"] == []
+
+    def test_stop_all_ends_every_grant_of_the_key_and_only_that_key(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        g1 = _grant(uv_ctx, a, _grant_dict(s, agent_handle=_handle("agent-1")))[1]["grant_id"]
+        g2 = _grant(uv_ctx, a, _grant_dict(s, agent_handle=_handle("agent-2")))[1]["grant_id"]
+        other = _grant(uv_ctx, a, _grant_dict(s, key="user-ai-other"))[1]["grant_id"]
+        status, body, _ = _revoke_key(uv_ctx, a, s)
+        assert status == 200 and sorted(body["revoked"]) == sorted([g1, g2]), body
+        assert [g["grant_id"] for g in _list_grants(uv_ctx, a)[1]["grants"]] == [other]
+
+    def test_a_stop_all_re_sent_ends_nothing_granted_since(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        _grant(uv_ctx, a, _grant_dict(s))
+        status, _, signed = _revoke_key(uv_ctx, a, s)
+        assert status == 200
+        fresh = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        status, body = _post_body(uv_ctx, "revoke-key", signed)  # the replay, signature verbatim
+        assert status == 403 and body["error"] == "grant_act_used", body
+        assert [g["grant_id"] for g in _list_grants(uv_ctx, a)[1]["grants"]] == [fresh]
+
+    def test_a_stop_all_with_a_long_window_is_refused(self, uv_ctx) -> None:
+        from recto.user_vault.grant_record import ACT_WINDOW_SECONDS
+
+        a, s = _bound(uv_ctx)
+        status, body, _ = _revoke_key(uv_ctx, a, s, window=ACT_WINDOW_SECONDS + 60)
+        assert status == 403 and body["error"] == "grant_act_window_invalid", body
+
+    def test_only_the_bound_phone_stops_all(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        _grant(uv_ctx, a, _grant_dict(s))
+        status, body, _ = _revoke_key(uv_ctx, b, s)
+        assert status == 403 and body["error"] == "grant_signature_invalid", body
+        assert len(_list_grants(uv_ctx, a)[1]["grants"]) == 1
+
+    def test_the_service_may_ask_for_a_revoke_and_the_phone_carries_it_out(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        gid = _grant(uv_ctx, a, _grant_dict(s))[1]["grant_id"]
+        status, body = _raise(uv_ctx, s, action="revoke", grant_id=gid)
+        assert status == 200, body
+        card = _uv_cards(uv_ctx, a)[0]
+        assert card["kind"] == "user_vault_revoke" and card["context"]["user_vault_grant"]["grant_id"] == gid
+        assert _revoke(uv_ctx, a, s, gid)[0] == 200
+        assert _status(uv_ctx, s, body["request_id"])[1]["status"] == "revoked"

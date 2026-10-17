@@ -49,7 +49,7 @@ _BOOTLOADER = "bl-test"
 def _record(**overrides) -> PairRecord:
     base = dict(
         bootloader_id=_BOOTLOADER,
-        user_id="user-1",
+        subject="user-1",
         phone_pubkey=_PHONE,
         code="A1B2C3D4",
         not_after=_NOW + 600,
@@ -91,7 +91,7 @@ def _claims(
 
 
 def test_fields_are_the_five_sorted():
-    assert PAIR_RECORD_FIELDS == ("bootloader_id", "code", "not_after", "phone_pubkey", "user_id")
+    assert PAIR_RECORD_FIELDS == ("bootloader_id", "code", "not_after", "phone_pubkey", "subject")
     assert list(_record().to_dict().keys()) == list(PAIR_RECORD_FIELDS)
 
 
@@ -99,7 +99,7 @@ def test_canonical_bytes_are_sorted_and_whitespace_free():
     b = _record().canonical_bytes()
     assert b == (
         b'{"bootloader_id":"bl-test","code":"A1B2C3D4","not_after":1800000600,'
-        b'"phone_pubkey":"' + _PHONE.encode() + b'","user_id":"user-1"}'
+        b'"phone_pubkey":"' + _PHONE.encode() + b'","subject":"user-1"}'
     )
 
 
@@ -110,11 +110,11 @@ def test_fingerprint_is_sha256_of_canonical_bytes_and_stable():
     assert len(r.fingerprint()) == 64 and r.fingerprint() == r.fingerprint().lower()
 
 
-@pytest.mark.parametrize("field", ["bootloader_id", "user_id", "phone_pubkey", "code", "not_after"])
+@pytest.mark.parametrize("field", ["bootloader_id", "subject", "phone_pubkey", "code", "not_after"])
 def test_every_field_moves_the_fingerprint(field):
     changed = {
         "bootloader_id": "bl-other",
-        "user_id": "user-2",
+        "subject": "user-2",
         "phone_pubkey": _OTHER_PHONE,
         "code": "Z9Y8X7W6",
         "not_after": _NOW + 601,
@@ -124,7 +124,7 @@ def test_every_field_moves_the_fingerprint(field):
 
 def test_from_dict_normalises_pubkey_case_and_prefix_only():
     a = PairRecord.from_dict(
-        {"bootloader_id": _BOOTLOADER, "user_id": "user-1", "code": "A1B2C3D4",
+        {"bootloader_id": _BOOTLOADER, "subject": "user-1", "code": "A1B2C3D4",
          "not_after": str(_NOW + 600), "phone_pubkey": "0x04" + _PHONE.upper()}
     )
     assert a == _record()
@@ -136,7 +136,7 @@ def test_from_dict_normalises_pubkey_case_and_prefix_only():
         ({"phone_pubkey": _PHONE[:-2]}, RECORD_PUBKEY_MALFORMED),
         ({"phone_pubkey": _PHONE.upper()}, RECORD_PUBKEY_MALFORMED),
         ({"code": " "}, RECORD_FIELD_EMPTY),
-        ({"user_id": ""}, RECORD_FIELD_EMPTY),
+        ({"subject": ""}, RECORD_FIELD_EMPTY),
         ({"not_after": 0}, RECORD_NOT_AFTER_MALFORMED),
         ({"not_after": True}, RECORD_NOT_AFTER_MALFORMED),
     ],
@@ -183,7 +183,7 @@ def test_scope_with_only_the_code_is_refused():
 
 
 def test_scope_naming_another_records_fingerprint_is_refused():
-    other = _record(user_id="user-2").fingerprint()
+    other = _record(subject="user-2").fingerprint()
     assert _refused(_claims(fingerprint=other)) == GRANT_SCOPE_FINGERPRINT_MISMATCH
 
 
@@ -225,3 +225,11 @@ def test_window_at_the_ceiling_is_admitted():
         _claims(fingerprint=r.fingerprint(), window=PAIR_WINDOW_CEILING_SECONDS), r,
         signer_pubkey_hex=_PHONE, bootloader_id=_BOOTLOADER, now=_NOW,
     )
+
+
+def test_a_record_still_naming_user_id_carries_no_subject_and_is_refused():
+    """The wire field is `subject`; a record from a phone that still sends `user_id` is refused, never read through."""
+    with pytest.raises(PairRefused) as e:
+        PairRecord.from_dict({"bootloader_id": _BOOTLOADER, "user_id": "user-1", "code": "A1B2C3D4",
+                              "phone_pubkey": _PHONE, "not_after": 1_800_000_000})
+    assert e.value.name == RECORD_FIELD_EMPTY

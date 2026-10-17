@@ -1,0 +1,191 @@
+@using Recto.Shared.Capability
+@using Recto.Shared.Protocol.V04
+@using Recto.Shared.Services
+@inject IBootloaderClient BootloaderClient
+@inject IEnclaveKeyService EnclaveKeys
+
+@* HARD RULE 15.aa: a revoke never needs the platform. The phone keeps no
+   grants (15.y), so this panel reads them from the vault each time it opens,
+   by the phone's own signature, and revokes straight to the vault - one grant,
+   or every grant of a key ("Stop all"). It shows only what Recto holds:
+   handles, key, scope, dates. No display names: Recto never holds them. *@
+
+<details class="rec-pairing-details" @ontoggle="OnToggleAsync">
+    <summary class="rec-pairing-summary">
+        <span class="rec-pairing-summary-label">
+            Your grants
+            @if (_grants is { Count: > 0 })
+            {
+                <span class="badge bg-secondary ms-1">@_grants.Count</span>
+            }
+        </span>
+        <span class="rec-pairing-summary-hint">Tap to view</span>
+    </summary>
+    <div class="rec-pairing-body text-start small">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="text-muted">Agents you let use your keys. Read from the vault; nothing is kept here.</span>
+            <button type="button" class="btn btn-link p-0" disabled="@_busy" @onclick="LoadAsync">Refresh</button>
+        </div>
+        @if (!string.IsNullOrEmpty(_error))
+        {
+            <div class="alert alert-danger small mb-2" role="alert">@_error</div>
+        }
+        @if (!string.IsNullOrEmpty(_status))
+        {
+            <div class="alert alert-secondary small mb-2" role="status">@_status</div>
+        }
+        @if (_busy)
+        {
+            <div class="text-muted"><span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>@_busyText</div>
+        }
+        else if (_grants is null)
+        {
+            <div class="text-muted">Open to read your grants.</div>
+        }
+        else if (_grants.Count == 0)
+        {
+            <div class="text-muted">No agent holds a grant for any of your keys.</div>
+        }
+        else
+        {
+            @foreach (var byKey in _grants.GroupBy(g => (g.Consumer, g.Subject, g.Key)))
+            {
+                <div class="uvg-key">
+                    <div class="uvg-key-head">
+                        <span><code>@byKey.Key.Key</code> <span class="text-muted">at @byKey.Key.Consumer</span></span>
+                        <button type="button" class="rec-btn rec-btn-deny uvg-stop-all"
+                                @onclick="() => StopAllAsync(byKey.Key.Consumer, byKey.Key.Subject, byKey.Key.Key, byKey.Count())">
+                            Stop all (@byKey.Count())
+                        </button>
+                    </div>
+                    @foreach (var g in byKey)
+                    {
+                        <div class="uvg-row">
+                            <div>
+                                <div><span class="uvg-h">agent @UserVaultCardModel.HandlePrefix(g.AgentHandle)</span> · @g.Scope</div>
+                                <div class="text-muted">
+                                    until @UserVaultCardModel.FormatUtc(g.NotAfter)
+                                    @if (g.AdmittedAtUnix is { } given)
+                                    {
+                                        <span> · given @UserVaultCardModel.FormatUtc(given)</span>
+                                    }
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-danger" @onclick="() => StopOneAsync(g)">Stop</button>
+                        </div>
+                    }
+                </div>
+            }
+        }
+    </div>
+</details>
+
+@code {
+    [Parameter, EditorRequired] public string BootloaderUrl { get; set; } = string.Empty;
+    [Parameter, EditorRequired] public string BootloaderId { get; set; } = string.Empty;
+    [Parameter, EditorRequired] public string PhoneId { get; set; } = string.Empty;
+    [Parameter, EditorRequired] public string IdentityKeyAlias { get; set; } = string.Empty;
+
+    // The rows of the last read, in memory while the panel is on screen; never written anywhere (hard rule 15.y).
+    private List<UserVaultGrantRow>? _grants;
+    private bool _busy;
+    private string _busyText = string.Empty;
+    private string? _error;
+    private string? _status;
+    private bool _open;
+
+    private async Task OnToggleAsync()
+    {
+        _open = !_open;
+        if (_open) await LoadAsync();
+        else _grants = null;
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _busy = true;
+        _busyText = "Awaiting biometric approval to read your grants...";
+        StateHasChanged();
+        try
+        {
+            var req = UserVaultCardModel.BuildGrantsListRequest(
+                BootloaderId, PhoneId, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), UserVaultCardModel.NewNonce());
+            var sig = await SignAsync(UserVaultCardModel.GrantsListPrefix, req);
+            if (sig is null) return;
+            var r = await BootloaderClient.ListUserVaultGrantsAsync(
+                BootloaderUrl, new UserVaultGrantsListRequest(req, sig), CancellationToken.None);
+            if (r.IsFailure) { _error = r.Error.Message; return; }
+            _grants = r.Value.Grants.ToList();
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task StopOneAsync(UserVaultGrantRow g)
+    {
+        _error = _status = null;
+        _busy = true;
+        _busyText = "Awaiting biometric approval to stop this grant...";
+        StateHasChanged();
+        try
+        {
+            var rec = UserVaultCardModel.BuildRevokeRecord(BootloaderId, g.Consumer, g.Subject, g.GrantId,
+                UserVaultCardModel.NewNonce());
+            var sig = await SignAsync(UserVaultCardModel.RevokePrefix, rec);
+            if (sig is null) return;
+            var r = await BootloaderClient.PostUserVaultRevokeAsync(
+                BootloaderUrl, new UserVaultSignedRecord(rec, sig), CancellationToken.None);
+            if (r.IsFailure) { _error = r.Error.Message; return; }
+            _grants?.RemoveAll(x => x.GrantId == g.GrantId);
+            _status = "Stopped. The agent's next use of the key is refused.";
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task StopAllAsync(string consumer, string subject, string key, int count)
+    {
+        _error = _status = null;
+        _busy = true;
+        _busyText = $"Awaiting biometric approval to stop all {count} for {key}...";
+        StateHasChanged();
+        try
+        {
+            var rec = UserVaultCardModel.BuildRevokeKeyRecord(BootloaderId, consumer, subject, key,
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds() + UserVaultCardModel.ActWindowSeconds,
+                UserVaultCardModel.NewNonce());
+            var sig = await SignAsync(UserVaultCardModel.RevokeKeyPrefix, rec);
+            if (sig is null) return;
+            var r = await BootloaderClient.PostUserVaultRevokeKeyAsync(
+                BootloaderUrl, new UserVaultSignedRecord(rec, sig), CancellationToken.None);
+            if (r.IsFailure) { _error = r.Error.Message; return; }
+            var gone = r.Value.Revoked.ToHashSet(StringComparer.Ordinal);
+            _grants?.RemoveAll(x => gone.Contains(x.GrantId));
+            _status = $"Stopped {gone.Count} for {key}.";
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<string?> SignAsync(string prefix, IReadOnlyDictionary<string, object?> record)
+    {
+        var sig = await EnclaveKeys.SignAsync(IdentityKeyAlias, UserVaultCardModel.SignedMessage(prefix, record),
+            CancellationToken.None);
+        if (sig.IsFailure)
+        {
+            _error = sig.Error.Message;
+            return null;
+        }
+        return Convert.ToBase64String(sig.Value).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+}

@@ -749,6 +749,16 @@
                                     }
                                     @switch (req.Kind)
                                     {
+                                        case PendingRequestKind.UserVaultGrant:
+                                        case PendingRequestKind.UserVaultRevoke:
+                                            @* R-series step 3: the card renders every signed field and owns its
+                                               buttons (hard rules 15.x, 15.y); nothing here signs for it. *@
+                                            <UserVaultCardView Request="req"
+                                                               BootloaderUrl="@ActiveBootloaderUrl"
+                                                               PairedBootloaderId="@(_paired?.BootloaderId ?? string.Empty)"
+                                                               IdentityKeyAlias="@KeyAlias"
+                                                               OnResolved="OnUserVaultResolvedAsync" />
+                                            break;
                                         case PendingRequestKind.SingleSign:
                                             @* Phase 3 disclosure — primary action (badge + operation
                                                description + service/secret reference) stays visible;
@@ -1500,6 +1510,10 @@
                                             </button>
                                         </div>
                                     }
+                                    else if (Recto.Shared.Capability.UserVaultCardModel.IsUserVaultKind(req.Kind))
+                                    {
+                                        @* The user-vault card's own Approve/Deny row is inside it. *@
+                                    }
                                     else if (CapabilityWindowClosed(req) is { } closedAt)
                                     {
                                         @* AN EXPIRED CARD OFFERS NO TAP (2026-09-21). The grant's window (iat -> exp) is
@@ -1565,6 +1579,16 @@
                 </div>
 
                 <hr class="my-3" />
+
+                @* R-series step 3, hard rule 15.aa: the phone's own grants, read from the vault by its own
+                   signature and revoked straight to it - a revoke never needs the platform. *@
+                @if (_paired is not null)
+                {
+                    <UserVaultGrantsPanel BootloaderUrl="@ActiveBootloaderUrl"
+                                          BootloaderId="@_paired.BootloaderId"
+                                          PhoneId="@_paired.PhoneId"
+                                          IdentityKeyAlias="@KeyAlias" />
+                }
 
                 @* Phase 2 disclosure — Registered Phones stays on the main
                    screen (critical security feature: operators with N paired
@@ -2300,14 +2324,14 @@
     // The pairing record's consumer-owned fields, carried by the QR. The phone signs the act
     // (bootloader, user, key, code, expiry); a typed code without them cannot pair.
     private string? _pairServiceRecordCode;
-    private string? _pairServiceUserId;
+    private string? _pairServiceSubject;
     private long? _pairServiceNotAfter;
     private bool _pairServiceBusy;
 
     private void StashPairRecordFields(PairDeepLinkPayload deepLink)
     {
         _pairServiceRecordCode = deepLink.HasRecord ? deepLink.Code : null;
-        _pairServiceUserId = deepLink.HasRecord ? deepLink.UserId : null;
+        _pairServiceSubject = deepLink.HasRecord ? deepLink.Subject : null;
         _pairServiceNotAfter = deepLink.HasRecord ? deepLink.NotAfter : null;
     }
     private string _pairServiceBusyText = string.Empty;
@@ -3424,9 +3448,9 @@
             }
 
             // 2) The pairing record: what the phone signs is the whole act, not the
-            //    code. The consumer's QR carried user_id + not_after; the bootloader
+            //    code. The consumer's QR carried subject + not_after; the bootloader
             //    id and the key are the phone's own.
-            if (string.IsNullOrEmpty(_pairServiceUserId) || _pairServiceNotAfter is null
+            if (string.IsNullOrEmpty(_pairServiceSubject) || _pairServiceNotAfter is null
                 || string.IsNullOrEmpty(_pairServiceRecordCode)
                 || !string.Equals(_pairServiceRecordCode, _pairServiceCode, StringComparison.OrdinalIgnoreCase))
             {
@@ -3440,7 +3464,7 @@
             }
             var record = new DevicesPairRecord(
                 BootloaderId: _paired!.BootloaderId,
-                UserId: _pairServiceUserId!,
+                Subject: _pairServiceSubject!,
                 PhonePubkey: masterPubkeyHex,
                 Code: _pairServiceRecordCode!,
                 NotAfter: _pairServiceNotAfter.Value);
@@ -3592,7 +3616,7 @@
                 $"You can sign in to {DefaultConsumerAppName} on any browser; this device is the signer.";
             _pairServiceCode = string.Empty;
             _pairServiceRecordCode = null;
-            _pairServiceUserId = null;
+            _pairServiceSubject = null;
             _pairServiceNotAfter = null;
         }
         catch (Exception ex)
@@ -5317,6 +5341,13 @@
     // derivation pass. A refresh that finds one running SKIPS -- the loop's
     // next tick is at most three seconds away and the diff gate makes it cheap.
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+
+    /// <summary>A user-vault card resolved: say so in the status line and re-poll so the card leaves.</summary>
+    private async Task OnUserVaultResolvedAsync(string? line)
+    {
+        if (!string.IsNullOrEmpty(line)) _pollingError = null;
+        await RefreshPendingAsync(CancellationToken.None);
+    }
 
     private async Task RefreshPendingAsync(CancellationToken ct)
     {
