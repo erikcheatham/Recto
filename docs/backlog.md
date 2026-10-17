@@ -3,6 +3,19 @@
 Ideas and owed work, newest first. A stacked item is not a commitment; it moves to a release when it is picked.
 (`docs/_config.yml` is an allowlist, so this file is not published to the Pages site.)
 
+## Encryption at rest for the bootloader's file-backed vaults (stacked 2026-10-17)
+
+In the container topology (`RECTO_USER_VAULT_SECRET_DIR` and the connections secret dir set), `FileBackedSecretSource` writes
+each value as a plaintext JSON file in the bootloader's data volume. That holds for both the connections (application) vault
+and the user vault. DPAPI-machine applies only to the foreground Windows-host topology.
+- **Today's posture (owner, 2026-10-17):** it stands. The values live in one place, the volume is in no backup lane, and
+  anyone who can read the volume already owns the host.
+- **Owed before the volume ever joins a backup or snapshot lane:** values encrypted at rest. For example, an envelope key held
+  outside the volume (the host's secret store, or a TPM-sealed key), so a copied volume carries only ciphertext.
+- **Applies to both vaults.**
+- **Related, ruled the same day:** each vault has its own agent token. The user vault is mapped to its own agent identity
+  alone, and that identity is in no connections ACL.
+
 ## Next phone app updates — Google Play quality requirements (stacked 2026-10-17)
 
 Source: Google Play's 2026-08-26 announcement and its help-center answer 17492799. Play enforces the memory and DEX thresholds
@@ -23,13 +36,45 @@ capability on Play.
      decoded images, and release them on pause.
    - Change something only if a threshold is near; the measurement comes first.
 3. **Zero-Tap Sign-In (the Android Restore Credentials API).**
-   - The requirement covers apps that support user sign-in. Recto has no account sign-in, and its signing keys are generated in
-     StrongBox and are non-exportable by design, so a new phone pairs again. Confirm against the help-center wording that Recto
-     is out of scope, and record the answer here.
+   - **Out of scope (checked 2026-10-17):** the requirement applies to "apps that support sign-in"; the help-center answer
+     (17492799) says apps without user accounts are not affected. Recto has no account sign-in, and its keys are generated in
+     StrongBox and are non-exportable by design, so a new phone pairs again. Restoring pairing state through the Restore
+     Credentials API would also defeat the one-device binding, so Recto should never adopt it.
    - Related, and worth fixing either way: `AndroidManifest.xml` sets `android:allowBackup="true"`. A device-to-device restore
      can bring back pairing records whose keystore aliases do not exist on the new phone. Test the restore, and either exclude
      the pairing store from backup (`dataExtractionRules` / `fullBackupContent`) or make the app treat a record without its key
      as unpaired, with a clear prompt to pair again.
+
+## Passkeys on both platforms versus Recto's own keys (researched 2026-10-17)
+
+**The standard is common; the ecosystems are not.**
+- One WebAuthn server can verify passkeys from both platforms. WebAuthn Level 3 became a W3C Recommendation on 2026-08-25. Its
+  backup-eligible / backup-state flags tell a server whether a credential is synced or single-device.
+- Below that, each platform keeps its own silo:
+  - **Android:** Credential Manager (Jetpack; androidx.credentials 1.6.0). On Android 9–13 it needs Google Play Services;
+    Android 14+ uses whatever providers the user installs.
+  - **iOS:** AuthenticationServices. Passkeys sync through the iCloud Keychain or an iOS 17+ provider extension. The app needs an
+    Associated Domains `webcredentials` entry, whose association file Apple fetches through its own CDN.
+  - **Moving passkeys between providers:** the FIDO Credential Exchange Format is a Proposed Standard, and the transfer protocol
+    is still a draft. Apple ships export/import in iOS 26; per Bitwarden, Android shipped it in July 2026 through Play Services
+    on Android 14+.
+- **Attestation:** synced consumer passkeys carry none in practice (`fmt: none`), so nothing proves where the key lives.
+  Neither platform gives consumers a device-bound passkey; only enterprise-managed devices or security keys do.
+
+**Recto's raw StrongBox / Secure Enclave key is the better fit for a governance channel, so it stays.**
+- It is generated in hardware, non-exportable, and lives on exactly one device behind a biometric gate.
+- Android key attestation can prove StrongBox and non-exportability.
+- It needs no Play Services, no iCloud, no provider, no hosted domain and no vendor CDN in the trust path.
+- Recovery is re-pairing, which is what a governance channel should require.
+- A passkey would trade all of that for sync, which is a feature for account sign-in and a defect for Recto.
+
+**Reference only, not planned:**
+- If a paired service ever demands proof of app integrity, iOS App Attest is available. It is a second key that Apple's servers
+  certify, and it is lost on reinstall or migration, so it adds an Apple dependency. Adopt only on a concrete demand.
+- .NET MAUI can reach both stacks: the `Xamarin.AndroidX.Credentials` bindings, and AuthenticationServices in `Microsoft.iOS`.
+  Neither is needed for Recto.
+- Apple has announced no counterpart to Play's 2027 memory, DEX or sign-in-restore rules. That rests on not finding one, so
+  re-check at each iOS release.
 
 ## Lessons from WhatsApp's passkey rollout (stacked 2026-10-17)
 
@@ -67,9 +112,11 @@ verified signature), so most of their lessons transfer:
    argues against ever building key sync or export.
 6. **Test across OS versions and OEMs.** WhatsApp hit device-specific exceptions on Android 13 and 14. Keep a device matrix
    (Android 13, 14, 15+, Pixel and Samsung at least) for the signing path, and watch error telemetry after each OS update.
-7. **Idea: Recto as a credential provider.** Android 14+ lets an app register as a Credential Manager *provider*. A Recto
-   phone could hold passkeys for the services it already signs for, under the same StrongBox + biometric gate. This is a large
-   piece of work; stacked as an idea, not planned.
+7. **RULED OUT (owner, 2026-10-17): Recto as a credential provider.** Android 14+ lets an app register as a Credential
+   Manager provider, but Recto stays governance-only: a proxy communication channel guaranteed by biometrics, nothing else. It is
+   its own app for that reason; holding passkeys or other credentials would make it no longer a governance-only app. Recto
+   also does not lean on either store's ecosystem (it is distributed through both, and built so that it does not depend on
+   either), so platform credential APIs are weighed for what they cost in independence, not only for what they add.
 8. **Not Recto, but related:** AllThruit's own web sign-in could offer passkeys, with the Recto pairing as the
    high-assurance step for sensitive actions (WhatsApp is moving the same way, using passkeys to re-authenticate in-app for
    sensitive actions).
