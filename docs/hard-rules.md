@@ -103,11 +103,13 @@ six things:
    genesis is open - a registry started fresh, before its first owner, or one
    the host reset reopened - an owner code alone enrolls the first owner; a
    registry from before the marker that already holds a phone or a session
-   starts closed. Once genesis is closed, a new owner key enters a slot only with the
-   APPROVAL of an owner phone it does not displace - with no other owner, the
-   occupant's approval of its own replacement: the bootloader cards the
-   approver with the incoming key's `phone_ref` (the ref the new phone shows),
-   the approver signs the card, and the new phone pairs again with a new code.
+   starts closed. Once genesis is closed, a new owner key enters a slot only
+   by a TOP-PLANE act (rule 14.7): the APPROVAL of an owner phone it does not
+   displace - with no other owner, the occupant's approval of its own
+   replacement - AND the sealed passphrase, signed on the host. The bootloader
+   cards the approver with the incoming key's `phone_ref` (the ref the new
+   phone shows), the approver signs the card, the passphrase signs the same
+   card on the host, and the new phone pairs again with a new code.
    The approval binds the key, the slot, the approver and the occupant; two
    keys asking for one slot are both refused. Pairing into an occupied slot
    still names the occupant to the incoming key, whose signed claim says which
@@ -119,10 +121,14 @@ six things:
    revoked. A lost sole owner phone is the host's act, never the network's:
    `recto bootloader owner-reset` on the bootloader host removes only the
    LAST owner phone and reopens genesis (refused while a server holds a
-   file-backend store); a non-sole owner phone is revoked over the network by
-   an owner phone in hand. When every owner phone is lost, `owner-reset
-   --every-owner-lost`, naming every owner phone held, removes them all and
-   reopens genesis. A state directory or schema lost or started fresh is a registry
+   file-backend store). It is a top-plane act with a WAITING PERIOD (rule
+   14.7): the passphrase at a hidden prompt STARTS the reset, every owner
+   phone still registered is carded at once, any of them may cancel it by
+   signing, and it takes effect only when the host completes it after 72
+   hours have passed uncancelled. A non-sole owner phone is revoked over the
+   network by an owner phone in hand. When every owner phone is lost,
+   `owner-reset --every-owner-lost`, naming every owner phone held, starts the
+   same window and, completed, removes them all and reopens genesis. A state directory or schema lost or started fresh is a registry
    that never had an owner. Pairing codes are six digits, so wrong codes
    are counted: a request carrying the edge's client-address header
    (`CF-Connecting-IP` when fronted by Cloudflare) is public, limited per client (an IPv4 address, an
@@ -139,6 +145,56 @@ six things:
 6. **The user plane is a vault plane.** A consumer may hold its own automation
    credentials; it holds no opener for any user's vault and no roster of users'
    phones. Absence, not denial: the question cannot be asked of it.
+7. **The top plane needs the passphrase AND one owner device, every time.**
+   The sealed genesis set is the recovery passphrase (a MANDATORY member) and
+   the owner phones as DEVICE members, one member per owner slot
+   (`recovery-phone`, `primary-phone`). A top-plane act is admitted only under
+   a valid passphrase signature AND at least one valid device-member signature,
+   each over the act's own domain-tagged bytes. The passphrase alone is
+   refused: a hijacked bootloader's sealed public key could be attacked
+   offline. Devices alone, one or both, are refused: a lost or stolen phone
+   must never carry the plane. The top-plane acts are:
+   - **owner-slot replacement** (rule 14.4) and an owner key entering an
+     empty slot after genesis closed; the device member for that slot is
+     replaced in the same act;
+   - **genesis roster changes**: a device member added or removed, and the
+     passphrase replaced (signed by the current passphrase and a device);
+   - **operator-key rotation**: the sealed operator public key replaced, so
+     the key a lost phone still holds stops verifying;
+   - **owner reset** on the host (rule 14.4). Whoever holds the host can make
+     a device, so the reset's guard is TIME: the passphrase starts it, every
+     owner phone still registered is carded and may cancel it by signing, and
+     it completes only after 72 hours pass uncancelled. A cancelled reset
+     never completes; one completed early is refused. EVERY registered owner
+     phone keeps the cancel power, including the phones the reset names as
+     lost: a quiet takeover is the danger the window guards against, and the
+     price is that whoever holds a lost phone AND passes its biometric (the
+     cancel is an identity-key signature) can cancel the owner's reset.
+     The freshly enrolling device then becomes the device member for its slot.
+   The same key re-pairing into the slot it holds is NOT a top-plane act; nor
+   is anything on the user plane (rule 15.m-aa: one bound phone, by design).
+   The passphrase is entered on the bootloader host at a hidden prompt: never
+   on a command line, in an environment variable, a file or a log. Its key is
+   derived in memory, signs once, and is dropped; only the signature leaves
+   the process. The operator keeps the words physically, in two separate safe
+   places, and nowhere else: never in a vault, a file or a photograph. A lost
+   passphrase FREEZES the top plane - no act can run, and only a new
+   bootloader recovers; that is the price of "never devices alone", accepted.
+   **The bootloader id is sealed, not re-derived.** It is derived once, at
+   genesis, from the operator key and the identity members then sealed, and
+   committed into the genesis chain: a fresh chain commits it in entry 0, and
+   a chain that predates this rule commits it in a `seal-id` entry signed by
+   the passphrase and a device. Every later entry signs over the sealed id, so
+   a chain spliced from another bootloader does not replay. At startup the
+   bootloader replays the chain and serves the committed id; a configured,
+   stored or derived id that differs from it refuses the start, as a
+   mismatched operator key does. Roster changes and operator-key rotation are
+   recorded in the chain and never rename the bootloader: grants, pairing
+   records and attestation all name the id, and a rename mid-recovery would
+   void every user's grants. Pinned:
+   `TestRule14_7TheTopPlaneNeedsThePassphraseAndADevice`
+   (`tests/test_recurve_acceptances.py`), `tests/test_genesis_authority.py`
+   and `tests/test_genesis_chain.py`.
 
 **No compatibility window.** Rule 14 predates launch; there is no earlier
 phone or registry to keep working. A registry created before it is wiped at
