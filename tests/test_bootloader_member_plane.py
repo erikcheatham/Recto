@@ -9,7 +9,7 @@ revokes the owner's phone. That is a plane crossing: a member's code must never 
 authority to read, fill or displace a business slot.
 
 THE SHAPE THESE TESTS PIN: a consumer mints a
-MEMBER code by naming who it is for -- ``{"member_of": {"consumer": <base url>, "user_id": <id>}}``
+MEMBER code by naming who it is for -- ``{"member_of": {"consumer": <base url>, "subject": <opaque handle>}}``
 on ``/v0.4/pairing/code``; a registration on a member code lands in the member plane (no slot,
 bound to that consumer user) and never answers 409 slot_occupied.
 
@@ -22,6 +22,8 @@ POSITIVE CONTROL: the owner's own code still fills the business slots exactly as
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from typing import Any
 
@@ -31,6 +33,12 @@ from recto.bootloader.server import ChallengeStore, create_server
 from recto.bootloader.state import SLOTS, StateStore
 
 from tests.test_bootloader_slots import Phone, _http
+
+
+def _subject(name: str) -> str:
+    """An opaque subject handle for a test user, minted the way a consumer would (hard rule 15.m)."""
+    return base64.urlsafe_b64encode(hashlib.sha256(name.encode()).digest()).rstrip(b"=").decode("ascii")
+
 
 AGENT_ID = "consumer-agent"
 AGENT_TOKEN = "agent-token-fixture"
@@ -60,7 +68,7 @@ def _member_challenge(ctx, user_id: str) -> str:
     """A consumer mints a MEMBER code for one of its users, then the phone asks for its challenge."""
     status, minted = _http(
         "POST", f"{ctx['base_url']}/v0.4/pairing/code",
-        {"member_of": {"consumer": CONSUMER, "user_id": user_id}},
+        {"member_of": {"consumer": CONSUMER, "subject": _subject(user_id)}},
         headers={"X-Recto-Agent-Id": AGENT_ID, "X-Recto-Agent-Token": AGENT_TOKEN},
     )
     assert status == 200, minted

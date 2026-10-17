@@ -15,22 +15,23 @@ substrate, ephemeral nowhere.
 Architecture (deliberate mirrors + deliberate divergences from connections):
   * SECRET VALUES live in the same at-rest backends as connections: the
     dpapi-machine vault on a Windows host
-    (`C:\\ProgramData\\recto\\<platform>\\uv.<user_id>.<key>.dpapi`) or the
+    (`C:\\ProgramData\\recto\\<platform>\\uv.<subject storage id>.<key>.dpapi`) or the
     file-backed store inside a container volume — selected through the
     same injectable `SecretSourceFactory` seam. The `uv.` prefix keeps
     user entries disjoint from `conn.` platform entries sharing a
     service directory.
   * METADATA (display_name, category, has_secret, timestamps) lives in a
     non-secret sidecar JSON (`user_vault.json`), keyed
-    (platform, user_id, key) — sister of connections.json. It NEVER
+    (platform, subject, key) — sister of connections.json. It NEVER
     carries a value; `has_secret` is the only signal.
   * ALL FOUR VERBS (set / list / release / delete) are agent-token-gated
     and platform-scoped — a divergence from connections, where writes
     are operator-gated. Rationale: user-vault writes are the platform
     acting for its own user at runtime (the user pasted a key into the
     platform's UI); there is no operator in the loop. The platform
-    supplies the user-id scoping claim (`X-Recto-User-Id`) and the
-    bootloader namespaces every operation under (platform, user_id).
+    supplies the scoping claim (`X-Recto-Subject`, its opaque subject
+    handle for the user - `recto.subject_handle`; never a user id) and
+    the bootloader namespaces every operation under (platform, subject).
   * RELEASE is async + deniable BY CONTRACT: the response carries a
     `status` field (`released` | `unset` today) so the Hard Rule #9
     endgame — phone-resident user secrets with release-on-approval —
@@ -59,13 +60,13 @@ from __future__ import annotations
 from .types import (
     UserVaultEntryMeta,
     UserVaultStore,
-    normalize_user_id,
+    normalize_subject,
     user_vault_secret_name,
 )
 
 __all__ = [
     "UserVaultEntryMeta",
     "UserVaultStore",
-    "normalize_user_id",
+    "normalize_subject",
     "user_vault_secret_name",
 ]

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import hashlib
 import http.client
 import io
 import json
@@ -56,6 +57,12 @@ from recto.bootloader.server import BootloaderError, ChallengeStore, create_serv
 from recto.bootloader.state import MEMBER_SLOT, PhoneRegistration, StateStore
 
 from tests.test_bootloader_slots import Phone, _http
+
+
+def _subject(name: str) -> str:
+    """An opaque subject handle for a test user, minted the way a consumer would (hard rule 15.m)."""
+    return base64.urlsafe_b64encode(hashlib.sha256(name.encode()).digest()).rstrip(b"=").decode("ascii")
+
 
 REPO = Path(__file__).resolve().parents[1]
 AGENT_ID = "consumer-agent"
@@ -176,7 +183,7 @@ def _revoke(ctx, revoker: Phone, target_ref: str) -> tuple[int, dict[str, Any]]:
 
 def _member_challenge(ctx, user_id: str) -> str:
     status, minted = _http("POST", f"{ctx['base_url']}/v0.4/pairing/code",
-                           {"member_of": {"consumer": CONSUMER, "user_id": user_id}},
+                           {"member_of": {"consumer": CONSUMER, "subject": _subject(user_id)}},
                            headers={"X-Recto-Agent-Id": AGENT_ID, "X-Recto-Agent-Token": AGENT_TOKEN})
     assert status == 200, minted
     return _plain_challenge(ctx, f"?code={minted['code']}")
@@ -700,7 +707,7 @@ def test_owner_codes_are_minted_only_by_a_flagged_agent(tmp_path) -> None:
                              headers={"X-Recto-Agent-Id": BRIDGE_ID, "X-Recto-Agent-Token": BRIDGE_TOKEN})
         assert status == 200, body
         status, body = _http("POST", f"{c['base_url']}/v0.4/pairing/code",
-                             {"member_of": {"consumer": CONSUMER, "user_id": "u"}},
+                             {"member_of": {"consumer": CONSUMER, "subject": _subject("u")}},
                              headers={"X-Recto-Agent-Id": AGENT_ID, "X-Recto-Agent-Token": AGENT_TOKEN})
         assert status == 200, body
 
@@ -1628,7 +1635,7 @@ def _mint(ctx, agent_id: str, token: str, body: dict[str, Any]) -> str:
 
 
 def _mint_member_code(ctx, user_id: str) -> str:
-    return _mint(ctx, AGENT_ID, AGENT_TOKEN, {"member_of": {"consumer": CONSUMER, "user_id": user_id}})
+    return _mint(ctx, AGENT_ID, AGENT_TOKEN, {"member_of": {"consumer": CONSUMER, "subject": _subject(user_id)}})
 
 
 def test_a_server_built_without_a_challenge_store_stamps_its_codes(tmp_path, monkeypatch) -> None:

@@ -6,7 +6,7 @@ provider key. `UserVaultStore` persists a collection of them to a sidecar
 JSON in the bootloader state dir (sister of connections.json).
 
 By construction NEITHER type carries a secret value — the key/token lives
-only in the secret backend, named `uv.<user_id>.<key>` within the consuming
+only in the secret backend, named `uv.<subject storage id>.<key>` within the consuming
 PLATFORM's namespace. A `has_secret` boolean flags whether a value has been
 set, so list surfaces can show "configured" vs "no key" without ever
 touching the value. See `recto.user_vault.manage` for the vault read/write
@@ -16,37 +16,18 @@ primitives.
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..connections.types import normalize_connection_key
+from ..subject_handle import normalize_subject, subject_storage_id
 
-# User ids are the consuming platform's user identifiers. The canonical
-# consumer emits GUIDs; we accept the RFC-4122 textual shape (lowercased on
-# normalization) so ids are filesystem- and URL-safe by construction and a
-# platform can never smuggle a path separator through the scoping claim.
-_USER_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
-
-
-def normalize_user_id(user_id: str) -> str:
-    """Lowercase + validate a user id (GUID textual form). Returns the
-    normalized id; raises ValueError on anything else. Ids become vault
-    secret-name components (`uv.<user_id>.<key>`) and JSON map keys, so
-    the shape gate is a security boundary, not a formality."""
-    if not isinstance(user_id, str):
-        raise ValueError(f"user id must be a string (got {type(user_id)!r})")
-    norm = user_id.strip().lower()
-    if not _USER_ID_RE.match(norm):
-        raise ValueError(
-            "user id must be a GUID (8-4-4-4-12 lowercase hex) "
-            f"(got {user_id!r})"
-        )
-    return norm
+# Entries are scoped by the platform's SUBJECT HANDLE (recto.subject_handle):
+# an opaque 43-character token the platform mints per user. Recto never sees
+# the platform's user id (hard rule 15.o); the handle's grammar is the only
+# thing checked here.
 
 
 def normalize_user_vault_key(key: str) -> str:
@@ -56,12 +37,14 @@ def normalize_user_vault_key(key: str) -> str:
     return normalize_connection_key(key)
 
 
-def user_vault_secret_name(user_id: str, key: str) -> str:
+def user_vault_secret_name(subject: str, key: str) -> str:
     """The secret name a user-vault value is stored under within the
-    platform's namespace: `uv.<user_id>.<key>`. The `uv.` prefix keeps
-    user entries disjoint from the platform tier's `conn.<key>` entries
-    in the same service directory. Assumes both parts are normalized."""
-    return f"uv.{user_id}.{key}"
+    platform's namespace: `uv.<subject storage id>.<key>`. The storage id is
+    the handle's 64 lowercase hex characters (case-safe on a case-folding
+    filesystem, one-to-one with the handle). The `uv.` prefix keeps user
+    entries disjoint from the platform tier's `conn.<key>` entries in the
+    same service directory. Assumes the key is normalized."""
+    return f"uv.{subject_storage_id(subject)}.{key}"
 
 
 @dataclass(frozen=True)
@@ -77,8 +60,9 @@ class UserVaultEntryMeta:
     """Consuming platform namespace (the secret-backend service), e.g. the
     same value the platform's agent is mapped to in the bootloader config."""
 
-    user_id: str
-    """Normalized (lowercase GUID) end-user id within the platform."""
+    subject: str
+    """The platform's opaque subject handle for the user (43 base64url
+    characters). Recto never holds the platform's user id."""
 
     key: str
     """Normalized entry id, e.g. 'anthropic'. Unique within (platform, user)."""
@@ -106,7 +90,7 @@ class UserVaultEntryMeta:
         Secret-free by construction — safe to log/transmit."""
         return {
             "platform": self.platform,
-            "user_id": self.user_id,
+            "subject": self.subject,
             "key": self.key,
             "display_name": self.display_name,
             "category": self.category,
@@ -120,7 +104,7 @@ class UserVaultEntryMeta:
     def from_dict(cls, raw: dict[str, Any]) -> "UserVaultEntryMeta":
         return cls(
             platform=raw["platform"],
-            user_id=normalize_user_id(raw["user_id"]),
+            subject=normalize_subject(raw["subject"]),
             key=normalize_user_vault_key(raw["key"]),
             display_name=raw.get("display_name", raw["key"]),
             category=raw.get("category", "uncategorized"),
@@ -134,12 +118,12 @@ class UserVaultEntryMeta:
 class UserVaultStore:
     """Persists a collection of UserVaultEntryMeta to a sidecar JSON file.
 
-    Keyed by (platform, user_id, key). Sister of ConnectionStore — the
+    Keyed by (platform, subject, key). Sister of ConnectionStore — the
     store holds metadata ONLY; the manage layer pairs it with the secret
     backend for the values.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2  # 2: rows keyed by subject handle, never a user id
 
     def __init__(
         self,
@@ -151,38 +135,38 @@ class UserVaultStore:
 
     # ---- queries -------------------------------------------------------
 
-    def list(self, platform: str, user_id: str) -> list[UserVaultEntryMeta]:
+    def list(self, platform: str, subject: str) -> list[UserVaultEntryMeta]:
         """One user's entries within one platform — the ONLY list shape.
         There is deliberately no all-users enumeration on this class's
         public wire path; the sidecar is host-private."""
-        user_id = normalize_user_id(user_id)
+        subject = normalize_subject(subject)
         return sorted(
             (
                 m
                 for m in self._entries.values()
-                if m.platform == platform and m.user_id == user_id
+                if m.platform == platform and m.subject == subject
             ),
             key=lambda m: (m.category, m.key),
         )
 
     def get(
-        self, platform: str, user_id: str, key: str
+        self, platform: str, subject: str, key: str
     ) -> UserVaultEntryMeta | None:
         return self._entries.get(
-            (platform, normalize_user_id(user_id), normalize_user_vault_key(key))
+            (platform, normalize_subject(subject), normalize_user_vault_key(key))
         )
 
     # ---- mutations -----------------------------------------------------
 
     def upsert(self, meta: UserVaultEntryMeta) -> UserVaultEntryMeta:
-        self._entries[(meta.platform, meta.user_id, meta.key)] = meta
+        self._entries[(meta.platform, meta.subject, meta.key)] = meta
         return meta
 
     def remove(
-        self, platform: str, user_id: str, key: str
+        self, platform: str, subject: str, key: str
     ) -> UserVaultEntryMeta | None:
         return self._entries.pop(
-            (platform, normalize_user_id(user_id), normalize_user_vault_key(key)),
+            (platform, normalize_subject(subject), normalize_user_vault_key(key)),
             None,
         )
 
@@ -205,7 +189,7 @@ class UserVaultStore:
                 meta = UserVaultEntryMeta.from_dict(row)
             except (KeyError, ValueError):
                 continue
-            entries[(meta.platform, meta.user_id, meta.key)] = meta
+            entries[(meta.platform, meta.subject, meta.key)] = meta
         return cls(entries)
 
     def save(self, path: Path) -> None:
@@ -216,7 +200,7 @@ class UserVaultStore:
                 m.to_dict()
                 for m in sorted(
                     self._entries.values(),
-                    key=lambda m: (m.platform, m.user_id, m.category, m.key),
+                    key=lambda m: (m.platform, m.subject, m.category, m.key),
                 )
             ],
         }
@@ -231,7 +215,7 @@ class UserVaultStore:
 __all__ = [
     "UserVaultEntryMeta",
     "UserVaultStore",
-    "normalize_user_id",
+    "normalize_subject",
     "normalize_user_vault_key",
     "user_vault_secret_name",
 ]

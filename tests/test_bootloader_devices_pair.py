@@ -18,6 +18,7 @@ Coverage:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -34,6 +35,12 @@ from recto.bootloader.state import StateStore
 from recto.capability.jwt import build_signing_input
 from recto.capability.pair_record import PAIR_ACTION, PairRecord
 from recto.capability.types import CapabilityClaims, CapabilityClause, CapabilityScope
+
+
+def _subject(name: str) -> str:
+    """An opaque subject handle for a test user, minted the way a consumer would (hard rule 15.m)."""
+    return base64.urlsafe_b64encode(hashlib.sha256(name.encode()).digest()).rstrip(b"=").decode("ascii")
+
 
 _MANIFEST_VERSION: str = json.loads(
     (Path(__file__).parent.parent / "recto" / "capability" / "manifest_v1.json")
@@ -101,7 +108,7 @@ def phone():
 def _record(phone, **overrides) -> PairRecord:
     base = dict(
         bootloader_id=_BOOTLOADER_ID,
-        user_id="user-1",
+        user_id=_subject("user-1"),  # the field carries the consumer's opaque handle (hard rule 15.o)
         phone_pubkey=phone["pub"],
         code=_VALID_CODE,
         not_after=int(time.time()) + 600,
@@ -346,7 +353,7 @@ class TestDevicesPairRefusals:
         url = fake_consumer["base_url"]
         ctx = bootloader(consumer_tokens={url: "tok"})
         rec = _record(phone)
-        other = _record(phone, user_id="user-2")
+        other = _record(phone, user_id=_subject("user-2"))
         jws = _grant(phone, rec, scope=CapabilityScope(payload_sha256=other.fingerprint()))
         status, body = _http_post_json(_pair_url(ctx), _body(url, phone, rec, jws))
         assert status == HTTPStatus.FORBIDDEN
@@ -558,3 +565,31 @@ class TestBootloaderAttest:
         # via the health twin here and the register path in test_bootloader.py.
         _, body = self._get(f"{ctx['base_url']}/v0.4/health")
         assert body["devices_pair_pubkey"] == public_key_hex(_BOOTLOADER_KEY)
+
+
+class TestRule15PairRecordCarriesAHandle:
+    """Hard rules 15.m and 15.q on devices/pair (named in tests/test_recurve_acceptances.py): the record's `user_id`
+    field carries the consumer's OPAQUE subject handle - a user id in it is refused before anything is relayed - and
+    a consumer's HTTP error is logged by its status alone, never its headers or body."""
+
+    def test_a_user_id_in_the_record_is_refused_and_nothing_is_relayed(self, bootloader, fake_consumer, phone):
+        url = fake_consumer["base_url"]
+        ctx = bootloader(consumer_tokens={url: "tok"})
+        record = _record(phone, user_id="11111111-2222-3333-4444-555555555555")
+        status, body = _http_post_json(_pair_url(ctx), _body(url, phone, record=record, jws=_grant(phone, record)))
+        assert status == HTTPStatus.BAD_REQUEST
+        assert body["error"] == "record_subject_invalid"
+        assert fake_consumer["received"] == []
+
+    def test_the_relay_log_carries_the_status_only(self, bootloader, fake_consumer, phone, capfd):
+        fake_consumer["handler"].response_status = 409
+        fake_consumer["handler"].response_body = {"error": "pubkey_already_bound", "detail": "MARKER-user-data-x7"}
+        url = fake_consumer["base_url"]
+        ctx = bootloader(consumer_tokens={url: "tok"})
+        status, _ = _http_post_json(_pair_url(ctx), _body(url, phone))
+        assert status == 409
+        out = capfd.readouterr()
+        logged = out.out + out.err
+        assert "HTTPError 409" in logged
+        assert "MARKER-user-data-x7" not in logged
+        assert "headers=" not in logged and "body=" not in logged

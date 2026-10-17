@@ -482,39 +482,55 @@ def test_challenge_kinds_are_isolated(store):
 
 # THE MEMBER PLANE (2026-09-30): a consumer's member codes + challenges are their own kinds, on both backends.
 
+# A member code and the challenge it buys carry the (consumer, subject) binding they were minted for (2026-10-17,
+# hard rule 15.n); consuming either returns it, or None when unknown, spent or expired.
+_BINDING = ("https://consumer.example", "ERERERERERERERERERERERERERERERERERERERERERE")
+
+
 def test_member_pairing_code_issue_and_single_use_consume(store):
-    code, exp = store.issue_member_pairing_code(ttl_seconds=300)
+    code, exp = store.issue_member_pairing_code(ttl_seconds=300, binding=_BINDING)
     assert len(code) == 6 and code.isdigit() and exp > int(time.time())
-    assert store.consume_member_pairing_code(code) is True
-    assert store.consume_member_pairing_code(code) is False
+    assert store.consume_member_pairing_code(code) == _BINDING
+    assert store.consume_member_pairing_code(code) is None
 
 
 def test_member_and_owner_codes_are_isolated(store):
     """A member code never buys an owner challenge, and an owner code is never a member one."""
-    member, _ = store.issue_member_pairing_code(ttl_seconds=300)
+    member, _ = store.issue_member_pairing_code(ttl_seconds=300, binding=_BINDING)
     owner, _ = store.issue_pairing_code(ttl_seconds=300)
     assert store.consume_pairing_code(member) is False
-    assert store.consume_member_pairing_code(owner) is False
-    assert store.consume_member_pairing_code(member) is True
+    assert store.consume_member_pairing_code(owner) is None
+    assert store.consume_member_pairing_code(member) == _BINDING
     assert store.consume_pairing_code(owner) is True
 
 
 def test_member_challenge_peek_never_consumes_and_kinds_are_isolated(store):
-    c, _ = store.issue_member_challenge(ttl_seconds=60)
+    c, _ = store.issue_member_challenge(ttl_seconds=60, binding=_BINDING)
     owner_c, _ = store.issue_challenge(ttl_seconds=60)
     assert store.is_member_challenge(c) is True
     assert store.is_member_challenge(c) is True, "the peek consumed the challenge"
     assert store.is_member_challenge(owner_c) is False
     assert store.consume_challenge(c) is False, "a member challenge answered as an owner one"
-    assert store.consume_member_challenge(c) is True
+    assert store.consume_member_challenge(c) == _BINDING
     assert store.is_member_challenge(c) is False
-    assert store.consume_member_challenge(c) is False
+    assert store.consume_member_challenge(c) is None
 
 
 def test_member_challenge_expired_is_not_a_member_challenge(store):
-    c, _ = store.issue_member_challenge(ttl_seconds=-1)
+    c, _ = store.issue_member_challenge(ttl_seconds=-1, binding=_BINDING)
     assert store.is_member_challenge(c) is False
-    assert store.consume_member_challenge(c) is False
+    assert store.consume_member_challenge(c) is None
+
+
+def test_a_member_code_carries_its_binding_into_the_challenge(store):
+    """The binding a code was minted for is the binding its challenge yields (hard rule 15.n)."""
+    from recto.bootloader.server import ChallengeStore
+
+    cs = ChallengeStore(state=store)
+    code, _ = cs.issue_member_pairing_code(ttl_seconds=300, binding=_BINDING)
+    binding = cs.consume_member_pairing_code(code)
+    c, _ = cs.issue_member_challenge(binding=binding)
+    assert cs.consume_member_challenge(c) == _BINDING
 
 
 def test_challenge_store_adapter_delegates_to_state(store):
@@ -540,13 +556,13 @@ def test_challenge_store_adapter_delegates_to_state(store):
 def test_owner_challenge_peek_never_consumes_and_kinds_are_isolated(store):
     c, _ = store.issue_owner_challenge(ttl_seconds=60)
     plain, _ = store.issue_challenge(ttl_seconds=60)
-    member, _ = store.issue_member_challenge(ttl_seconds=60)
+    member, _ = store.issue_member_challenge(ttl_seconds=60, binding=_BINDING)
     assert store.is_owner_challenge(c) is True
     assert store.is_owner_challenge(c) is True, "the peek consumed the challenge"
     assert store.is_owner_challenge(plain) is False, "a codeless challenge answered as an owner one"
     assert store.is_owner_challenge(member) is False
     assert store.consume_challenge(c) is False
-    assert store.consume_member_challenge(c) is False
+    assert store.consume_member_challenge(c) is None
     assert store.consume_owner_challenge(plain) is False
     assert store.consume_owner_challenge(c) is True
     assert store.consume_owner_challenge(c) is False

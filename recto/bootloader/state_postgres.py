@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import sys
@@ -75,6 +76,7 @@ from recto.bootloader.state import (
     StateStoreBase,
     _merge_onto_existing,
     default_state_dir,
+    member_bindings_from_doc,
     validate_genesis_pubkey,
 )
 
@@ -151,6 +153,10 @@ CREATE TABLE IF NOT EXISTS {schema}.challenges (
     expires_at_unix bigint NOT NULL,
     PRIMARY KEY (kind, value)
 );
+-- THE MEMBER BINDING (2026-10-17, hard rule 15.n): a member code and the challenge it buys carry the
+-- (consumer, subject) they were minted for. Additive; NULL on every other kind. The subject is an opaque handle.
+ALTER TABLE {schema}.challenges
+    ADD COLUMN IF NOT EXISTS binding jsonb;
 
 -- THE OWNER SLOTS (hard rule 14.4, amended): small registry facts, one row each (the owner-genesis marker).
 CREATE TABLE IF NOT EXISTS {schema}.registry_meta (
@@ -297,6 +303,7 @@ class PostgresStateStore(StateStoreBase):
     def _phone_from_doc(d: dict[str, Any]) -> PhoneRegistration:
         d = dict(d)
         d["supported_algorithms"] = tuple(d.get("supported_algorithms") or ())
+        d["member_bindings"] = member_bindings_from_doc(d.get("member_bindings"))
         return PhoneRegistration(**d)
 
     def register_phone(self, reg: PhoneRegistration) -> PhoneRegistration:
@@ -860,16 +867,53 @@ class PostgresStateStore(StateStoreBase):
             self._CHALLENGE_KIND_PAIRING_CODE, code
         )
 
-    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+    def issue_member_pairing_code(
+        self, ttl_seconds: int = 300, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         code = self._unique_code()
-        return code, self._issue_one_time(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code, ttl_seconds)
+        return code, self._issue_bound(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code, ttl_seconds, binding)
 
-    def consume_member_pairing_code(self, code: str) -> bool:
-        return self._consume_one_time(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code)
+    def consume_member_pairing_code(self, code: str) -> tuple[str, str] | None:
+        return self._consume_bound(self._CHALLENGE_KIND_MEMBER_PAIRING_CODE, code)
 
-    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+    def issue_member_challenge(
+        self, ttl_seconds: int = 60, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
-        return c, self._issue_one_time(self._CHALLENGE_KIND_MEMBER_REGISTRATION, c, ttl_seconds)
+        return c, self._issue_bound(self._CHALLENGE_KIND_MEMBER_REGISTRATION, c, ttl_seconds, binding)
+
+    def _issue_bound(self, kind: str, value: str, ttl_seconds: int, binding: tuple[str, str] | None) -> int:
+        """A one-time value that carries its member binding (consumer, subject) in the same row."""
+        exp = int(time.time()) + ttl_seconds
+        doc = None if binding is None else json.dumps({"consumer": binding[0], "subject": binding[1]})
+        with self._pool.connection() as conn:
+            self._purge_expired_challenges(conn)
+            conn.execute(
+                self._q(
+                    "INSERT INTO {schema}.challenges (kind, value, expires_at_unix, binding) "
+                    "VALUES (%s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT (kind, value) DO UPDATE "
+                    "SET expires_at_unix = EXCLUDED.expires_at_unix, binding = EXCLUDED.binding"
+                ),
+                (kind, value, exp, doc),
+            )
+        return exp
+
+    def _consume_bound(self, kind: str, value: str) -> tuple[str, str] | None:
+        """Spend a one-time value; its binding if it was live, else None."""
+        now = int(time.time())
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                self._q(
+                    "DELETE FROM {schema}.challenges WHERE kind = %s AND value = %s "
+                    "RETURNING expires_at_unix, binding"
+                ),
+                (kind, value),
+            ).fetchone()
+        if row is None or now >= row[0] or not row[1]:
+            return None
+        b = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+        return (str(b["consumer"]), str(b["subject"]))
 
     def is_member_challenge(self, challenge: str) -> bool:
         now = int(time.time())
@@ -880,8 +924,8 @@ class PostgresStateStore(StateStoreBase):
             ).fetchone()
         return row is not None and now < row[0]
 
-    def consume_member_challenge(self, challenge: str) -> bool:
-        return self._consume_one_time(self._CHALLENGE_KIND_MEMBER_REGISTRATION, challenge)
+    def consume_member_challenge(self, challenge: str) -> tuple[str, str] | None:
+        return self._consume_bound(self._CHALLENGE_KIND_MEMBER_REGISTRATION, challenge)
 
     # THE OWNER SLOTS (hard rule 14.4, amended): an owner code's challenge is its own kind - the same table, no schema
     # change. The genesis marker lives in registry_meta; the owner-enroll records in results (kind owner_enroll).

@@ -9,10 +9,11 @@ DpapiMachineSource is Windows-only).
 Auth model under test (deliberate divergence from connections: ALL four
 verbs are agent-gated — the platform acts for its own user at runtime):
   - Every verb: agent-token-gated AND platform-scoped via
-    user_vault_agent_platforms, plus an X-Recto-User-Id scoping claim
-    (GUID) the platform supplies per request.
+    user_vault_agent_platforms, plus an X-Recto-Subject scoping claim
+    (the platform's opaque subject handle, 43 base64url characters - never
+    a user id, hard rule 15.o) the platform supplies per request.
   - Disabled-by-default: no user_vault_path -> all routes 404. No
-    agent->platform mapping -> 403. Missing/invalid user-id claim -> 400.
+    agent->platform mapping -> 403. Missing/invalid subject claim -> 400.
 
 Release contract under test: `status` field is "released" | "unset"
 (the phone release-on-approval seam adds "pending"/"denied" later with
@@ -33,10 +34,8 @@ import pytest
 from recto.bootloader.server import ChallengeStore, create_server
 from recto.bootloader.state import StateStore
 from recto.secrets.base import DirectSecret, SecretMaterial, SecretNotFoundError
-from recto.user_vault.types import (
-    normalize_user_id,
-    user_vault_secret_name,
-)
+from recto.subject_handle import normalize_subject, subject_storage_id
+from recto.user_vault.types import user_vault_secret_name
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +84,9 @@ AGENT_PLATFORMS = {
     "platform-b-agent": "PlatformB",
 }
 
-USER_1 = "11111111-2222-3333-4444-555555555555"
-USER_2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+# Opaque subject handles (43 base64url characters = 32 bytes), as a platform mints them.
+USER_1 = "ERERERERERERERERERERERERERERERERERERERERERE"
+USER_2 = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
 
 
 def _hdrs(agent: str = "a", user_id: str | None = USER_1) -> dict[str, str]:
@@ -96,7 +96,7 @@ def _hdrs(agent: str = "a", user_id: str | None = USER_1) -> dict[str, str]:
         "X-Recto-Agent-Token": AGENT_TOKENS[agent_id],
     }
     if user_id is not None:
-        h["X-Recto-User-Id"] = user_id
+        h["X-Recto-Subject"] = user_id
     return h
 
 
@@ -187,28 +187,39 @@ def _set(base: str, headers: dict[str, str], **body) -> tuple[int, dict[str, Any
 
 
 class TestTypes:
-    def test_user_id_normalized_lowercase(self):
-        assert normalize_user_id("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE") == USER_2
+    def test_subject_is_returned_unchanged(self):
+        assert normalize_subject(f"  {USER_2} ") == USER_2
 
     @pytest.mark.parametrize(
         "bad",
         [
             "",
-            "not-a-guid",
-            "11111111222233334444555555555555",  # no dashes
-            "11111111-2222-3333-4444-55555555555z",  # non-hex
+            "11111111-2222-3333-4444-555555555555",  # a GUID: a user id, never a handle
+            "not-a-handle",
+            "E" * 42,  # too short
+            "E" * 44,  # too long
+            "ERERERERERERERERERERERERERERERERERERERERERE=",  # padded
+            "ERERERERERERERERERERERERERERERERERERERERER+",  # not url-safe
+            "ERERERERERERERERERERERERERERERERERERERERERF",  # non-canonical last character
             "../../../etc/passwd",
         ],
     )
-    def test_user_id_rejects_bad_shapes(self, bad):
+    def test_subject_rejects_bad_shapes(self, bad):
         with pytest.raises(ValueError):
-            normalize_user_id(bad)
+            normalize_subject(bad)
 
-    def test_secret_name_shape(self):
+    def test_secret_name_uses_the_case_safe_storage_id(self):
+        assert subject_storage_id(USER_1) == "11" * 32
         assert (
             user_vault_secret_name(USER_1, "anthropic")
-            == f"uv.{USER_1}.anthropic"
+            == f"uv.{'11' * 32}.anthropic"
         )
+
+    def test_handles_differing_in_case_never_share_a_secret_name(self):
+        upper = "EpXZrhv5IxZUwhMMC2A1kzotNyKvXnbm91Oe-gkJ054"
+        lower = "ePxzRHV5iXzuWHmmc2a1KZOTnYkVxNBM91oE-GKj054"  # the same text with its case swapped
+        assert normalize_subject(upper) and normalize_subject(lower)
+        assert user_vault_secret_name(upper, "k") != user_vault_secret_name(lower, "k")
 
 
 # ===========================================================================
@@ -254,7 +265,7 @@ class TestAuth:
             {
                 "X-Recto-Agent-Id": "platform-a-agent",
                 "X-Recto-Agent-Token": "wrong",
-                "X-Recto-User-Id": USER_1,
+                "X-Recto-Subject": USER_1,
             },
         )
         assert status == 401
@@ -269,27 +280,27 @@ class TestAuth:
         finally:
             shutdown()
 
-    def test_400_missing_user_id_claim(self, server):
+    def test_400_missing_subject_claim(self, server):
         status, body = _get(
             f"{server['base_url']}/v0.4/user-vault", _hdrs(user_id=None)
         )
         assert status == 400
-        assert body["error"] == "user_id_required"
+        assert body["error"] == "subject_required"
 
-    def test_400_invalid_user_id_claim(self, server):
+    def test_400_a_user_id_shaped_claim_is_refused(self, server):
         status, body = _get(
             f"{server['base_url']}/v0.4/user-vault",
-            _hdrs(user_id="not-a-guid"),
+            _hdrs(user_id="11111111-2222-3333-4444-555555555555"),
         )
         assert status == 400
-        assert body["error"] == "user_id_invalid"
+        assert body["error"] == "subject_invalid"
 
-    def test_writes_also_require_user_id_claim(self, server):
+    def test_writes_also_require_subject_claim(self, server):
         status, body = _set(
             server["base_url"], _hdrs(user_id=None), key="k", secret="v"
         )
         assert status == 400
-        assert body["error"] == "user_id_required"
+        assert body["error"] == "subject_required"
 
 
 # ===========================================================================
@@ -311,7 +322,7 @@ class TestRoundTrip:
         assert status == 200
         entry = body["entry"]
         assert entry["platform"] == "PlatformA"
-        assert entry["user_id"] == USER_1
+        assert entry["subject"] == USER_1
         assert entry["key"] == "anthropic"
         assert entry["has_secret"] is True
         # The secret VALUE must NEVER appear in the metadata.
@@ -321,7 +332,7 @@ class TestRoundTrip:
         status, body = _get(f"{base}/v0.4/user-vault", _hdrs())
         assert status == 200
         assert body["platform"] == "PlatformA"
-        assert body["user_id"] == USER_1
+        assert body["subject"] == USER_1
         rows = {e["key"]: e for e in body["entries"]}
         assert rows["anthropic"]["has_secret"] is True
         assert "sk-ant-test-value" not in json.dumps(body)
@@ -334,7 +345,7 @@ class TestRoundTrip:
         assert body["status"] == "released"
         assert body["has_value"] is True
         assert body["value"] == "sk-ant-test-value"
-        assert body["user_id"] == USER_1
+        assert body["subject"] == USER_1
 
     def test_release_unset_entry_status_unset(self, server):
         base = server["base_url"]
@@ -365,14 +376,19 @@ class TestRoundTrip:
         assert body["key"] == "anthropic"
         assert body["value"] == "v"
 
-    def test_user_id_claim_normalized(self, server):
+    def test_subject_claim_is_case_sensitive(self, server):
         base = server["base_url"]
-        _set(base, _hdrs(user_id=USER_2.upper()), key="k", secret="v")
+        other = USER_2[:-1].upper() + "A"  # same length, another handle
+        _set(base, _hdrs(user_id=USER_2), key="k", secret="v")
+        status, body = _get(
+            f"{base}/v0.4/user-vault/release?key=k", _hdrs(user_id=other)
+        )
+        assert status == 200
+        assert body["status"] == "unset"
         status, body = _get(
             f"{base}/v0.4/user-vault/release?key=k", _hdrs(user_id=USER_2)
         )
-        assert status == 200
-        assert body["user_id"] == USER_2
+        assert body["subject"] == USER_2
         assert body["value"] == "v"
 
     def test_value_shell_unsafe_chars_survive(self, server):

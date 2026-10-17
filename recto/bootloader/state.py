@@ -259,6 +259,15 @@ class PhoneRegistration:
     # pair without displacing one. Defaults to primary so directly-seeded
     # fixtures construct; the wire always names it.
     slot: str = "primary"
+    # THE MEMBER BINDING (2026-10-17, hard rule 15.n). The (consumer, subject)
+    # pairs this phone is bound to as a consumer's MEMBER: at most one subject
+    # per consumer, and one phone per (consumer, subject) across the registry.
+    # The subject is the consumer's OPAQUE handle for its user
+    # (recto.subject_handle) - never the consumer's user id (hard rule 15.o).
+    # A binding moves to another phone only by this phone's signature or the
+    # operator's host reset. Empty for owner phones that never took a member
+    # code; additive, so older registrations load unchanged.
+    member_bindings: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def new(
@@ -271,6 +280,7 @@ class PhoneRegistration:
         push_platform: str | None = None,
         poll_public_key_b64u: str | None = None,
         slot: str = "primary",
+        member_bindings: tuple[tuple[str, str], ...] = (),
     ) -> PhoneRegistration:
         now = int(time.time())
         # THE KEY IS THE IDENTITY (2026-09-21): the id names the key. This
@@ -289,7 +299,13 @@ class PhoneRegistration:
             push_platform=push_platform,
             poll_public_key_b64u=poll_public_key_b64u,
             slot=slot,
+            member_bindings=member_bindings,
         )
+
+
+def member_bindings_from_doc(raw: Any) -> tuple[tuple[str, str], ...]:
+    """A stored registration's member bindings as the tuple the dataclass holds (JSON gives lists)."""
+    return tuple((str(b[0]), str(b[1])) for b in (raw or ()))
 
 
 SLOTS = ("primary", "recovery")
@@ -1981,17 +1997,23 @@ class StateStoreBase(ABC):
     # THE MEMBER PLANE (2026-09-30). A consumer's MEMBER code and the registration challenge it buys are their own
     # kind: a member registers BESIDE the business slots (hard rule 14.4) and never answers a slot question. The owner
     # codes above keep their meaning (the code is the owner's authority for displacement); a member code carries none.
+    # Since 2026-10-17 each member code carries the (consumer, subject) BINDING it was minted for, the challenge it buys
+    # carries the same binding, and consuming either returns it (None = unknown, spent or expired).
     @abstractmethod
-    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]: ...
+    def issue_member_pairing_code(
+        self, ttl_seconds: int = 300, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]: ...
     @abstractmethod
-    def consume_member_pairing_code(self, code: str) -> bool: ...
+    def consume_member_pairing_code(self, code: str) -> tuple[str, str] | None: ...
     @abstractmethod
-    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]: ...
+    def issue_member_challenge(
+        self, ttl_seconds: int = 60, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]: ...
     @abstractmethod
     def is_member_challenge(self, challenge: str) -> bool:
         """Peek, never consume: registration asks the plane BEFORE its slot question."""
     @abstractmethod
-    def consume_member_challenge(self, challenge: str) -> bool: ...
+    def consume_member_challenge(self, challenge: str) -> tuple[str, str] | None: ...
 
     # THE OWNER SLOTS (hard rule 14.4, amended). A challenge bought with an OWNER code is its own kind, and only it
     # registers into an owner slot. A challenge fetched with no code (the plain kind above) serves revoke and never
@@ -2068,6 +2090,8 @@ class StateStore(StateStoreBase):
         # THE MEMBER PLANE (2026-09-30): member codes + their challenges, apart from the owner's.
         self._member_pairing_codes: dict[str, int] = {}
         self._member_challenges: dict[str, int] = {}
+        # code or challenge -> the (consumer, subject) it was minted for (2026-10-17); purged with its owner below.
+        self._member_bindings_by_value: dict[str, tuple[str, str] | None] = {}
         # THE OWNER SLOTS: owner-code challenges, the genesis marker (owner_genesis.json; loaded below), the
         # owner-enroll records (in-memory - a restart means re-pairing, as with the pending queue) and the
         # registry lock over every owner-slot decision.
@@ -2862,26 +2886,33 @@ class StateStore(StateStoreBase):
             exp = self._pairing_codes.pop(code, None)
         return exp is not None and time.time() < exp
 
-    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+    def issue_member_pairing_code(
+        self, ttl_seconds: int = 300, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         exp = int(time.time()) + ttl_seconds
         with self._lock:
             self._purge_challenges()
             code = self._unique_code_locked()
             self._member_pairing_codes[code] = exp
+            self._member_bindings_by_value[code] = binding
         return code, exp
 
-    def consume_member_pairing_code(self, code: str) -> bool:
+    def consume_member_pairing_code(self, code: str) -> tuple[str, str] | None:
         with self._lock:
             self._purge_challenges()
             exp = self._member_pairing_codes.pop(code, None)
-        return exp is not None and time.time() < exp
+            binding = self._member_bindings_by_value.pop(code, None)
+        return binding if exp is not None and time.time() < exp else None
 
-    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+    def issue_member_challenge(
+        self, ttl_seconds: int = 60, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
         exp = int(time.time()) + ttl_seconds
         with self._lock:
             self._purge_challenges()
             self._member_challenges[c] = exp
+            self._member_bindings_by_value[c] = binding
         return c, exp
 
     def is_member_challenge(self, challenge: str) -> bool:
@@ -2889,11 +2920,12 @@ class StateStore(StateStoreBase):
             exp = self._member_challenges.get(challenge)
         return exp is not None and time.time() < exp
 
-    def consume_member_challenge(self, challenge: str) -> bool:
+    def consume_member_challenge(self, challenge: str) -> tuple[str, str] | None:
         with self._lock:
             self._purge_challenges()
             exp = self._member_challenges.pop(challenge, None)
-        return exp is not None and time.time() < exp
+            binding = self._member_bindings_by_value.pop(challenge, None)
+        return binding if exp is not None and time.time() < exp else None
 
     def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
         c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
@@ -2999,6 +3031,10 @@ class StateStore(StateStoreBase):
         }
         self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
         self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
+        self._member_bindings_by_value = {
+            v: b for v, b in self._member_bindings_by_value.items()
+            if v in self._member_pairing_codes or v in self._member_challenges
+        }
         self._owner_challenges = {c: e for c, e in self._owner_challenges.items() if e > now}
 
     # ------------------------------------------------------------------
@@ -3014,6 +3050,7 @@ class StateStore(StateStoreBase):
                     raw = json.loads(phones_path.read_text(encoding="utf-8"))
                     for r in raw.get("phones", []):
                         r["supported_algorithms"] = tuple(r["supported_algorithms"])
+                        r["member_bindings"] = member_bindings_from_doc(r.get("member_bindings"))
                         self._phones[r["phone_id"]] = PhoneRegistration(**r)
             sessions_path = self._dir / "sessions.json"
             if sessions_path.exists():

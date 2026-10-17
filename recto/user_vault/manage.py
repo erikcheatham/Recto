@@ -30,7 +30,7 @@ from ..secrets.base import SecretNotFoundError
 from .types import (
     UserVaultEntryMeta,
     UserVaultStore,
-    normalize_user_id,
+    normalize_subject,
     normalize_user_vault_key,
     user_vault_secret_name,
 )
@@ -41,11 +41,11 @@ from .types import (
 
 
 def list_user_entries(
-    store_path: Path, platform: str, user_id: str
+    store_path: Path, platform: str, subject: str
 ) -> list[UserVaultEntryMeta]:
     """One user's entry metadata within one platform. Never touches the
     secret backend — safe to call freely from list surfaces."""
-    return UserVaultStore.load(store_path).list(platform, user_id)
+    return UserVaultStore.load(store_path).list(platform, subject)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def list_user_entries(
 
 def release_user_secret(
     platform: str,
-    user_id: str,
+    subject: str,
     key: str,
     *,
     secret_source_factory: SecretSourceFactory = _default_secret_source,
@@ -68,11 +68,11 @@ def release_user_secret(
     signature, but the value comes back only after the paired device
     approves (None on denial). Callers must already tolerate None.
     """
-    user_id = normalize_user_id(user_id)
+    subject = normalize_subject(subject)
     key = normalize_user_vault_key(key)
     source = secret_source_factory(platform)
     material = source.fetch(
-        user_vault_secret_name(user_id, key), {"required": False}
+        user_vault_secret_name(subject, key), {"required": False}
     )
     value = material.value
     return value if value else None
@@ -88,7 +88,7 @@ def set_user_entry(
     store_path: Path,
     *,
     platform: str,
-    user_id: str,
+    subject: str,
     key: str,
     display_name: str | None = None,
     category: str | None = None,
@@ -107,24 +107,24 @@ def set_user_entry(
     """
     if not platform:
         raise ValueError("platform must be non-empty")
-    user_id = normalize_user_id(user_id)
+    subject = normalize_subject(subject)
     key = normalize_user_vault_key(key)
     now = int(time.time())
 
     store = UserVaultStore.load(store_path)
-    existing = store.get(platform, user_id, key)
+    existing = store.get(platform, subject, key)
 
     wrote_secret = False
     if secret:  # non-empty string only
         source = secret_source_factory(platform)
-        source.write(user_vault_secret_name(user_id, key), secret)
+        source.write(user_vault_secret_name(subject, key), secret)
         wrote_secret = True
 
     has_secret = (existing.has_secret if existing else False) or wrote_secret
 
     meta = UserVaultEntryMeta(
         platform=platform,
-        user_id=user_id,
+        subject=subject,
         key=key,
         display_name=(
             display_name
@@ -154,21 +154,21 @@ def delete_user_entry(
     store_path: Path,
     *,
     platform: str,
-    user_id: str,
+    subject: str,
     key: str,
     secret_source_factory: SecretSourceFactory = _default_secret_source,
 ) -> UserVaultEntryMeta | None:
     """Remove the metadata row AND the secret value. Idempotent — returns
     the removed metadata, or None if nothing was registered."""
-    user_id = normalize_user_id(user_id)
+    subject = normalize_subject(subject)
     key = normalize_user_vault_key(key)
     store = UserVaultStore.load(store_path)
-    removed = store.remove(platform, user_id, key)
+    removed = store.remove(platform, subject, key)
     if removed is None:
         return None
     try:
         secret_source_factory(platform).delete(
-            user_vault_secret_name(user_id, key)
+            user_vault_secret_name(subject, key)
         )
     except SecretNotFoundError:
         pass  # metadata existed without a value — fine.

@@ -210,6 +210,42 @@ fails in the tree before a reader has to find it again
   constant time over its sha256; its threat is theft, answered by TLS and
   rotation, not by a jti. A reader asking it for a replay guard is asking a
   password for a nonce.
+- **m. A subject is a handle, not an identity.** Wherever a consuming
+  platform names one of its users - the member code's `member_of`, the user
+  vault's `X-Recto-Subject` claim, the device-pairing record - it sends an
+  opaque subject handle: exactly 43 base64url characters (32 bytes), minted
+  by the platform. Recto checks the grammar and nothing else; a GUID, an
+  email or any other shape is refused (400). Storage names use the handle's
+  hex form (`subject_storage_id`) so a case-folding filesystem never merges
+  two handles. Pinned: `TestRule15mASubjectIsAHandle`.
+- **n. A bound subject rebinds only by its bound phone.** A member code
+  binds (consumer, subject) to the phone that registers on it - one phone
+  per pair, one subject per consumer on a phone. A second key registering
+  for a bound pair is refused (409 `member_subject_bound`) unless the bound
+  phone's identity key signed the hand-over
+  (`recto-member-rebind-v1|consumer|subject|bound ref|incoming key|challenge`);
+  with it, the binding moves and the old phone loses it. The challenge is the
+  fresh member challenge the incoming phone answers, so each signature admits
+  one registration and a replayed one is refused. The operator's host reset
+  is the only other way. Pinned: `TestRule15nABoundSubjectRebindsOnlyByItsPhone`.
+- **o. The bootloader never stores a platform's user id.** No state field,
+  sidecar key or log line carries one - only the subject handle. The platform
+  holds the mapping from handle to meaning; nothing in this tree can reverse
+  it. Pinned: `TestRule15oTheBootloaderNeverStoresAPlatformUserId`.
+- **p. An auth-only agent raises no card.** An agent registered with
+  `"capability_requests": false` authenticates to a substrate (the user vault,
+  say) and is refused by name (403 `agent_auth_only`) before any capability
+  card is raised. An empty request policy stays a config error: "may request
+  nothing" is this kind, not an empty list. Pinned:
+  `TestRule15pAnAuthOnlyAgentRaisesNoCard`.
+- **q. The relay log carries the status only.** When a consumer answers a
+  relayed device pairing or unpairing with an HTTP error, the bootloader logs
+  the status code; the consumer's headers and body can carry its users' data
+  and are never printed. Pinned: `test_the_relay_log_carries_the_status_only`.
+- **r. A device label is generated, never asked.** A phone that sends no
+  label gets `phone-<4 hex>`, derived from its own key's reference; the phone
+  may rename itself, and the registry never prompts a person for a name.
+  Pinned: `TestRule15rADeviceLabelIsGenerated`.
 
 **The reader's residue.** Findings that name a design here are not re-argued;
 they are answered by the rule's letter and the test's name. A finding this

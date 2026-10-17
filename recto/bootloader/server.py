@@ -38,6 +38,7 @@ import secrets
 import threading
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -136,6 +137,31 @@ SLOT_REPLACE_PREFIX = "recto-slot-replace-v1"
 def slot_replace_payload(slot: str, occupant_phone_ref: str, incoming_public_key_b64u: str) -> bytes:
     """The ASCII bytes the incoming identity key signs to displace a slot's occupant."""
     return f"{SLOT_REPLACE_PREFIX}|{slot}|{occupant_phone_ref}|{incoming_public_key_b64u}".encode("ascii")
+
+
+# THE MEMBER BINDING (2026-10-17, hard rule 15.n). A consumer's (consumer, subject) is bound to ONE phone. Another
+# key registering for a bound pair is refused with 409 member_subject_bound naming the bound phone's ref; it may
+# take the binding only with the BOUND phone's identity-key signature over
+#   recto-member-rebind-v1|{consumer}|{subject}|{bound phone_ref}|{incoming pubkey}|{challenge}
+# carried as `member_rebind_b64u` (or after the operator's host reset). The CHALLENGE is the fresh member challenge
+# the incoming phone answers, so a signature is good for that one registration and never replays: a binding moved
+# A->B and back can never be taken again with A's old signature. The subject is the consumer's opaque handle.
+MEMBER_REBIND_PREFIX = "recto-member-rebind-v1"
+
+
+def member_rebind_payload(
+    consumer: str, subject: str, bound_phone_ref: str, incoming_public_key_b64u: str, challenge: str
+) -> bytes:
+    """The bytes the BOUND phone's identity key signs to hand its (consumer, subject) binding to a new key, for the one
+    registration answering `challenge`."""
+    return (
+        f"{MEMBER_REBIND_PREFIX}|{consumer}|{subject}|{bound_phone_ref}|{incoming_public_key_b64u}|{challenge}"
+    ).encode("utf-8")
+
+
+def generated_device_label(phone_ref: str) -> str:
+    """The label a phone gets when it sends none (hard rule 15.r): never asked, derived from its own key's ref."""
+    return "phone-" + phone_ref.removeprefix("pk_")[:4]
 
 
 def poll_key_delegation_payload(public_key_b64u: str, poll_public_key_b64u: str) -> bytes:
@@ -421,6 +447,10 @@ class BootloaderConfig:
     # nothing here mints authority, it only narrows which requests are
     # allowed to spend the operator's attention.
     capability_agent_requestable: dict[str, list[str]] = {}
+    # AUTH-ONLY AGENTS (2026-10-17, hard rule 15.p): agents whose entry says "capability_requests": false. They
+    # authenticate to a substrate (the user vault, say) and may raise NO capability card - refused by name before
+    # carding. Distinct from an empty requestable list, which stays a config error for the request kind.
+    capability_agent_auth_only: frozenset[str] = frozenset()
     # Per-agent REQUESTABLE-audience policy (2026-10-04), the audience
     # twin of the action policy above: WHERE a requested grant may be
     # spent, as the action policy bounds WHAT it may do. Map of agent_id
@@ -641,8 +671,8 @@ class BootloaderConfig:
     # Map of agent_id -> the PLATFORM namespace that agent may operate
     # on. A consuming platform (identified by its X-Recto-Agent-Id
     # header) reads/writes user entries only within the platform it's
-    # mapped to here, always further scoped by the X-Recto-User-Id claim
-    # it supplies. ALL FOUR user-vault verbs are agent-gated (divergence
+    # mapped to here, always further scoped by the X-Recto-Subject claim
+    # (an opaque handle) it supplies. ALL FOUR user-vault verbs are agent-gated (divergence
     # from connections, where writes are operator-gated): user-vault
     # writes are the platform acting for its own user at runtime.
     user_vault_agent_platforms: dict[str, str] = {}
@@ -708,6 +738,8 @@ class ChallengeStore:
         self._pairing_codes: dict[str, int] = {}  # code -> expires_at_unix
         self._member_pairing_codes: dict[str, int] = {}  # THE MEMBER PLANE (2026-09-30)
         self._member_challenges: dict[str, int] = {}
+        # code or challenge -> the (consumer, subject) it was minted for (2026-10-17, hard rule 15.n)
+        self._member_bindings: dict[str, tuple[str, str] | None] = {}
         self._owner_challenges: dict[str, int] = {}  # THE OWNER SLOTS (hard rule 14.4, amended)
 
     def issue_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
@@ -765,32 +797,40 @@ class ChallengeStore:
 
     # THE MEMBER PLANE (2026-09-30): a consumer's member code, and the registration challenge it buys, are their own
     # kind - a member registers BESIDE the business slots and never answers a slot question.
-    def issue_member_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+    def issue_member_pairing_code(
+        self, ttl_seconds: int = 300, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         if self._state is not None:
-            code, exp = self._state.issue_member_pairing_code(ttl_seconds)
+            code, exp = self._state.issue_member_pairing_code(ttl_seconds, binding)
         else:
             with self._lock:   # draw and insert under one hold, so two mints never draw one code
                 code = self._unique_code()
                 exp = int(time.time()) + ttl_seconds
                 self._member_pairing_codes[code] = exp
+                self._member_bindings[code] = binding
         self._minted(code, exp)
         return code, exp
 
-    def consume_member_pairing_code(self, code: str) -> bool:
+    def consume_member_pairing_code(self, code: str) -> tuple[str, str] | None:
+        """Spend a member code; the (consumer, subject) it was minted for, or None (unknown, spent, expired)."""
         if self._state is not None:
             return self._state.consume_member_pairing_code(code)
         with self._lock:
             self._purge()
             exp = self._member_pairing_codes.pop(code, None)
-            return exp is not None and time.time() < exp
+            binding = self._member_bindings.pop(code, None)
+            return binding if exp is not None and time.time() < exp else None
 
-    def issue_member_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+    def issue_member_challenge(
+        self, ttl_seconds: int = 60, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
         if self._state is not None:
-            return self._state.issue_member_challenge(ttl_seconds)
+            return self._state.issue_member_challenge(ttl_seconds, binding)
         with self._lock:
             c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
             exp = int(time.time()) + ttl_seconds
             self._member_challenges[c] = exp
+            self._member_bindings[c] = binding
             return c, exp
 
     def is_member_challenge(self, c: str) -> bool:
@@ -800,13 +840,15 @@ class ChallengeStore:
             exp = self._member_challenges.get(c)
             return exp is not None and time.time() < exp
 
-    def consume_member_challenge(self, c: str) -> bool:
+    def consume_member_challenge(self, c: str) -> tuple[str, str] | None:
+        """Spend a member challenge; its (consumer, subject) binding, or None (unknown, spent, expired)."""
         if self._state is not None:
             return self._state.consume_member_challenge(c)
         with self._lock:
             self._purge()
             exp = self._member_challenges.pop(c, None)
-            return exp is not None and time.time() < exp
+            binding = self._member_bindings.pop(c, None)
+            return binding if exp is not None and time.time() < exp else None
 
     # THE OWNER SLOTS (hard rule 14.4, amended): an OWNER code buys an OWNER challenge, and only that kind registers
     # into an owner slot. A challenge fetched with no code is the plain kind: it serves revoke and never registers.
@@ -840,6 +882,10 @@ class ChallengeStore:
         self._pairing_codes = {c: e for c, e in self._pairing_codes.items() if e > now}
         self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
         self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
+        self._member_bindings = {
+            v: b for v, b in self._member_bindings.items()
+            if v in self._member_pairing_codes or v in self._member_challenges
+        }
         self._owner_challenges = {c: e for c, e in self._owner_challenges.items() if e > now}
 
 
@@ -1299,10 +1345,12 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                               "operator's private route",
                 })
                 return
+            binding: tuple[str, str] | None = None
             if cfg.challenges.consume_pairing_code(code):
                 kind = "owner"
-            elif cfg.challenges.consume_member_pairing_code(code):
+            elif (binding := cfg.challenges.consume_member_pairing_code(code)) is not None:
                 # THE MEMBER PLANE (2026-09-30): a consumer's member code buys a MEMBER challenge - never an owner one.
+                # Since 2026-10-17 the challenge carries the code's (consumer, subject) binding (hard rule 15.n).
                 kind = "member"
             elif limiter.was_spent(code):
                 raise RegistrationExpiredError("pairing code already used - get a new code")
@@ -1317,7 +1365,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                     "burned a pairing code redeemed over the public edge after too many wrong guesses")
                 raise RegistrationExpiredError("this pairing code was exposed to too many wrong guesses - get a new code")
         challenge, expires_at = (
-            cfg.challenges.issue_owner_challenge() if kind == "owner" else cfg.challenges.issue_member_challenge()
+            cfg.challenges.issue_owner_challenge() if kind == "owner"
+            else cfg.challenges.issue_member_challenge(binding=binding)
         )
         self._send_json(HTTPStatus.OK, {
             "challenge_b64u": challenge,
@@ -1336,7 +1385,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         challenge = proof.get("challenge", "")
         sig = proof.get("signature_b64u", "")
         public_key_b64u = body.get("public_key_b64u", "")
-        device_label = body.get("device_label", "(unnamed)")
+        device_label = body.get("device_label")
         # GATE 2a (2026-08-17). This read `body.get("supported_algorithms",
         # ["ed25519"])` -- an ABSENT field enrolled the phone as software-keyed,
         # and line 814 below re-defaulted an EMPTY list the same way. Two
@@ -1373,6 +1422,10 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # made-up challenge, and the slot's authority was a claim signed by the INCOMING key.
         _require_canonical_key(public_key_b64u, algos[0])
         incoming_ref = _phone_ref(public_key_b64u)
+        # THE LABEL (2026-10-17, hard rule 15.r): a phone that sends no label gets one derived from its own key - the
+        # registry never asks a person for a name.
+        if not isinstance(device_label, str) or not device_label.strip() or device_label == "(unnamed)":
+            device_label = generated_device_label(incoming_ref)
         member = cfg.challenges.is_member_challenge(challenge)
         owner = not member and cfg.challenges.is_owner_challenge(challenge)
         if not member and not owner:
@@ -1447,7 +1500,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 f"against the identity key (algorithm={chosen_algo!r})"
             )
 
-        def _new(slot_: str) -> PhoneRegistration:
+        def _new(slot_: str, bindings: tuple[tuple[str, str], ...] | None = None) -> PhoneRegistration:
+            # A key that re-registers keeps the member bindings it holds unless the caller names new ones.
+            if bindings is None:
+                known = cfg.state.get_phone(incoming_ref)
+                bindings = known.member_bindings if known is not None else ()
             return PhoneRegistration.new(
                 device_label=str(device_label),
                 public_key_b64u=public_key_b64u,
@@ -1456,6 +1513,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 push_platform=push_platform if push_token else None,
                 poll_public_key_b64u=poll_public_key_b64u,
                 slot=slot_,
+                member_bindings=bindings,
             )
 
         # THE MEMBER PLANE (2026-09-30). A challenge bought with a consumer's MEMBER code carries none of the owner's
@@ -1468,13 +1526,55 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                     "registration refused: a member registration answers no slot question - "
                     "slot_replace_b64u is the business owner's act, never a member code's"
                 )
+            rebind_sig = body.get("member_rebind_b64u") or None
             with cfg.state.registry_lock():
-                held = next((p for p in cfg.state.list_phones() if p.public_key_b64u == public_key_b64u),
+                phones = cfg.state.list_phones()
+                held = next((p for p in phones if p.public_key_b64u == public_key_b64u),
                             None) or cfg.state.get_phone(incoming_ref)
                 slot = held.slot if held is not None and held.slot in SLOTS else MEMBER_SLOT
-                if not cfg.challenges.consume_member_challenge(challenge):
+                binding = cfg.challenges.consume_member_challenge(challenge)
+                if binding is None:
                     raise RegistrationExpiredError("registration challenge expired or invalid")
-                reg = cfg.state.register_phone(_new(slot))
+                consumer, subject = binding
+                own = held.member_bindings if held is not None else ()
+                # THE MEMBER BINDING (2026-10-17, hard rule 15.n). One subject per consumer on a phone, one phone per
+                # (consumer, subject): a phone already bound to ANOTHER subject of this consumer is refused, and a pair
+                # bound to another phone moves only by that phone's signature (or the operator's host reset).
+                if any(c == consumer and s_ != subject for c, s_ in own):
+                    self._send_json(HTTPStatus.FORBIDDEN, {
+                        "error": "member_phone_bound_elsewhere",
+                        "detail": "this phone is already bound to another subject of this consumer",
+                    })
+                    return
+                bound = next((p for p in phones if binding in p.member_bindings
+                              and p.public_key_b64u != public_key_b64u), None)
+                if bound is not None:
+                    rebind_ok = bool(rebind_sig) and verify_signature(
+                        payload=member_rebind_payload(consumer, subject, bound.phone_id, public_key_b64u, challenge),
+                        signature_b64u=rebind_sig or "",
+                        public_key_b64u=bound.public_key_b64u,
+                        algorithm=_registered_algorithm(bound, "member-rebind"),
+                    )
+                    if not rebind_ok:
+                        self._send_json(HTTPStatus.CONFLICT, {
+                            "error": "member_subject_bound",
+                            "bound_phone_ref": bound.phone_id,
+                            "detail": (
+                                "this subject is bound to another phone; it moves only with that phone's signature - "
+                                f"pair again with member_rebind_b64u = the bound phone's identity-key signature over "
+                                f"{MEMBER_REBIND_PREFIX}|<consumer>|<subject>|{bound.phone_id}|<public_key_b64u>|"
+                                "<the fresh challenge>, on a new member code (this challenge is spent), "
+                                "or ask the operator for a host reset"
+                            ),
+                        })
+                        return
+                    cfg.state.register_phone(replace(
+                        bound, member_bindings=tuple(b for b in bound.member_bindings if b != binding)))
+                    logging.getLogger("recto.bootloader.members").warning(
+                        "member binding moved from phone_id=%s to phone_id=%s by the bound phone's signature",
+                        bound.phone_id, incoming_ref)
+                bindings = tuple(b for b in own if b != binding) + (binding,)
+                reg = cfg.state.register_phone(_new(slot, bindings))
             self._send_registered(reg, displaced_ref=None)
             return
 
@@ -3867,6 +3967,12 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 {"error": "agent_auth_failed"},
             )
             return
+        if agent_id in cfg.capability_agent_auth_only:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "agent_auth_only",
+                "detail": f"agent {agent_id!r} authenticates to a substrate only and may raise no capability card",
+            })
+            return
         # Body shape
         phone_id = body.get("phone_id", "")
         if not phone_id or not isinstance(phone_id, str):
@@ -4201,6 +4307,19 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                  "detail": "the record names another bootloader"},
             )
             return
+        # THE PLACEHOLDER RULE (2026-10-17, hard rules 15.m/15.o): the record's `user_id` field carries the consumer's
+        # OPAQUE subject handle, never its user id - Recto signs and relays handles only. Another shape is refused.
+        from recto.subject_handle import normalize_subject as _normalize_subject
+        try:
+            _normalize_subject(record.user_id)
+        except ValueError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "record_subject_invalid",
+                 "detail": "record.user_id must carry the consumer's opaque subject handle "
+                           "(43 base64url characters), never a user id"},
+            )
+            return
 
         try:
             claims = _verify_jws(
@@ -4358,12 +4477,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             consumer_status = e.code
             try:
                 raw = e.read()
-                print(
-                    f"[bootloader] devices/pair: HTTPError {e.code} from "
-                    f"{forward_url}, headers={dict(e.headers)}, "
-                    f"body={raw[:500] if raw else b'(empty)'}",
-                    flush=True,
-                )
+                # The status only (hard rule 15.q): the consumer's headers and body may carry its users' data.
+                print(f"[bootloader] devices/pair: HTTPError {e.code} from the consumer", flush=True)
                 consumer_body = json.loads(raw) if raw else None
             except (json.JSONDecodeError, Exception):
                 consumer_body = {"raw": str(e)}
@@ -4570,12 +4685,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             consumer_status = e.code
             try:
                 raw = e.read()
-                print(
-                    f"[bootloader] devices/unpair: HTTPError {e.code} from "
-                    f"{forward_url}, headers={dict(e.headers)}, "
-                    f"body={raw[:500] if raw else b'(empty)'}",
-                    flush=True,
-                )
+                # The status only (hard rule 15.q): the consumer's headers and body may carry its users' data.
+                print(f"[bootloader] devices/unpair: HTTPError {e.code} from the consumer", flush=True)
                 consumer_body = json.loads(raw) if raw else None
             except (json.JSONDecodeError, Exception):
                 consumer_body = {"raw": str(e)}
@@ -5506,13 +5617,26 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # THE MEMBER PLANE (2026-09-30): a consumer mints a code for one of ITS MEMBERS by naming who it is for.
         # That code registers beside the business slots and carries none of the owner's authority; a code minted
         # without member_of keeps its meaning (the owner's, e.g. the owner's own re-pair lane).
+        # Since 2026-10-17 it names the user by the consumer's OPAQUE subject handle (hard rules 15.m/15.o), and the code
+        # carries (consumer, subject) into the registration it buys (15.n).
         member_of = body.get("member_of")
         if member_of is not None:
             if (not isinstance(member_of, dict)
                     or not isinstance(member_of.get("consumer"), str) or not member_of["consumer"].strip()
-                    or not isinstance(member_of.get("user_id"), str) or not member_of["user_id"].strip()):
-                raise BootloaderError("member_of must be {\"consumer\": <base url>, \"user_id\": <id>}")
-            code, exp = cfg.challenges.issue_member_pairing_code(ttl_seconds=ttl_seconds)
+                    or "subject" not in member_of):
+                raise BootloaderError(
+                    "member_of must be {\"consumer\": <base url>, \"subject\": <opaque handle>}")
+            from recto.subject_handle import normalize_subject as _normalize_subject
+            try:
+                subject = _normalize_subject(member_of["subject"])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {
+                    "error": "subject_invalid",
+                    "detail": "member_of.subject must be an opaque handle of 43 base64url characters",
+                })
+                return
+            code, exp = cfg.challenges.issue_member_pairing_code(
+                ttl_seconds=ttl_seconds, binding=(member_of["consumer"].strip(), subject))
             print(f"[bootloader] minted MEMBER pairing code via /v0.4/pairing/code "
                   f"(agent={agent_id}, consumer={member_of['consumer']}, expires_at_unix={exp})", flush=True)
             self._send_json(HTTPStatus.OK, {"code": code, "expires_at_unix": exp, "ttl_seconds": ttl_seconds,
@@ -6952,14 +7076,14 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     #
     #   ALL FOUR verbs (set / list / release / delete) are agent-token-
     #   gated AND platform-scoped via user_vault_agent_platforms, and
-    #   every operation is further scoped by the X-Recto-User-Id claim
+    #   every operation is further scoped by the X-Recto-Subject claim
     #   the calling platform supplies. There is no operator tier here:
     #   user-vault writes are the platform acting for its OWN user at
     #   runtime (the user pasted a key into the platform's UI), so the
-    #   platform's agent token is the trust anchor and the user-id
+    #   platform's agent token is the trust anchor and the subject
     #   claim bounds each request to one user's namespace. One platform
     #   can never touch another platform's users (agent map), and a
-    #   request can never span users (single claimed id per call).
+    #   request can never span users (single claimed handle per call).
     #
     # Release-on-approval seam (Hard Rule #9): the release response
     # carries a `status` field -- "released" | "unset" today. The
@@ -7001,26 +7125,28 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             return None
         return platform
 
-    def _user_vault_user_id(self) -> str | None:
-        """Read + validate the X-Recto-User-Id scoping claim. Returns the
-        normalized (lowercase GUID) user id, or None after sending the
-        failure response. The header travels on every user-vault call --
-        a claim the AUTHENTICATED platform supplies, scoping the request
-        to exactly one user's namespace."""
-        raw = self.headers.get("X-Recto-User-Id", "").strip()
+    def _user_vault_subject(self) -> str | None:
+        """Read + validate the X-Recto-Subject scoping claim: the platform's
+        OPAQUE subject handle for one user (recto.subject_handle - 43
+        base64url characters; never the platform's user id, hard rule 15.o).
+        Returns the handle, or None after sending the failure response. The
+        header travels on every user-vault call -- a claim the AUTHENTICATED
+        platform supplies, scoping the request to exactly one user's
+        namespace. A value in any other shape is refused (hard rule 15.m)."""
+        raw = self.headers.get("X-Recto-Subject", "").strip()
         if not raw:
             self._send_json(HTTPStatus.BAD_REQUEST, {
-                "error": "user_id_required",
-                "detail": "X-Recto-User-Id header required",
+                "error": "subject_required",
+                "detail": "X-Recto-Subject header required",
             })
             return None
-        from recto.user_vault.types import normalize_user_id
+        from recto.subject_handle import normalize_subject
         try:
-            return normalize_user_id(raw)
+            return normalize_subject(raw)
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {
-                "error": "user_id_invalid",
-                "detail": "X-Recto-User-Id must be a GUID",
+                "error": "subject_invalid",
+                "detail": "X-Recto-Subject must be an opaque handle of 43 base64url characters",
             })
             return None
 
@@ -7040,17 +7166,17 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         platform = self._user_vault_agent_platform()
         if platform is None:
             return
-        user_id = self._user_vault_user_id()
-        if user_id is None:
+        subject = self._user_vault_subject()
+        if subject is None:
             return
         from pathlib import Path as _Path
         from recto.user_vault.manage import list_user_entries
         rows = list_user_entries(
-            _Path(self.config.user_vault_path), platform, user_id
+            _Path(self.config.user_vault_path), platform, subject
         )
         self._send_json(HTTPStatus.OK, {
             "platform": platform,
-            "user_id": user_id,
+            "subject": subject,
             "entries": [m.to_dict() for m in rows],
         })
 
@@ -7067,8 +7193,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         platform = self._user_vault_agent_platform()
         if platform is None:
             return
-        user_id = self._user_vault_user_id()
-        if user_id is None:
+        subject = self._user_vault_subject()
+        if subject is None:
             return
         from urllib.parse import parse_qs
         raw_key = (parse_qs(url.query).get("key", [""])[0]).strip()
@@ -7079,13 +7205,13 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         try:
             key = normalize_user_vault_key(raw_key)
             value = release_user_secret(
-                platform, user_id, key, **self._user_vault_secret_kwargs()
+                platform, subject, key, **self._user_vault_secret_kwargs()
             )
         except ValueError as exc:
             raise BootloaderError(str(exc)) from exc
         self._send_json(HTTPStatus.OK, {
             "platform": platform,
-            "user_id": user_id,
+            "subject": subject,
             "key": key,
             "status": "released" if value is not None else "unset",
             "has_value": value is not None,
@@ -7100,8 +7226,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         platform = self._user_vault_agent_platform()
         if platform is None:
             return
-        user_id = self._user_vault_user_id()
-        if user_id is None:
+        subject = self._user_vault_subject()
+        if subject is None:
             return
         key = (body.get("key") or "").strip()
         if not key:
@@ -7115,7 +7241,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             meta = set_user_entry(
                 _Path(self.config.user_vault_path),
                 platform=platform,
-                user_id=user_id,
+                subject=subject,
                 key=key,
                 display_name=body.get("display_name"),
                 category=body.get("category"),
@@ -7132,8 +7258,8 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         platform = self._user_vault_agent_platform()
         if platform is None:
             return
-        user_id = self._user_vault_user_id()
-        if user_id is None:
+        subject = self._user_vault_subject()
+        if subject is None:
             return
         key = (body.get("key") or "").strip()
         if not key:
@@ -7144,7 +7270,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             removed = delete_user_entry(
                 _Path(self.config.user_vault_path),
                 platform=platform,
-                user_id=user_id,
+                subject=subject,
                 key=key,
                 **self._user_vault_secret_kwargs(),
             )
@@ -7216,6 +7342,7 @@ def create_server(
     capability_agent_tokens: dict[str, str] | None = None,
     capability_agent_requestable: dict[str, list[str]] | None = None,
     capability_agent_audiences: dict[str, list[str]] | None = None,
+    capability_agent_auth_only: Any = None,
     capability_operator_pubkey: bytes | None = None,
     capability_result_ttl_seconds: int = 600,
     capability_manifest: object | None = None,
@@ -7390,6 +7517,7 @@ def create_server(
         if capability_agent_requestable
         else {}
     )
+    BootloaderHandler.config.capability_agent_auth_only = frozenset(capability_agent_auth_only or ())
     BootloaderHandler.config.capability_agent_audiences = (
         {k: list(v) for k, v in capability_agent_audiences.items()}
         if capability_agent_audiences
@@ -7726,7 +7854,7 @@ def create_server(
     # Recto User Vault Substrate (2026-07-25). Empty/None user_vault_path
     # leaves all /v0.4/user-vault/* endpoints disabled (404). All four
     # verbs are agent-gated + platform-scoped via the agent->platform map,
-    # then user-scoped by the per-request X-Recto-User-Id claim.
+    # then user-scoped by the per-request X-Recto-Subject claim.
     BootloaderHandler.config.user_vault_path = user_vault_path
     BootloaderHandler.config.user_vault_agent_platforms = (
         dict(user_vault_agent_platforms) if user_vault_agent_platforms else {}

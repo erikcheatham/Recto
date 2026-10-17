@@ -1296,6 +1296,9 @@ def main() -> int:
     capability_agent_tokens: dict[str, str] = {}
     capability_agent_requestable: dict[str, list[str]] = {}
     capability_agent_audiences: dict[str, list[str]] = {}
+    # AUTH-ONLY agents (2026-10-17, hard rule 15.p): "capability_requests": false on an entry - the agent
+    # authenticates to a substrate (e.g. the user vault) and the bootloader refuses any capability card it asks for.
+    capability_agent_auth_only: set[str] = set()
     principal_apps: dict[str, AppContext] = {}
     # THE OWNER SLOTS (hard rule 14.4, amended): only an agent whose entry carries "may_mint_owner_codes": true mints
     # OWNER pairing codes; every other agent mints member codes only. A strict JSON boolean - anything else refuses.
@@ -1376,6 +1379,19 @@ def main() -> int:
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
+        # THE AUTH-ONLY KIND (2026-10-17): "capability_requests" is a strict JSON boolean, default true. False marks an
+        # agent that may raise no card at all; a request policy on such an agent contradicts it and is refused.
+        capability_requests = agent.get("capability_requests", True)
+        if not isinstance(capability_requests, bool):
+            print(f"ERROR: agent {agent_id!r}: capability_requests must be true or false; "
+                  f"got {capability_requests!r}", file=sys.stderr)
+            return 2
+        if not capability_requests:
+            if requestable is not None or audiences is not None:
+                print(f"ERROR: agent {agent_id!r}: an auth-only agent (capability_requests: false) carries no "
+                      "requestable_actions or requestable_audiences", file=sys.stderr)
+                return 2
+            capability_agent_auth_only.add(agent_id)
         if requestable is not None:
             capability_agent_requestable[agent_id] = requestable
         if audiences is not None:
@@ -1489,7 +1505,7 @@ def main() -> int:
     # endpoints stay 404. When set, all four verbs are agent-token-gated
     # + platform-scoped via RECTO_USER_VAULT_AGENT_PLATFORMS (same
     # agent_id:Namespace format as the connections map), and each request
-    # carries an X-Recto-User-Id claim scoping it to one user. In the
+    # carries an X-Recto-Subject claim (an opaque handle) scoping it to one user. In the
     # DOCKERIZED topology point the file inside the bootloader-data named
     # volume (e.g. /var/lib/recto/bootloader/user_vault.json) and set
     # RECTO_USER_VAULT_SECRET_DIR beside it -- DPAPI cannot decrypt in a
@@ -1597,6 +1613,7 @@ def main() -> int:
             capability_agent_tokens=capability_agent_tokens,
             capability_agent_requestable=capability_agent_requestable or None,
             capability_agent_audiences=capability_agent_audiences or None,
+            capability_agent_auth_only=capability_agent_auth_only or None,
             owner_code_minters=owner_code_minters,
             capability_operator_token=operator_write_token,
             principal_apps=principal_apps,
@@ -1675,6 +1692,8 @@ def main() -> int:
             policy = capability_agent_requestable.get(aid)
             if policy is not None:
                 ctx_str += f" [requestable: {', '.join(policy)}]"
+            if aid in capability_agent_auth_only:
+                ctx_str += " [auth-only: raises no capability card]"
             aud_policy = capability_agent_audiences.get(aid)
             if aud_policy is not None:
                 ctx_str += f" [audiences: {', '.join(aud_policy)}]"

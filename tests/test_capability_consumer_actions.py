@@ -252,6 +252,46 @@ class TestAgentPolicyReader:
         assert rc == 2 and kw is None
         assert "agent 'a': requestable_audiences must be a non-empty array" in capsys.readouterr().err
 
+    # THE AUTH-ONLY KIND (2026-10-17, hard rule 15.p): "capability_requests": false reaches the server as an auth-only
+    # agent; a non-boolean, or a request policy beside it, stops startup by name.
+    def test_an_auth_only_agent_reaches_the_server(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        rc, kw = _launcher_kwargs(monkeypatch, tmp_path, [
+            {"agent_id": "a", "token_env": "POLICY_TEST_TOKEN_A", "capability_requests": False},
+            {"agent_id": "b", "token_env": "POLICY_TEST_TOKEN_B"},
+        ])
+        assert rc is None, "main() returned before create_server"
+        assert set(kw["capability_agent_auth_only"]) == {"a"}
+
+    def test_no_auth_only_agent_means_none_is_passed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        rc, kw = _launcher_kwargs(monkeypatch, tmp_path, [
+            {"agent_id": "a", "token_env": "POLICY_TEST_TOKEN_A", "capability_requests": True},
+        ])
+        assert rc is None and kw["capability_agent_auth_only"] is None
+
+    @pytest.mark.parametrize("bad", ["false", 0, None])
+    def test_a_non_boolean_capability_requests_stops_startup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: Any,
+    ) -> None:
+        rc, kw = _launcher_kwargs(monkeypatch, tmp_path, [
+            {"agent_id": "a", "token_env": "POLICY_TEST_TOKEN_A", "capability_requests": bad},
+        ])
+        assert rc == 2 and kw is None
+        assert "agent 'a': capability_requests must be true or false" in capsys.readouterr().err
+
+    def test_an_auth_only_agent_with_a_request_policy_stops_startup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc, kw = _launcher_kwargs(monkeypatch, tmp_path, [
+            {"agent_id": "a", "token_env": "POLICY_TEST_TOKEN_A", "capability_requests": False,
+             "requestable_actions": [ACT]},
+        ])
+        assert rc == 2 and kw is None
+        assert "an auth-only agent (capability_requests: false) carries no" in capsys.readouterr().err
+
 
 class _CreateServerCalled(Exception):
     def __init__(self, kwargs: dict[str, Any]) -> None:

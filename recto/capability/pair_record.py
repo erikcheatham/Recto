@@ -75,7 +75,11 @@ GRANT_AUDIENCE_NOT_BOOTLOADER = "grant_audience_not_bootloader"
 @dataclass(frozen=True)
 class PairRecord:
     """``phone_pubkey``: 128 lowercase hex (X||Y, no 0x04). ``not_after``:
-    unix seconds. ``code``: the typed alias, case-preserved."""
+    unix seconds. ``code``: the typed alias, case-preserved. ``user_id``:
+    the consumer's OPAQUE subject handle for the user (recto.subject_handle),
+    never its user id (hard rules 15.m, 15.o); the bootloader refuses another
+    shape. The field keeps its wire name until the phone app's next release
+    renames it."""
 
     bootloader_id: str
     user_id: str
