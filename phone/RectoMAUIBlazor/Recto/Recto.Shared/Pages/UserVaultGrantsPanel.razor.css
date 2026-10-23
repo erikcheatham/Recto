@@ -1,0 +1,10 @@
+/* R-series step 3: "Your grants" (hard rule 15.aa), in the app's own tokens. */
+.uvg-key { border: 1px solid var(--rec-border); border-radius: .3rem; background: var(--rec-surface-lo); margin-bottom: .6rem; }
+.uvg-key-head { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .45rem .55rem;
+                border-bottom: 1px solid var(--rec-border); }
+.uvg-key-head code { color: var(--rec-accent-hi); font-family: var(--rec-font-mono); }
+.uvg-stop-all { flex: 0 0 auto; min-width: 0; padding: .3rem .7rem; font-size: .8rem; }
+.uvg-row { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .4rem .55rem;
+           border-top: 1px solid var(--rec-border); }
+.uvg-row:first-of-type { border-top: none; }
+.uvg-h { font-family: var(--rec-font-mono); font-size: .76rem; color: var(--rec-text-muted); }

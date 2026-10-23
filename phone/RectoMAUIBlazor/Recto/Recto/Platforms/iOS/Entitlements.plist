@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      APNs environment: "development" = sandbox gateway, "production" = live.
+      Set explicitly for MAUI; Entitlements.Release.plist carries production.
+    -->
+    <key>aps-environment</key>
+    <string>development</string>
+
+    <!--
+      Explicit keychain access group. On the simulator (no provisioning
+      profile) the implicit group is absent and SecureStorage fails with
+      errSecMissingEntitlement (-34018) on the first pairing call; naming
+      the group fixes that. The team prefix is substituted at signing time.
+    -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)app.recto.phone</string>
+    </array>
+</dict>
+</plist>

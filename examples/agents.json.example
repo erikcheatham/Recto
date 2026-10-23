@@ -1,0 +1,55 @@
+{
+  "_comment": "Canonical multi-agent manifest for examples/run_bootloader_consumer.py. Copy to a real path (e.g., C:\\Recto\\agents.json), fill in the per-consumer values, then `$env:RECTO_AGENTS_FILE = '<path>'` and start the launcher. When RECTO_AGENTS_FILE is set, this file is the single source of truth for the agent registry -- the per-agent env vars (RECTO_AGENT_ID / RECTO_VAULT_SERVICE / RECTO_APP_*) are ignored. Bootloader-level env vars (RECTO_BOOTLOADER_ID / RECTO_BIND_HOST / RECTO_BIND_PORT / RECTO_PUBLIC_URL / RECTO_STATE_DIR / RECTO_BOOTLOADER_QUIET) still apply.",
+
+  "_placeholders": "EVERY IDENTIFIER BELOW IS A PLACEHOLDER AND IS MEANT TO BE REPLACED. It reads as `example-service` / `example.com` on purpose. This file previously shipped one real deployment's agent ids, vault service names and hostnames, which made an example file into a description of somebody's production topology -- and, per the warning below, that particular example had already been copy-pasted into a live deployment once. A placeholder asks to be substituted; a real name invites the copy-paste.",
+
+  "_app_block_warning": "THIS FILE HAS BEEN COPY-PASTED INTO A REAL DEPLOYMENT, and the app_* values rode along. Treat the app block as YOURS to replace, not as boilerplate to keep. Two specific traps, both learned the hard way: (1) app_description is what the operator's phone renders on EVERY approval card, so a stale one is visible on the most trusted surface you have - and because it is only ever seen on a phone, nobody greps for it; (2) MEASURE app_icon_url before shipping it. Serve the icon from the web root (/brand/...), not from a Razor Class Library _content path - the RCL surface soft-404s, and a card pointed at a dead URL silently falls back to a monogram, which reads as a broken deploy rather than a bad string.",
+
+  "_token_resolution": "Each agent's token is resolved in priority order: (1) os.environ[token_env] if token_env is set and the env var is non-empty (the supervised-launcher case -- Recto's launcher decrypts each per-agent vault entry and injects under the named env var); (2) dpapi-machine vault fetch from vault_service / vault_secret (the foreground bring-up case -- operator runs the launcher from PowerShell without per-agent token env vars set, the script decrypts in-process). First non-empty wins. Tokens must be 64 hex chars regardless of source.",
+
+  "_two_agents": "Two consumer entries are shown because the manifest exists to register MORE THAN ONE consumer against one bootloader; a single-agent example would not demonstrate the thing the file is for. Each consumer gets its own token, its own vault entry, and its own app block -- nothing is shared but the bootloader. The first entry, operator-console, is not a consumer: it is the operator's own agent, the one that mints OWNER pairing codes (see _may_mint_owner_codes), and it carries no app block.",
+
+  "_requestable_actions": "OPTIONAL per-agent field: an array of action keys this agent may ASK for. When present the agent is deny-by-default -- a capability request that names any action outside this list (allow_actions, plus each group's members expanded via the manifest; deny_actions is never subtracted first, so a deny cannot cancel its own allow into a pass) is refused 403 BEFORE it reaches the operator's approval queue, so a misbehaving or compromised agent cannot spend the operator's attention on requests it was never meant to make. When absent the agent is unrestricted at this layer and the operator's approval remains the only gate. Note this is a filter on what may be REQUESTED, never a grant: every listed action still requires the normal per-request approval. If a policed agent sends group-bearing claims the bootloader must have its action manifest loaded (RECTO_CAPABILITY_MANIFEST_FILE), otherwise the request is refused unexpanded, fail-closed. An empty array is a config error and refuses startup: an agent that may request nothing should not be registered.",
+
+  "_requestable_audiences": "OPTIONAL per-agent field: an array of audience strings this agent may name in a request's aud claim -- WHERE the grant it asks for may be spent, as requestable_actions bounds WHAT it may do. When present the agent is deny-by-default -- a request whose aud is not an array of strings, is empty, or names any audience outside this list is refused 403 BEFORE it reaches the operator's approval queue. When absent the agent is unrestricted at this layer. The values are YOURS: name each verifier the way it expects to be named (one audience per consumer, per cluster, per executor). Recto ships none, treats aud as opaque, compares it exactly (case included) and never rewrites it; the phone shows it on the approval card. Like requestable_actions this narrows what may be ASKED and grants nothing. An empty array is a config error and refuses startup.",
+
+  "_may_mint_owner_codes": "OPTIONAL per-agent field, a JSON boolean (default false): true lets this agent mint OWNER pairing codes through POST /v0.4/pairing/code (no member_of). Give it to the operator's own agent only - a consumer mints MEMBER codes (member_of), which register beside the owner slots. Any other value refuses startup. Past genesis, adding or replacing an owner phone spends a code on each of its two passes, so it needs a flagged agent; the startup code (RECTO_BOOTLOADER_QUIET unset) is printed only while owner genesis is open - the first owner, or after a host reset. An owner code is still not enough on its own: once the bootloader has an owner, a new owner key needs the approval of an owner phone it does not displace.",
+
+  "agents": [
+    {
+      "agent_id": "operator-console",
+      "token_env": "RECTO_AGENT_TOKEN_OPERATOR_CONSOLE",
+      "vault_service": "OperatorConsole",
+      "vault_secret": "RECTO_CAPABILITY_AGENT_TOKEN",
+      "may_mint_owner_codes": true
+    },
+    {
+      "agent_id": "example-service",
+      "token_env": "RECTO_AGENT_TOKEN_EXAMPLE_SERVICE",
+      "vault_service": "ExampleService",
+      "vault_secret": "RECTO_CAPABILITY_AGENT_TOKEN",
+      "app": {
+        "app_id": "example-service",
+        "app_name": "Example Service",
+        "app_description": "One short line; this is what the approval card shows.",
+        "app_url": "https://example.com",
+        "app_icon_url": "https://example.com/brand/example-service-icon.png"
+      }
+    },
+    {
+      "agent_id": "second-example-service",
+      "token_env": "RECTO_AGENT_TOKEN_SECOND_EXAMPLE",
+      "vault_service": "SecondExampleService",
+      "vault_secret": "RECTO_CAPABILITY_AGENT_TOKEN",
+      "requestable_actions": ["example:submit-item"],
+      "requestable_audiences": ["example-consumer:staging"],
+      "app": {
+        "app_id": "second-example-service",
+        "app_name": "Second Example Service",
+        "app_description": "A different consumer on the same bootloader.",
+        "app_url": "https://second.example.com",
+        "app_icon_url": "https://second.example.com/brand/second-example-icon.png"
+      }
+    }
+  ]
+}

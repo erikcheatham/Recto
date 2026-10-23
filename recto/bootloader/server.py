@@ -1,0 +1,9691 @@
+"""HTTPS server for the v0.4 bootloader.
+
+Implements the endpoint set defined in `docs/v0.4-protocol.md`:
+
+- POST /v0.4/register
+- GET  /v0.4/registration_challenge
+- POST /v0.4/issue_session
+- GET  /v0.4/pending?phone_id=<id>
+- POST /v0.4/respond/<request_id>
+
+Uses stdlib `http.server.ThreadingHTTPServer` + `ssl.SSLContext`. No
+extra HTTP-framework dependency. The server is single-process (one
+bootloader per service, owned by the launcher); concurrency comes from
+the threading mixin handling each request on its own thread.
+
+State access is delegated to `recto.bootloader.state.StateStore`, which
+is internally thread-safe. The handler holds a reference to the store
+and a few config values via class attributes set at server creation.
+
+Threat model notes are in module docstrings of `state.py` and
+`sessions.py`. This module enforces the wire-protocol contract. Its one
+brute-force defense is the wrong pairing-code limiter (owner_slots.py:
+per public client, and a per-code exposure budget); it does no other
+rate limiting, and no replay protection beyond the JWT `jti` and
+challenge expiry. The rest is followup work tracked in the v0.4
+deferred-items list.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+import types
+import uuid
+from dataclasses import replace
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, parse_qsl, quote, urlparse
+import urllib.error
+import urllib.request
+
+from recto.bootloader import top_plane
+from recto.bootloader.genesis_chain import ChainError, canonical_meta
+from recto.bootloader.top_plane import RESET_CHALLENGE_PREFIX
+
+from recto.bootloader.clusters import ClusterRegistry, ClusterRegistryError
+
+from recto.bootloader import (
+    BootloaderError,
+    PendingRequestNotFoundError,
+    RegistrationExpiredError,
+    UnknownPhoneError,
+)
+from recto import __version__
+from recto.bootloader.sessions import (
+    SUPPORTED_ALGORITHMS,
+    build_session_issuance_payload,
+    verify_jwt,
+    verify_signature,
+)
+from recto.bootloader.owner_slots import (
+    MALFORMED_CLIENT,
+    StoreLockUnavailable,
+    void_owner_enrolls_for,
+    OWNER_APPROVAL_TTL_SECONDS,
+    OWNER_CARD_TTL_SECONDS,
+    OWNER_CONTEST_WINDOW_SECONDS,
+    PUBLIC_CLIENT_HEADER,
+    CodeAttemptLimiter,
+    acquire_server_store_lock,
+    grouped_ref,
+    owner_enroll_digest,
+)
+from recto.bootloader.state import (
+    MEMBER_SLOT,
+    SLOTS,
+    RegistryLockUnavailable,
+    ActorContext,
+    AppContext,
+    phone_ref_of,
+    CapabilityResult,
+    PendingRequest,
+    PhoneRegistration,
+    ProfileCreateResult,
+    RevocationEntry,
+    Session,
+    StateStore,
+    StateStoreBase,
+)
+
+__all__ = [
+    "BootloaderHandler",
+    "BootloaderConfig",
+    "ChallengeStore",
+    "create_server",
+]
+
+PROTOCOL_VERSION = 1
+
+# Signed-poll protocol (2026-08-13, "phone_id split: reference vs
+# capability"). The phone signs the ASCII string
+#   recto-poll-v1|{phone_id}|{ts}|{path}
+# with its enclave key (ts = unix seconds, path = URL path only, e.g.
+# "/v0.4/pending") and sends the signature + timestamp as headers on
+# every possession-of-phone_id read. Freshness window is +/- this many
+# seconds around the server clock.
+POLL_SIG_PREFIX = "recto-poll-v1"
+POLL_SIG_HEADER = "X-Recto-Phone-Sig"
+POLL_SIG_TS_HEADER = "X-Recto-Phone-Ts"
+POLL_SIG_FRESHNESS_SECONDS = 120
+
+# The poll-key delegation (2026-09-21, hard rule 14.2). The
+# identity key is per-use biometric-gated on both shipped platforms, so
+# it cannot sign a poll tick. At registration the phone MAY carry a
+# second, non-gated enclave key (`poll_public_key_b64u`) and the identity
+# key's signature (`poll_key_delegation_b64u`) over
+#   recto-poll-key-v1|{public_key_b64u}|{poll_public_key_b64u}
+# Poll signatures are then verified against the poll key. The delegation
+# is the signed claim that keeps "every crossing is a signature by THAT
+# key" true: the identity key named the poll key, once, under biometrics.
+POLL_KEY_DELEGATION_PREFIX = "recto-poll-key-v1"
+
+# THE SLOTS (2026-09-21, hard rule 14.4). Two phones, not a list. Pairing into
+# an occupied slot is refused with 409 slot_occupied and the occupant's
+# model + last seen, so the phone can ask the operator the replacement
+# question; the answer is the incoming IDENTITY key's signature over
+#   recto-slot-replace-v1|{slot}|{occupant phone_ref}|{incoming pubkey}
+# carried as `slot_replace_b64u` on the retried registration. The occupant
+# is revoked in the same act as the incoming key is registered.
+SLOT_REPLACE_PREFIX = "recto-slot-replace-v1"
+
+
+def slot_replace_payload(slot: str, occupant_phone_ref: str, incoming_public_key_b64u: str) -> bytes:
+    """The ASCII bytes the incoming identity key signs to displace a slot's occupant."""
+    return f"{SLOT_REPLACE_PREFIX}|{slot}|{occupant_phone_ref}|{incoming_public_key_b64u}".encode("ascii")
+
+
+# THE MEMBER BINDING (2026-10-17, hard rule 15.n). A consumer's (consumer, subject) is bound to ONE phone. Another
+# key registering for a bound pair is refused with 409 member_subject_bound naming the bound phone's ref; it may
+# take the binding only with the BOUND phone's identity-key signature over
+#   recto-member-rebind-v1|{consumer}|{subject}|{bound phone_ref}|{incoming pubkey}|{challenge}
+# carried as `member_rebind_b64u` (or after the operator's host reset). The CHALLENGE is the fresh member challenge
+# the incoming phone answers, so a signature is good for that one registration and never replays: a binding moved
+# A->B and back can never be taken again with A's old signature. The subject is the consumer's opaque handle.
+MEMBER_REBIND_PREFIX = "recto-member-rebind-v1"
+
+
+def member_rebind_payload(
+    consumer: str, subject: str, bound_phone_ref: str, incoming_public_key_b64u: str, challenge: str
+) -> bytes:
+    """The bytes the BOUND phone's identity key signs to hand its (consumer, subject) binding to a new key, for the one
+    registration answering `challenge`."""
+    return (
+        f"{MEMBER_REBIND_PREFIX}|{consumer}|{subject}|{bound_phone_ref}|{incoming_public_key_b64u}|{challenge}"
+    ).encode("utf-8")
+
+
+def generated_device_label(phone_ref: str) -> str:
+    """The label a phone gets when it sends none (hard rule 15.r): never asked, derived from its own key's ref."""
+    return "phone-" + phone_ref.removeprefix("pk_")[:4]
+
+
+def poll_key_delegation_payload(public_key_b64u: str, poll_public_key_b64u: str) -> bytes:
+    """The ASCII bytes the identity key signs to delegate a poll key."""
+    return f"{POLL_KEY_DELEGATION_PREFIX}|{public_key_b64u}|{poll_public_key_b64u}".encode("ascii")
+
+# The three legal signed_poll_mode values. "advisory" is the DEFAULT:
+# Build 12 phones in both stores poll bare, so a hard require would
+# brick the shipped app (Hard Rule #1 back-compat). Advisory allows
+# every poll and logs the per-poll verdict (signed-valid /
+# signed-invalid / unsigned) so an operator can watch the evidence
+# window before flipping to "required" (the RECURVE ceremony:
+# advisory -> evidence window -> flip -> single redeploy).
+SIGNED_POLL_MODES = ("off", "advisory", "required")
+
+
+def _phone_ref(public_key_b64u: str) -> str:
+    """The phone's identity as a name -- ``phone_ref_of`` in the state module.
+
+    THE KEY IS THE IDENTITY (2026-09-21): the phone_id split is finished. A
+    new registration's ``phone_id`` IS this ref; a legacy Guid record keeps
+    its Guid and answers to the ref too. One derivation, owned by the store,
+    so the wire and the registry cannot disagree.
+    """
+    return phone_ref_of(public_key_b64u)
+
+
+_KEY_BYTES = {"ed25519": 32, "ecdsa-p256": 64}
+
+
+def _require_canonical_key(public_key_b64u: Any, algorithm: str, *, name: str = "public_key_b64u") -> None:
+    """THE KEY'S SPELLING (hard rule 14.3): one key, one string - unpadded base64url of the raw key (ed25519 32 bytes,
+    ecdsa-p256 64 bytes X||Y, the form both shipped phones send). A re-spelled key would be a second row for one key
+    and slip past every key comparison the slot rules make."""
+    ok = isinstance(public_key_b64u, str) and re.fullmatch(r"[A-Za-z0-9_-]+", public_key_b64u) is not None
+    raw = b""
+    if ok:
+        try:
+            raw = base64.urlsafe_b64decode(public_key_b64u + "=" * (-len(public_key_b64u) % 4))
+        except ValueError:   # binascii.Error: a length no key has
+            ok = False
+        else:
+            ok = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") == public_key_b64u
+    want = _KEY_BYTES.get(algorithm)
+    if not ok or (want is not None and len(raw) != want):
+        raise BootloaderError(
+            f"registration refused: {name} must be the unpadded base64url of the raw public key "
+            f"({', '.join(f'{a} {n} bytes' for a, n in _KEY_BYTES.items())})"
+        )
+
+
+def _constant_time_compare(a: str, b: str) -> bool:
+    """Constant-time string compare for the X-Recto-Agent-Token header
+    check. Defends against timing-based agent-token guessing."""
+    if len(a) != len(b):
+        # Still walk the string to keep the timing roughly constant
+        # for length probes; the caller treats the result as boolean.
+        result = 1
+    else:
+        result = 0
+    for x, y in zip(a.encode("utf-8"), b.encode("utf-8")):
+        result |= x ^ y
+    return result == 0
+
+
+def _connection_key_matches(pattern: str, key: str) -> bool:
+    """Does one allowlist pattern admit one (already normalized) key?
+
+    Three shapes, deliberately no regex and no general globbing -- an ACL
+    is only as good as the operator's ability to read it at a glance:
+      - ``"*"``          -> allow every key (the migration escape hatch)
+      - ``"prefix-*"``   -> allow keys starting with ``prefix-``
+      - ``"anthropic"``  -> exact match
+
+    Patterns are compared case-insensitively because keys normalize to
+    lowercase; an empty or whitespace-only pattern matches nothing.
+    """
+    pat = (pattern or "").strip().lower()
+    if not pat:
+        return False
+    if pat == "*":
+        return True
+    if pat.endswith("*"):
+        prefix = pat[:-1]
+        # A bare "*" is handled above, so prefix is non-empty here.
+        return key.startswith(prefix)
+    return key == pat
+
+
+def _registered_algorithm(reg: Any, who: str) -> str:
+    """The algorithm a REGISTERED phone signs with, from its stored list.
+
+    GATE 2a (2026-08-17). Four sites read this and each re-implemented the same
+    `[0] if list else "ed25519"` fallback -- one value, five places, every copy
+    resolving silence to the software path.
+
+    WHY THIS WARNS INSTEAD OF REFUSING, and the distinction is the whole design:
+    enrollment now REFUSES an absent or empty list, which binds only phones that
+    have not registered yet. This function reads phones that ALREADY EXIST. A
+    legacy row with an empty list belongs to a real device -- possibly the
+    operator's, which is the root of trust -- and making this fatal would lock
+    it out to fix a record-keeping gap. That trade is not worth taking blind.
+
+    So it stays permissive AND becomes VISIBLE, which is the same order that
+    worked for the connections ACL today: emit the evidence, watch a window,
+    make it fatal once the window is silent. A gate flipped before its evidence
+    exists is a gate flipped on a guess.
+
+    WARNING, not INFO, deliberately: this is a defect in stored state, not
+    routine traffic, and it must survive a log level set to suppress the ACL
+    audit line.
+    """
+    algos = getattr(reg, "supported_algorithms", None)
+    if algos:
+        return algos[0]
+    logging.getLogger("recto.bootloader.enrollment").warning(
+        "registered phone %r has an EMPTY supported_algorithms list; assuming "
+        "'ed25519' to keep it working. This row predates the GATE 2a enrollment "
+        "refusal (2026-08-17) -- new registrations cannot produce it. Re-enroll "
+        "the device to state its algorithm explicitly. While any of these lines "
+        "appear, the read path CANNOT be made fatal.",
+        who,
+    )
+    return "ed25519"
+
+
+# --------------------------------------------------------------------------
+# GATE 5b -- bootloader identity derived from the operator key set.
+# --------------------------------------------------------------------------
+
+BOOTLOADER_ID_DERIVATION_V1 = "recto-bootloader-id-v1"
+BOOTLOADER_ID_PREFIX = "rb1-"
+
+# CROSS-LANGUAGE PARITY PIN. The phone MUST be able to recompute this, and the
+# phone is C#. Any reimplementation must reproduce these bytes exactly; the
+# repo already uses this pattern for the pair deep-link (see
+# recto/qr/pair.py CANONICAL_DEMO_PAIR_URL and its C# sister test).
+#   operator pubkey = bytes(range(64))  ->  the value pinned in
+#   tests/test_bootloader_identity.py::test_the_cross_language_parity_pin
+# Do not "fix" a parity mismatch by editing the pin. The pin is the contract.
+
+
+def derive_bootloader_id(
+    operator_pubkey: bytes | None,
+    member_pubkeys: "tuple[bytes, ...] | list[bytes]" = (),
+) -> str:
+    """Derive a bootloader id from the operator key set.
+
+    WHY THIS EXISTS. `bootloader_id` is the JWT audience. Configured or random,
+    it is a NAME THE PHONE IS TOLD -- so a look-alike deployment at any
+    hostname can claim any id, and the phone signs against it. Derived, the id
+    becomes a CLAIM THE PHONE CAN CHECK: recompute it from the key set and a
+    mismatch is arithmetic, not a hostname the operator has to eyeball.
+
+    THE THREE PROPERTIES, each load-bearing:
+
+    * DOMAIN SEPARATED. The hash is prefixed with a version string, so this
+      digest can never collide with some other SHA-256 over the same keys.
+      Bumping the string is how a v2 derivation stays distinguishable.
+    * ORDER INDEPENDENT. Keys are de-duplicated and sorted, so the id depends
+      on the SET, not on enumeration order -- which is not stable across
+      backends (file vs postgres) and must not change the identity.
+    * LENGTH PREFIXED. Each key is preceded by its 4-byte big-endian length.
+      Without this, {AB, C} and {A, BC} hash identically -- a concatenation
+      ambiguity that is a real (if here unlikely) forgery primitive.
+
+    Returns `rb1-<32 hex chars>` (128 bits). Truncation is deliberate: this is
+    an identifier to be compared, displayed, and typed, not a MAC. 128 bits is
+    far beyond collision reach for a set of operator keys.
+
+    Raises ValueError if there is no operator pubkey -- an unsealed bootloader
+    HAS no derived identity, and returning a plausible-looking string for one
+    would be worse than refusing.
+    """
+    if not operator_pubkey:
+        raise ValueError(
+            "cannot derive a bootloader id with no operator pubkey: an "
+            "unsealed bootloader has no derived identity"
+        )
+    keys = sorted({bytes(operator_pubkey)} | {bytes(k) for k in member_pubkeys})
+    h = hashlib.sha256()
+    h.update(BOOTLOADER_ID_DERIVATION_V1.encode("ascii"))
+    for k in keys:
+        h.update(len(k).to_bytes(4, "big"))
+        h.update(k)
+    return BOOTLOADER_ID_PREFIX + h.hexdigest()[:32]
+
+
+# WHICH SEALED MEMBERS ARE PART OF THE IDENTITY -- AN ALLOWLIST, DELIBERATELY.
+#
+# The bootloader's identity is the DEVICE set: the keys a phone can be shown
+# and can check at pairing. The passphrase member is a QUORUM member (tier 3)
+# and is deliberately NOT identity: quorum answers "who may authorise", the
+# id answers "which bootloader is this", and folding one into the other would
+# make sealing a phrase rename the bootloader.
+#
+# An allowlist rather than an exclusion: a NEW member kind entering the
+# identity derivation changes the id of every deployment that seals one --
+# that is a decision to make loudly (add the kind here, with a reason), never
+# a default inherited by whatever kind someone seals next. Excluded kinds are
+# logged at startup so the omission is visible, not silent.
+IDENTITY_MEMBER_KINDS = frozenset({"recovery-phone"})
+
+
+def collect_identity_member_pubkeys(
+    members: "Mapping[str, Any]",
+) -> "tuple[list[bytes], list[str]]":
+    """Split sealed members into (identity pubkeys, excluded kinds).
+
+    `members` is the mapping from `StateStoreBase.list_genesis_members_full`
+    (kind -> GenesisMember). Returns the pubkeys of allowlisted kinds in
+    sorted-kind order (the derivation re-sorts by key bytes anyway) plus the
+    excluded kind names for the startup log.
+    """
+    identity: list[bytes] = []
+    excluded: list[str] = []
+    for kind in sorted(members):
+        if kind in IDENTITY_MEMBER_KINDS:
+            identity.append(bytes(members[kind].pubkey))
+        else:
+            excluded.append(kind)
+    return identity, excluded
+
+
+class BootloaderConfig:
+    """Server-side config values shared across requests.
+
+    Lives on the handler class as a class attribute (set by
+    `create_server`). Threading.local would be overkill -- these
+    values don't change during the bootloader's lifetime."""
+
+    bootloader_id: str = ""
+    # GATE 5b phone-recomputation half: the EXACT inputs that produced the
+    # derived `bootloader_id`, snapshotted at the same moment the id was
+    # derived (create_server). Emitted to phones at registration as the
+    # additive `bootloader_identity` field so the id becomes a claim the
+    # phone RECOMPUTES rather than a name it is told. None when the id is
+    # not derived (unsealed bootloader) -- the field is then omitted and
+    # the phone has no claim to check. Snapshot, not a live read: id and
+    # inputs must never disagree, and a member sealed mid-life takes
+    # effect at restart exactly like the id itself.
+    bootloader_identity_inputs: "dict[str, Any] | None" = None
+    # Typed against the seam (StateStoreBase), not the file-backed
+    # concrete class -- any backend implementing the contract slots in
+    # (file-backed StateStore for single-host installs,
+    # PostgresStateStore for load-balanced multi-instance deployments).
+    state: StateStoreBase | None = None
+    # Silent-push wake dispatcher (recto.bootloader.push.PushDispatcher,
+    # production-scale wave C). None = poll-only (current default).
+    # When set, every queued PendingRequest fires a best-effort silent
+    # wake push to the target phone's registered token; polling stays
+    # the fallback path.
+    push_dispatcher: Any = None
+    # Public URL list emitted to phones at registration as
+    # `bootloader_urls` (primary first). Empty = field omitted (v1
+    # behavior). Phones persist the list so a future multi-region /
+    # failover deployment can move hosts without re-pairing -- the
+    # banked multi-bootloader-per-pairing wire extension.
+    public_urls: tuple[str, ...] = ()
+    challenges: "ChallengeStore | None" = None
+    default_session_lifetime_seconds: int = 86400  # 24h
+    default_session_max_uses: int = 1000
+    # Phase 5 Wave B: pre-shared bearer tokens for external agents
+    # submitting capability requests. Map of agent_id -> token; the
+    # capability-request endpoint requires both X-Recto-Agent-Id and
+    # X-Recto-Agent-Token headers and rejects 401 if they don't match
+    # an entry here. Empty dict (default) disables the endpoint
+    # entirely — bootloaders that don't issue capabilities to external
+    # agents leave it empty, and the endpoint returns 404.
+    capability_agent_tokens: dict[str, str] = {}
+    # Per-agent REQUESTABLE-action policy, evaluated BEFORE a request
+    # is queued for approval. Map of agent_id -> list of action keys
+    # that agent may ask for. An agent WITH an entry is deny-by-default:
+    # a capability request that NAMES any action outside its list
+    # (allow_actions, plus each group's members expanded via the
+    # manifest) is refused 403 and never reaches the approval queue.
+    # deny_actions is never subtracted first: a deny cannot cancel its
+    # own allow into a pass, because a verifier that reads allow_actions
+    # alone would grant the action the deny was meant to cancel. An
+    # agent WITHOUT an entry is unrestricted at this layer (legacy
+    # behavior — the operator's approval remains the gate). This is a
+    # pre-carding filter on what may be ASKED, not a grant of anything:
+    # nothing here mints authority, it only narrows which requests are
+    # allowed to spend the operator's attention.
+    capability_agent_requestable: dict[str, list[str]] = {}
+    # AUTH-ONLY AGENTS (2026-10-17, hard rule 15.p): agents whose entry says "capability_requests": false. They
+    # authenticate to a substrate (the user vault, say) and may raise NO capability card - refused by name before
+    # carding. Distinct from an empty requestable list, which stays a config error for the request kind.
+    capability_agent_auth_only: frozenset[str] = frozenset()
+    # Per-agent REQUESTABLE-audience policy (2026-10-04), the audience
+    # twin of the action policy above: WHERE a requested grant may be
+    # spent, as the action policy bounds WHAT it may do. Map of agent_id
+    # -> list of audience strings that agent may name in a request's
+    # `aud`. An agent WITH an entry is deny-by-default: a request whose
+    # `aud` is not a JSON array of strings, is empty, or names any
+    # audience outside the list is refused 403 and never queued. An agent
+    # WITHOUT an entry is unrestricted at this layer (legacy behavior).
+    # The strings are the deploying operator's configuration -- one per
+    # consumer, per cluster, per executor, whatever its verifiers expect
+    # -- and the substrate carries none of them: `aud` stays opaque here,
+    # is compared exactly (case included, as verify_jws compares it), and
+    # is never rewritten. Like the action policy, this narrows what may
+    # be ASKED; it grants nothing.
+    capability_agent_audiences: dict[str, list[str]] = {}
+    # Operator's expected secp256k1 public key (uncompressed, 64 raw
+    # bytes — X || Y, no 0x04 prefix). When set, the bootloader
+    # verifies the phone's capability signature recovers to this key
+    # before storing the assembled JWS. When None, only the Ed25519
+    # paired-phone envelope is checked (development convenience —
+    # production deployments MUST set this).
+    capability_operator_pubkey: bytes | None = None
+    # Default TTL for the resolved CapabilityResult. After resolution,
+    # the agent has this long to poll the result endpoint before the
+    # JWT is purged. 600s (10 min) is generous for synchronous chat-
+    # style flows; bursty fan-outs may need longer.
+    capability_result_ttl_seconds: int = 600
+    # Phase 5 Wave C part 1: capability action manifest the bootloader
+    # serves at GET /v0.4/capability/manifest. Loaded at startup via
+    # `recto.capability.manifest.load_manifest`. None means the
+    # manifest endpoint returns 404 (bootloaders that don't broker
+    # capability auth leave this unset).
+    capability_manifest: object | None = None  # ActionManifest | None
+    # Phase 5 Wave C part 1: pre-populated map of vault-readable
+    # secrets keyed by (service, secret_name) tuple. The
+    # `/v0.4/secrets/read` endpoint looks up secrets here after
+    # verifying the caller's capability JWT and evaluating the
+    # `secret:read` action against the JWT's scope. Operator
+    # populates at create_server time from whichever SecretSource
+    # backend their deployment uses (dpapi-machine in production,
+    # env in dev). Empty dict (default) disables the endpoint --
+    # returns 404 -- so bootloaders that don't expose vault secrets
+    # via HTTP have zero attack surface. v2 will wire the bootloader
+    # directly to recto.secrets.SecretSource implementations for
+    # on-demand resolution; v1 keeps the secret-resolution chain
+    # in the launcher's existing flow and the bootloader stays a
+    # simple authorization layer.
+    capability_vault_secrets: dict[tuple[str, str], str] = {}
+    # Phase 5 Wave C part 1: revocation list seed for testing. v1
+    # accepted in-memory revocation entries via this kwarg; v2 (Wave
+    # C part 2) moves the source-of-truth to the StateStore's
+    # persistent revocation list (revocations.json under the state
+    # dir). This kwarg now seeds the StateStore at create_server
+    # time so existing tests keep passing -- production deployments
+    # add revocations via POST /v0.4/capability/revoke instead, and
+    # they survive bootloader restart.
+    capability_revocation_jtis: set[str] = set()
+    # Phase 5 Wave C part 2: pre-shared operator token for the
+    # POST /v0.4/capability/revoke endpoint. When set, the endpoint
+    # requires an `X-Recto-Operator-Token` header with this exact
+    # value. When None / empty, the revoke endpoint returns 404 --
+    # bootloaders that don't expose revocation via HTTP can run
+    # revocation entirely operator-side via direct StateStore writes
+    # (or via Wave D's phone-mediated revocation flow when that
+    # ships). v1 uses a pre-shared token rather than capability-JWT
+    # gating because revocation needs to work for the chicken-and-
+    # egg case of "revoke a compromised JWT" -- gating revocation
+    # itself behind a JWT would create a cycle. Future iteration
+    # may layer capability:revoke-other tier-3 enforcement ON TOP
+    # of the operator token (revocation requires BOTH), but v1
+    # keeps it simple.
+    capability_operator_token: str | None = None
+    # Phase 5 Wave C part 3: operator-administered registry of
+    # AppContext entries keyed by principal-id. The bootloader injects
+    # the matching AppContext into every PendingRequest at queue time
+    # so the phone can show the app's icon + name + description at
+    # the top of every approval card.
+    #
+    # Lookup order in the queue handlers:
+    #   1. cap_agent_id when set (capability_request flow) -- the
+    #      X-Recto-Agent-Id header value identifies which app sent
+    #      the request.
+    #   2. service when cap_agent_id is None (other phone-rendered
+    #      request kinds) -- the supervised child's service name from
+    #      service.yaml is the app identifier for non-capability flows.
+    #
+    # Empty / unset means no AppContext is injected; PendingRequests
+    # carry app_context=None and the phone renders an "Unknown app"
+    # warning banner. Operator-side discipline is to register every
+    # consumer's AppContext at deploy time so operators never see the
+    # warning in production.
+    principal_apps: dict[str, AppContext] = {}
+
+    # Phase H end-user device pairing (2026-05-19). Map of consumer
+    # base URLs (e.g. "https://consumer.example.com") -> the webhook
+    # token the consumer's /api/v1/devices/pairing/complete endpoint
+    # requires in its X-Openclaw-Token header. The bootloader's new
+    # POST /v0.4/devices/pair endpoint is a thin relay: it takes the
+    # user-supplied {consumer_base_url, pairing_code, user_pubkey_hex,
+    # user_jws}, looks up the matching webhook token in this dict, and
+    # forwards the payload to the consumer's /complete endpoint with
+    # the token applied.
+    #
+    # Empty dict (default) disables the endpoint entirely -- bootloaders
+    # that don't broker end-user device pairing for any consumer leave
+    # it empty, and POST /v0.4/devices/pair returns 404. Sister of
+    # capability_agent_tokens / capability_vault_secrets patterns:
+    # consumers register their webhook tokens at deploy time, the
+    # bootloader stays a thin authorization layer.
+    #
+    # Security posture: this dict holds OPERATOR-LEVEL secrets (each
+    # consumer's webhook secret authorizes the bootloader to bind ANY
+    # user's master pubkey to ANY pairing code on that consumer). The
+    # user's JWS self-attestation (verified at the consumer's /complete
+    # endpoint) is the load-bearing trust gate that prevents the
+    # bootloader from binding pubkeys it doesn't actually hold the
+    # signing keys for; the X-Openclaw-Token here is defense-in-depth
+    # ("the request came through THIS authorized bootloader").
+    devices_pair_consumer_webhook_tokens: dict[str, str] = {}
+
+    # Optional relay-URL overrides.  When a consumer's ``relay_url`` is
+    # set in the manifest, the bootloader forwards to that URL instead of
+    # ``base_url``.  The phone still sends the original ``base_url`` as
+    # ``consumer_base_url`` in the request body, so the lookup key stays
+    # the same; only the outbound HTTP target changes.  Motivation:
+    # three-zone architecture (commitment #17) — the phone knows the
+    # .com user-zone URL, but server-to-server relay must traverse the
+    # .ai agent-zone hostname to bypass the WAF.
+    devices_pair_consumer_relay_urls: dict[str, str] = {}
+
+    # The bootloader's own secp256k1 key (32 bytes) for signing its pairing
+    # RESULT; consumers pin the matching public key. None = no signed result.
+    devices_pair_signing_key: bytes | None = None
+    devices_pair_signing_pubkey_hex: str | None = None
+
+    # Phase H optional: per-call timeout (seconds) for the bootloader's
+    # outbound request to the consumer's /complete endpoint. 15s is
+    # generous for a single DB write + JWS verify; bumps if a future
+    # consumer's /complete grows slower (e.g. on-chain attestation
+    # writeback).
+    devices_pair_consumer_timeout_seconds: float = 15.0
+
+    # Recto Connections Substrate (2026-06-13). Path to the connections
+    # metadata sidecar JSON (sister of phones.json under the state dir).
+    # When None (default), ALL /v0.4/connections/* endpoints return 404 --
+    # the substrate is opt-in, so bootloaders that don't broker connection
+    # management for any consumer carry zero attack surface.
+    connections_path: str | None = None
+    # Map of agent_id -> the connections SERVICE that agent may READ. A
+    # consuming app (identified by its X-Recto-Agent-Id header) can read
+    # only the service it's mapped to here, so one consumer's agent can't
+    # read another consumer's provider keys, and vice versa. Reads (list
+    # metadata + fetch a
+    # secret value) are agent-token-gated AND service-scoped via this map.
+    # Writes (upsert/rotate/enable/delete) are OPERATOR-gated via
+    # capability_operator_token and may target any service, so they do NOT
+    # consult this map. Empty (default) means no agent may read connections
+    # even when connections_path is set -- the operator must register each
+    # consumer's agent->service mapping at deploy time.
+    connections_agent_services: dict[str, str] = {}
+    # Map of agent_id -> the KEY PATTERNS that agent may read the VALUE of
+    # (2026-07-28). The service map above answers "whose keys?"; this map
+    # answers "which of them?" -- without it, an agent token mapped to a
+    # service is a skeleton key to EVERY secret in that service's
+    # namespace (`secret?key=<anything>`), which for a platform service
+    # means its AI-provider, payment, edge and push credentials all at
+    # once. Patterns are exact keys ("anthropic"), trailing-`*` prefixes
+    # ("media-*"), or the bare wildcard "*" (allow-all -- an explicit,
+    # logged migration escape hatch, never a default).
+    #
+    # DEFAULT-DENY: an agent with no entry here reads no secret values at
+    # all. Reads of secret-free METADATA (GET /v0.4/connections) are
+    # deliberately NOT filtered by this map -- discovery stays whole so a
+    # consumer can still see which connections exist and whether they
+    # carry a value; only the VALUE read is gated.
+    connections_agent_keys: dict[str, list[str]] = {}
+    # Enforcement switch for the allowlist above. TRUE BY DEFAULT (flipped
+    # 2026-08-09): an unlisted key is refused with 403 key_not_allowed.
+    #
+    # Set False to run the gate in AUDIT mode: every would-be denial is
+    # logged at WARNING with the agent, service and key, and the read still
+    # SUCCEEDS. That mode exists for a real reason -- it lets an operator
+    # discover the live key set from logs, including keys that are not
+    # statically enumerable in the consuming app (connection keys carried in
+    # DB-driven media-source configs, say) -- and it remains available. What
+    # changed is which way the switch points when nobody has touched it.
+    #
+    # Why it was flipped: audit was the DEFAULT, so a deployment that never
+    # read this docstring served every unlisted secret and logged a warning
+    # nobody was watching. A boundary whose default is open is a boundary
+    # that is open, and the per-key allowlist is the VAULT role's entire
+    # crossing test -- a fetch with a valid token but an unlisted key must
+    # return refusal, not the secret. It could not pass while this was False.
+    #
+    # The migration cost is real and is deliberately paid on the safe side:
+    # an existing deployment that never set this flag and relies on unlisted
+    # keys will start getting 403s. That is a loud, legible failure naming
+    # the exact key, which is recoverable in one config edit -- as against
+    # the quiet failure it replaces, which was indistinguishable from working.
+    # With the allowlist empty, default-deny means NOTHING is readable; the
+    # startup posture log says so at WARNING rather than letting a fresh
+    # install look mysteriously broken.
+    connections_key_acl_enforce: bool = True
+    # Injectable secret backend factory (service_name -> WritableSecretSource)
+    # for the connections substrate. None (default) means the handlers use
+    # recto.connections.manage's production DpapiMachineSource factory -- the
+    # right backend on the Windows bootloader host. Tests inject an in-memory
+    # double so the connections endpoints exercise on a non-Windows box.
+    connections_secret_source_factory: Any = None
+
+    # Recto User Vault Substrate (2026-07-25). Per-USER secret storage
+    # ("bring your own key") -- the user-tier sister of the connections
+    # substrate. Path to the user-vault metadata sidecar JSON (sister of
+    # connections.json under the state dir). When None (default), ALL
+    # /v0.4/user-vault/* endpoints return 404 -- opt-in, zero attack
+    # surface for bootloaders that don't broker user keys.
+    user_vault_path: str | None = None
+    # Map of agent_id -> the PLATFORM namespace that agent may operate
+    # on. A consuming platform (identified by its X-Recto-Agent-Id
+    # header) reads/writes user entries only within the platform it's
+    # mapped to here, always further scoped by the X-Recto-Subject claim
+    # (an opaque handle) it supplies. ALL FOUR user-vault verbs are agent-gated (divergence
+    # from connections, where writes are operator-gated): user-vault
+    # writes are the platform acting for its own user at runtime.
+    user_vault_agent_platforms: dict[str, str] = {}
+    # Injectable secret backend factory for user-vault values. Same seam
+    # as connections_secret_source_factory: None means DpapiMachineSource
+    # (Windows host); containers inject a file-backed factory; tests
+    # inject an in-memory double.
+    user_vault_secret_source_factory: Any = None
+    # Map of user-vault PLATFORM namespace -> the CONSUMER url its users' phones are bound under (R-series step 3).
+    # Entries key by platform; grants and member bindings key by consumer. A platform with no entry raises no grant
+    # request: the bootloader never guesses which binding a platform means.
+    user_vault_platform_consumers: dict[str, str] = {}
+    # The open grant requests (recto.user_vault.grant_request.GrantRequestBook) - in memory only, never the state
+    # store (hard rule 15.z). Set by create_server when the user vault is on.
+    user_vault_grant_requests: Any = None
+    # THE OWNER RESET'S WINDOW (hard rule 14.4/14.7): how long a started reset waits, carded and cancellable, before
+    # the host may arm it. 72 h; a test bootloader may shorten it, a production one never does.
+    owner_reset_window_seconds: int = 72 * 3600
+    # The arm code is kept as an HMAC under this per-process key, never a bare hash of six digits; a restart drops the
+    # key, so an armed code dies with the process and the host arms again (with the passphrase).
+    owner_reset_code_key: bytes = b""
+    # THE ANCHOR (hard rule 14.7): the sealed id the operator expects, set OUTSIDE the state dir (the launcher's
+    # RECTO_EXPECT_SEALED_ID). When set, a chain not sealed with exactly this id refuses the start and every act.
+    expect_sealed_id: str | None = None
+    # The id THIS start derived from the operator key and the identity members (None when nothing was derived): the
+    # only id `seal-id` ever seals.
+    derived_bootloader_id: str | None = None
+
+    # Signed-poll enforcement mode (2026-08-13, phone_id split). Gates
+    # the possession-of-phone_id read surfaces (GET /v0.4/pending and
+    # POST /v0.4/manage/push_token). GET /v0.4/manage/phones and
+    # owner-slot cards on /v0.4/pending need a verified poll signature
+    # in EVERY mode (hard rule 14.2):
+    #   - "off":      no signature processing at all (pre-split shape).
+    #   - "advisory": DEFAULT. All polls allowed; each one is logged as
+    #                 signed-valid / signed-invalid / unsigned (verdicts
+    #                 only -- never header values). The evidence window.
+    #   - "required": unsigned polls 401 poll_signature_required; polls
+    #                 with a bad/stale/wrong-key signature 401
+    #                 poll_signature_invalid. Possession of the
+    #                 phone_id string alone no longer reads anything.
+    # Default is advisory, NOT required: Build 12 phones in both stores
+    # poll bare (Hard Rule #1 back-compat) -- the flip to required is an
+    # operator ceremony after the advisory evidence window shows every
+    # live phone signing (RECURVE pattern).
+    signed_poll_mode: str = "advisory"
+    # THE OWNER SLOTS (hard rule 14.4, amended). The agents allowed to mint OWNER pairing codes (an agent entry's
+    # "may_mint_owner_codes": true); every other agent mints member codes only. How long an approval, once given,
+    # waits for the new phone's second pass. The wrong-code limiter (per public client; never a private-network caller).
+    owner_code_minters: frozenset = frozenset()
+    owner_approval_ttl_seconds: int = OWNER_APPROVAL_TTL_SECONDS
+    code_limiter: Any = None
+
+
+class ChallengeStore:
+    """Store of one-time challenges.
+
+    Two challenge types share the same TTL store:
+    - Registration challenges (60s TTL, single use).
+    - Pairing codes (300s TTL, single use, 6-digit human-readable).
+
+    Since 2026-07 this is a thin adapter over the injected
+    ``StateStoreBase`` (which owns challenge persistence semantics per
+    backend): the file backend keeps challenges in-memory (restart
+    invalidates -- re-run `recto v0.4 register` for a fresh code), the
+    postgres backend persists them so a pairing code survives replica
+    restarts and works across instances behind a load balancer.
+
+    Constructed without a state store (legacy/test paths), it falls
+    back to its original self-contained in-memory dicts.
+    """
+
+    def __init__(self, state: "StateStoreBase | None" = None) -> None:
+        self._state = state
+        # Set by create_server: told of every pairing code minted here, so the wrong-code limiter can count the public
+        # failures each code sits through (owner_slots.CodeAttemptLimiter.stamp).
+        self.code_minted: "Any" = None
+        # The stateless store's own lock: every read, purge and write of the dicts below runs under it (the state store
+        # has its own). code_minted is called after it is released - the limiter's lock is always taken first.
+        self._lock = threading.RLock()
+        self._challenges: dict[str, int] = {}  # value -> expires_at_unix
+        self._pairing_codes: dict[str, int] = {}  # code -> expires_at_unix
+        self._member_pairing_codes: dict[str, int] = {}  # THE MEMBER PLANE (2026-09-30)
+        self._member_challenges: dict[str, int] = {}
+        # code or challenge -> the (consumer, subject) it was minted for (2026-10-17, hard rule 15.n)
+        self._member_bindings: dict[str, tuple[str, str] | None] = {}
+        self._owner_challenges: dict[str, int] = {}  # THE OWNER SLOTS (hard rule 14.4, amended)
+
+    def issue_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_challenge(ttl_seconds)
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._purge()
+            self._challenges[c] = exp
+            return c, exp
+
+    def consume_challenge(self, c: str) -> bool:
+        """Return True if the challenge exists and is unexpired; remove
+        it on success (single-use)."""
+        if self._state is not None:
+            return self._state.consume_challenge(c)
+        with self._lock:
+            self._purge()
+            exp = self._challenges.pop(c, None)
+            return exp is not None and time.time() < exp
+
+    def issue_pairing_code(self, ttl_seconds: int = 300) -> tuple[str, int]:
+        if self._state is not None:
+            code, exp = self._state.issue_pairing_code(ttl_seconds)
+        else:
+            with self._lock:   # draw and insert under one hold, so two mints never draw one code
+                code = self._unique_code()
+                exp = int(time.time()) + ttl_seconds
+                self._pairing_codes[code] = exp
+        self._minted(code, exp)
+        return code, exp
+
+    def _minted(self, code: str, expires_at: int) -> None:
+        if self.code_minted is not None:
+            self.code_minted(code, expires_at)
+
+    def _unique_code(self) -> str:
+        # 6-digit human-readable, unique across owner and member codes (the GET tries the owner code first). The caller
+        # holds self._lock.
+        self._purge()
+        for _ in range(64):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            if code not in self._pairing_codes and code not in self._member_pairing_codes:
+                return code
+        raise RuntimeError("no free pairing code after 64 draws")
+
+    def consume_pairing_code(self, code: str) -> bool:
+        if self._state is not None:
+            return self._state.consume_pairing_code(code)
+        with self._lock:
+            self._purge()
+            exp = self._pairing_codes.pop(code, None)
+            return exp is not None and time.time() < exp
+
+    # THE MEMBER PLANE (2026-09-30): a consumer's member code, and the registration challenge it buys, are their own
+    # kind - a member registers BESIDE the business slots and never answers a slot question.
+    def issue_member_pairing_code(
+        self, ttl_seconds: int = 300, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
+        if self._state is not None:
+            code, exp = self._state.issue_member_pairing_code(ttl_seconds, binding)
+        else:
+            with self._lock:   # draw and insert under one hold, so two mints never draw one code
+                code = self._unique_code()
+                exp = int(time.time()) + ttl_seconds
+                self._member_pairing_codes[code] = exp
+                self._member_bindings[code] = binding
+        self._minted(code, exp)
+        return code, exp
+
+    def consume_member_pairing_code(self, code: str) -> tuple[str, str] | None:
+        """Spend a member code; the (consumer, subject) it was minted for, or None (unknown, spent, expired)."""
+        if self._state is not None:
+            return self._state.consume_member_pairing_code(code)
+        with self._lock:
+            self._purge()
+            exp = self._member_pairing_codes.pop(code, None)
+            binding = self._member_bindings.pop(code, None)
+            return binding if exp is not None and time.time() < exp else None
+
+    def issue_member_challenge(
+        self, ttl_seconds: int = 60, binding: tuple[str, str] | None = None
+    ) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_member_challenge(ttl_seconds, binding)
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._member_challenges[c] = exp
+            self._member_bindings[c] = binding
+            return c, exp
+
+    def is_member_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.is_member_challenge(c)
+        with self._lock:
+            exp = self._member_challenges.get(c)
+            return exp is not None and time.time() < exp
+
+    def consume_member_challenge(self, c: str) -> tuple[str, str] | None:
+        """Spend a member challenge; its (consumer, subject) binding, or None (unknown, spent, expired)."""
+        if self._state is not None:
+            return self._state.consume_member_challenge(c)
+        with self._lock:
+            self._purge()
+            exp = self._member_challenges.pop(c, None)
+            binding = self._member_bindings.pop(c, None)
+            return binding if exp is not None and time.time() < exp else None
+
+    # THE OWNER SLOTS (hard rule 14.4, amended): an OWNER code buys an OWNER challenge, and only that kind registers
+    # into an owner slot. A challenge fetched with no code is the plain kind: it serves revoke and never registers.
+    def issue_owner_challenge(self, ttl_seconds: int = 60) -> tuple[str, int]:
+        if self._state is not None:
+            return self._state.issue_owner_challenge(ttl_seconds)
+        with self._lock:
+            c = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            exp = int(time.time()) + ttl_seconds
+            self._owner_challenges[c] = exp
+            return c, exp
+
+    def is_owner_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.is_owner_challenge(c)
+        with self._lock:
+            exp = self._owner_challenges.get(c)
+            return exp is not None and time.time() < exp
+
+    def consume_owner_challenge(self, c: str) -> bool:
+        if self._state is not None:
+            return self._state.consume_owner_challenge(c)
+        with self._lock:
+            self._purge()
+            exp = self._owner_challenges.pop(c, None)
+            return exp is not None and time.time() < exp
+
+    def _purge(self) -> None:
+        now = time.time()
+        self._challenges = {c: e for c, e in self._challenges.items() if e > now}
+        self._pairing_codes = {c: e for c, e in self._pairing_codes.items() if e > now}
+        self._member_pairing_codes = {c: e for c, e in self._member_pairing_codes.items() if e > now}
+        self._member_challenges = {c: e for c, e in self._member_challenges.items() if e > now}
+        self._member_bindings = {
+            v: b for v, b in self._member_bindings.items()
+            if v in self._member_pairing_codes or v in self._member_challenges
+        }
+        self._owner_challenges = {c: e for c, e in self._owner_challenges.items() if e > now}
+
+
+class BootloaderHandler(BaseHTTPRequestHandler):
+    """HTTP request handler implementing the v0.4 endpoint set."""
+
+    # Override the default banner to not leak Python version.
+    server_version = "RectoBootloader/0.4"
+    sys_version = ""
+
+    config: BootloaderConfig = BootloaderConfig()
+
+    # ------------------------------------------------------------------
+    # Request dispatch
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Cluster registry -- /v0.5/clusters/* .
+    # Config-presence gated like every surface here: deployments that
+    # leave clusters_registry unset keep all endpoints 404. That gate IS
+    # the two-deployment / one-codebase split: one deployment sets it
+    # (the registry writer) and configures nothing agent-facing; another
+    # leaves it unset and serves the agent surfaces. Registry laws: one
+    # writer (runtime consumers read the exported projection file, never
+    # these endpoints); leases catch the dying that never report (reap
+    # persists the orphan transitions); records hold pointers, never
+    # secret values (the heartbeat token is returned exactly once at
+    # register and stored only as a hash).
+    # ------------------------------------------------------------------
+    _clusters_lock = threading.Lock()
+
+    def _clusters_or_404(self):
+        registry = getattr(self.config, "clusters_registry", None)
+        if registry is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        return registry
+
+    def _clusters_spawn_authed(self) -> bool:
+        supplied = self.headers.get("X-Recto-Spawn-Token", "").strip()
+        expected = getattr(self.config, "clusters_spawn_token", None) or ""
+        if not supplied or not expected or not _constant_time_compare(supplied, expected):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "spawn_token_required"})
+            return False
+        return True
+
+    def _handle_clusters_list(self) -> None:
+        registry = self._clusters_or_404()
+        if registry is None:
+            return
+        if not self._clusters_spawn_authed():
+            return
+        with self._clusters_lock:
+            clusters = registry.list_clusters()
+        self._send_json(HTTPStatus.OK, {"clusters": clusters})
+
+    def _handle_clusters_register(self, body: dict[str, Any]) -> None:
+        registry = self._clusters_or_404()
+        if registry is None:
+            return
+        if not self._clusters_spawn_authed():
+            return
+        try:
+            with self._clusters_lock:
+                rec, token = registry.register(
+                    region=str(body.get("region", "")),
+                    ordinal=str(body.get("ordinal", "")),
+                    color=str(body.get("color", "")),
+                    endpoints=body.get("endpoints") or {},
+                    metadata=body.get("metadata") or {},
+                    lease_ttl_seconds=body.get("lease_ttl_seconds"),
+                )
+        except ClusterRegistryError as e:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "cluster_registry", "detail": str(e)},
+            )
+            return
+        payload = rec.public_view()
+        payload["heartbeat_token"] = token  # returned exactly once
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_clusters_heartbeat(self, body: dict[str, Any]) -> None:
+        registry = self._clusters_or_404()
+        if registry is None:
+            return
+        token = self.headers.get("X-Recto-Cluster-Token", "").strip()
+        try:
+            with self._clusters_lock:
+                rec = registry.heartbeat(
+                    str(body.get("cluster_id", "")),
+                    token,
+                    endpoints=body.get("endpoints") or None,
+                    metadata=body.get("metadata") or None,
+                )
+        except ClusterRegistryError as e:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "cluster_registry", "detail": str(e)},
+            )
+            return
+        self._send_json(HTTPStatus.OK, rec.public_view())
+
+    def _handle_clusters_retire(self, body: dict[str, Any]) -> None:
+        registry = self._clusters_or_404()
+        if registry is None:
+            return
+        token = self.headers.get("X-Recto-Cluster-Token", "").strip()
+        try:
+            with self._clusters_lock:
+                rec = registry.retire(
+                    str(body.get("cluster_id", "")),
+                    token,
+                    reason=str(body.get("reason", "retired")),
+                )
+        except ClusterRegistryError as e:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "cluster_registry", "detail": str(e)},
+            )
+            return
+        self._send_json(HTTPStatus.OK, rec.public_view())
+
+    def _handle_clusters_reap(self) -> None:
+        registry = self._clusters_or_404()
+        if registry is None:
+            return
+        if not self._clusters_spawn_authed():
+            return
+        with self._clusters_lock:
+            newly = registry.reap()
+        self._send_json(HTTPStatus.OK, {"orphaned": newly})
+
+    def do_GET(self) -> None:
+        try:
+            url = urlparse(self.path)
+            pairs = [kv for part in re.split(r"[&;]", url.query) for kv in parse_qsl(part, keep_blank_values=True)]
+            shown = "&".join(
+                f"{quote(name, safe='')}=" + ("***" if "code" in name.lower() else quote(value, safe=''))
+                for name, value in pairs
+            )
+            print(f"[bootloader] GET {url.path}{'?' + shown if shown else ''}", flush=True)
+            if url.path == "/v0.4/registration_challenge":
+                self._handle_registration_challenge(url)
+            elif url.path == "/v0.4/pending":
+                self._handle_pending(url)
+            elif url.path == "/v0.4/manage/phones":
+                self._handle_manage_phones(url)
+            elif url.path == "/v0.4/health":
+                self._handle_health()
+            elif url.path == "/v0.4/attest":
+                self._handle_attest(url)
+            elif url.path == "/v0.4/version":
+                self._handle_version()
+            elif url.path.startswith("/v0.4/capability/result/"):
+                request_id = url.path[len("/v0.4/capability/result/"):]
+                self._handle_capability_result(request_id)
+            elif url.path == "/v0.4/capability/manifest":
+                self._handle_capability_manifest()
+            elif url.path == "/v0.4/capability/revocations":
+                self._handle_capability_revocations()
+            elif url.path.startswith("/v0.4/profile/result/"):
+                request_id = url.path[len("/v0.4/profile/result/"):]
+                self._handle_profile_create_result(request_id)
+            elif url.path.startswith("/v0.4/profile/add-device-result/"):
+                request_id = url.path[
+                    len("/v0.4/profile/add-device-result/"):
+                ]
+                self._handle_profile_add_device_result(request_id)
+            elif url.path.startswith("/v0.4/profile/revoke-device-result/"):
+                request_id = url.path[
+                    len("/v0.4/profile/revoke-device-result/"):
+                ]
+                self._handle_profile_revoke_device_result(request_id)
+            elif url.path == "/v0.4/connections":
+                self._handle_connections_list(url)
+            elif url.path == "/v0.4/connections/secret":
+                self._handle_connections_secret(url)
+            elif url.path == "/v0.4/user-vault":
+                self._handle_user_vault_list(url)
+            elif url.path == "/v0.4/user-vault/release":
+                self._handle_user_vault_release(url)
+            elif url.path == "/v0.4/user-vault/grant-request":
+                self._handle_user_vault_grant_request_status(url)
+            elif url.path == "/v0.4/genesis/chain":
+                self._top_plane_call(self._handle_genesis_chain)
+            elif url.path == "/v0.4/top-plane/act":
+                self._top_plane_call(lambda: self._handle_top_plane_act_status(url))
+            elif url.path == "/v0.4/owner/enroll/pending":
+                self._top_plane_call(self._handle_owner_enroll_pending)
+            elif url.path == "/v0.4/owner/reset":
+                self._top_plane_call(lambda: self._handle_owner_reset_status(url))
+            elif url.path == "/v0.5/clusters":
+                self._handle_clusters_list()
+            else:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        except RegistryLockUnavailable as e:
+            print(f"[bootloader] registry lock unavailable on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "registry_busy", "detail": str(e)})
+        except top_plane.TopPlaneRefused as e:
+            self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+        except BootloaderError as e:
+            print(f"[bootloader] BootloaderError on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bootloader_error", "detail": str(e)})
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"[bootloader] EXCEPTION on {url.path}: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "internal", "detail": type(e).__name__},
+            )
+
+    def do_POST(self) -> None:
+        try:
+            url = urlparse(self.path)
+            body = self._read_json_body()
+            print(f"[bootloader] POST {url.path}", flush=True)
+            if url.path == "/v0.4/register":
+                self._handle_register(body)
+            elif url.path == "/v0.4/issue_session":
+                self._handle_issue_session(body)
+            elif url.path.startswith("/v0.4/respond/"):
+                request_id = url.path[len("/v0.4/respond/"):]
+                self._handle_respond(request_id, body)
+            elif url.path == "/v0.4/capability/request":
+                self._handle_capability_request(body)
+            elif url.path == "/v0.4/capability/revoke":
+                self._handle_capability_revoke(body)
+            elif url.path == "/v0.4/pairing/code":
+                self._handle_mint_pairing_code(body)
+            elif url.path == "/v0.4/manage/push_token":
+                self._handle_push_token_update(body)
+            elif url.path == "/v0.4/manage/phones/revoke":
+                self._handle_revoke_phone(body)
+            elif url.path == "/v0.4/secrets/read":
+                self._handle_secret_read(body)
+            elif url.path == "/v0.4/devices/pair":
+                self._handle_devices_pair(body)
+            elif url.path == "/v0.4/devices/unpair":
+                self._handle_devices_unpair(body)
+            elif url.path == "/v0.4/profile/create":
+                self._handle_profile_create(body)
+            elif (
+                url.path.startswith("/v0.4/profile/")
+                and url.path.endswith("/add-device")
+            ):
+                profile_id = url.path[
+                    len("/v0.4/profile/"):-len("/add-device")
+                ]
+                self._handle_profile_add_device(profile_id, body)
+            elif (
+                url.path.startswith("/v0.4/profile/")
+                and url.path.endswith("/revoke-device")
+            ):
+                profile_id = url.path[
+                    len("/v0.4/profile/"):-len("/revoke-device")
+                ]
+                self._handle_profile_revoke_device(profile_id, body)
+            elif url.path == "/v0.4/connections":
+                self._handle_connections_upsert(body)
+            elif url.path == "/v0.4/connections/enable":
+                self._handle_connections_enable(body)
+            elif url.path == "/v0.4/connections/delete":
+                self._handle_connections_delete(body)
+            elif url.path == "/v0.4/connections/act":
+                self._handle_connections_act(body)
+            elif url.path == "/v0.4/user-vault/set":
+                self._handle_user_vault_set(body)
+            elif url.path == "/v0.4/user-vault/delete":
+                self._handle_user_vault_delete(body)
+            elif url.path == "/v0.4/user-vault/grant":
+                self._handle_user_vault_grant(body)
+            elif url.path == "/v0.4/user-vault/revoke":
+                self._handle_user_vault_revoke(body)
+            elif url.path == "/v0.4/user-vault/revoke-key":
+                self._handle_user_vault_revoke_key(body)
+            elif url.path == "/v0.4/user-vault/grants":
+                self._handle_user_vault_grants_list(body)
+            elif url.path == "/v0.4/user-vault/grant-request":
+                self._handle_user_vault_grant_request(body)
+            elif url.path == "/v0.4/user-vault/grant-request/deny":
+                self._handle_user_vault_grant_request_deny(body)
+            elif url.path == "/v0.4/top-plane/open":
+                self._top_plane_call(lambda: self._handle_top_plane_open(body))
+            elif url.path == "/v0.4/owner/enroll/passphrase":
+                self._top_plane_call(lambda: self._handle_owner_enroll_passphrase(body))
+            elif url.path == "/v0.4/owner/reset/start":
+                self._top_plane_call(lambda: self._handle_owner_reset_start(body))
+            elif url.path == "/v0.4/owner/reset/arm":
+                self._top_plane_call(lambda: self._handle_owner_reset_arm(body))
+            elif url.path == "/v0.4/owner/reset/complete":
+                self._top_plane_call(lambda: self._handle_owner_reset_complete(body))
+            elif url.path == "/v0.4/owner/reset/abort":
+                self._top_plane_call(lambda: self._handle_owner_reset_abort(body))
+            elif url.path == "/v0.5/clusters/register":
+                self._handle_clusters_register(body)
+            elif url.path == "/v0.5/clusters/heartbeat":
+                self._handle_clusters_heartbeat(body)
+            elif url.path == "/v0.5/clusters/retire":
+                self._handle_clusters_retire(body)
+            elif url.path == "/v0.5/clusters/reap":
+                self._handle_clusters_reap()
+            else:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        except RegistryLockUnavailable as e:
+            print(f"[bootloader] registry lock unavailable on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "registry_busy", "detail": str(e)})
+        except top_plane.TopPlaneRefused as e:
+            self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+        except BootloaderError as e:
+            print(f"[bootloader] BootloaderError on {url.path}: {e}", flush=True)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bootloader_error", "detail": str(e)})
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"[bootloader] EXCEPTION on {url.path}: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "internal", "detail": type(e).__name__},
+            )
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/health
+    # ------------------------------------------------------------------
+
+    def _handle_health(self) -> None:
+        cfg = self.config
+        body: dict[str, Any] = {
+            "ok": True,
+            "bootloader_id": cfg.bootloader_id,
+            "v0_4_protocol": PROTOCOL_VERSION,
+        }
+        if cfg.devices_pair_signing_pubkey_hex:
+            # Public by nature; consumers pin it out of band, never from here.
+            body["devices_pair_pubkey"] = cfg.devices_pair_signing_pubkey_hex
+        self._send_json(HTTPStatus.OK, body)
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/attest?nonce=<b64u>  -- the server's identity, proven
+    # ------------------------------------------------------------------
+
+    def _handle_attest(self, url) -> None:
+        """Prove possession of this bootloader's signing key over a phone nonce.
+
+        WHY THIS EXISTS (2026-09-16). The phone used to pin the TLS leaf's
+        SPKI at pairing time. Cloudflare reissued the edge certificate on its
+        own schedule and every paired phone lost the bootloader below HTTP,
+        with no path back but a hand re-pair. A leaf is the vendor's lease,
+        not our identity (the 09-03 feed-signing lesson, one layer down).
+        Identity is THIS key: minted by us, rotated by us, published on
+        /v0.4/health, pinned by the platform and -- from this build -- by the
+        phone at pairing. A phone that sees the TLS chain change asks here
+        with a fresh nonce; a signature over that nonce by the pinned key
+        means the server is still ours, whatever certificate fronts it.
+
+        Shape: an ES256K capability JWS (the phone already verifies these),
+        iss/sub = bootloader:<id>, aud = ["recto-phone"], jti = the nonce,
+        cap.scope.payload_sha256 = sha256(nonce bytes), allow_actions =
+        [ATTEST_ACTION], 120 s window. 503 when this bootloader holds no key
+        (an unsigned bootloader cannot prove anything -- the phone treats
+        that as unverifiable, never as verified).
+        """
+        cfg = self.config
+        if cfg.devices_pair_signing_key is None:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "attest_unavailable",
+                 "detail": "this bootloader holds no signing key (RECTO_DEVICES_PAIR_SIGNING_KEY_FILE)"},
+            )
+            return
+        params = parse_qs(url.query)
+        nonce_b64u = (params.get("nonce") or [""])[0].strip()
+        try:
+            pad = "=" * (-len(nonce_b64u) % 4)
+            nonce_bytes = base64.urlsafe_b64decode(nonce_b64u + pad) if nonce_b64u else b""
+        except (ValueError, TypeError):
+            nonce_bytes = b""
+        if not (16 <= len(nonce_bytes) <= 64):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_nonce", "detail": "nonce must be base64url of 16..64 bytes"},
+            )
+            return
+
+        from recto.capability.pair_record import ATTEST_ACTION, ATTEST_WINDOW_SECONDS, CLOCK_SKEW_SECONDS
+        from recto.capability.signing import mint_jws
+        from recto.capability.types import CapabilityClaims, CapabilityClause, CapabilityScope
+
+        now = int(time.time())
+        registry_version = "0"
+        if cfg.capability_manifest is not None:
+            registry_version = str(getattr(cfg.capability_manifest, "version", registry_version))
+        claims = CapabilityClaims(
+            iss=f"bootloader:{cfg.bootloader_id}",
+            sub=f"bootloader:{cfg.bootloader_id}",
+            aud=["recto-phone"],
+            iat=now,
+            nbf=now - CLOCK_SKEW_SECONDS,
+            exp=now + ATTEST_WINDOW_SECONDS,
+            jti=f"attest-{nonce_b64u}",
+            cap=CapabilityClause(
+                tier=0,
+                registry_version=registry_version,
+                scope=CapabilityScope(payload_sha256=hashlib.sha256(nonce_bytes).hexdigest()),
+                allow_actions=[ATTEST_ACTION],
+            ),
+            purpose="bootloader attest",
+            max_uses=1,
+        )
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "bootloader_id": cfg.bootloader_id,
+                "nonce": nonce_b64u,
+                "devices_pair_pubkey": cfg.devices_pair_signing_pubkey_hex,
+                "attest_jws": mint_jws(claims, cfg.devices_pair_signing_key),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/version  -- GATE 3 prerequisite #2
+    # ------------------------------------------------------------------
+
+    def _handle_version(self) -> None:
+        """What is actually running here, answerable without host access.
+
+        WHY THIS EXISTS. Until 2026-08-18 the only way to learn which commit a
+        bootloader was serving was to read the container image label from the
+        Docker host -- which found, on its first use, a container that had been
+        serving a PRE-GENESIS build for weeks while CI reported green. That
+        check is good and it is not enough: it requires a shell on the machine,
+        so no phone, no client, and no remote operator could ask.
+
+        `recto --version` could not answer either. It read a hardcoded
+        `__version__` that said 0.1.0.dev0 while pyproject said 1.0.0 -- one
+        value in two places, disagreeing, for months.
+
+        THE THREE FIELDS ARE DELIBERATELY DIFFERENT KINDS OF FACT:
+          version   the PACKAGE, from installed metadata (pyproject is the only
+                    declaration; this cannot drift from it)
+          revision  the SOURCE COMMIT, from RECTO_BUILD_REVISION, which the
+                    Dockerfile has exported into the container environment all
+                    along and nothing has ever read
+          created   the BUILD TIME, same source
+
+        "unknown" is returned verbatim rather than omitted or guessed. An image
+        built without the stamp genuinely does not know its commit, and saying
+        so is the honest answer -- absent and stale look identical, which is
+        exactly how the pre-genesis container went unnoticed.
+
+        UNAUTHENTICATED, and that is a decision. It discloses a version, a
+        commit sha of a public repository, and a build timestamp -- nothing an
+        attacker cannot read from GitHub. Weighed against it: a health check
+        that cannot say what it is checking is the class of instrument this
+        estate spent 2026-08-17 removing.
+        """
+        cfg = self.config
+        self._send_json(HTTPStatus.OK, {
+            "version": __version__,
+            "revision": os.environ.get("RECTO_BUILD_REVISION", "unknown"),
+            "created": os.environ.get("RECTO_BUILD_CREATED", "unknown"),
+            "bootloader_id": cfg.bootloader_id,
+            "v0_4_protocol": PROTOCOL_VERSION,
+        })
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/registration_challenge
+    # ------------------------------------------------------------------
+
+    def _handle_registration_challenge(self, url) -> None:
+        cfg = self.config
+        if cfg.challenges is None:
+            raise BootloaderError("challenge store not initialized")
+        # THE KIND (hard rule 14.4, amended). An OWNER code buys an OWNER challenge, a consumer's MEMBER code a MEMBER
+        # challenge, and no code at all a PLAIN challenge - which serves revoke and never registers. Before the kinds,
+        # a request with no code (or an empty `code=`, or `CODE=`) bought the same challenge a code buys.
+        params = parse_qs(url.query)
+        if "code" not in params:
+            challenge, expires_at = cfg.challenges.issue_challenge()
+            self._send_json(HTTPStatus.OK, {"challenge_b64u": challenge, "expires_at_unix": expires_at})
+            return
+        code = params["code"][0]
+        # A request through the public edge carries its client's address; one without it came over a private network
+        # or loopback and is never locked. Check, redeem and count under one lock: a burst cannot outrun the count,
+        # and a refused attempt never spends a good code.
+        sent = self.headers.get_all(PUBLIC_CLIENT_HEADER) or []
+        client = None if not sent else (sent[0].strip() if len(sent) == 1 and sent[0].strip() else MALFORMED_CLIENT)
+        limiter = cfg.code_limiter if cfg.code_limiter is not None else CodeAttemptLimiter()
+        with limiter.lock:
+            if limiter.blocked(client):
+                limiter.record_refusal()
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {
+                    "error": "too_many_wrong_codes",
+                    "detail": "too many wrong pairing codes from this network - wait 15 minutes, or pair over the "
+                              "operator's private route",
+                })
+                return
+            binding: tuple[str, str] | None = None
+            reset_rec = self._armed_reset_for_code(code)
+            if reset_rec is not None:
+                # THE OWNER RESET'S CODE (hard rule 14.7): the challenge is bound to the reset's intent, so the fresh
+                # device's registration proof IS its signature in the reset's chain entry. Only the challenge's MAC is
+                # stored while the reset is armed: the challenge itself is the code holder's alone until it is spent.
+                # The record is re-read and written under the registry lock (always taken after the limiter's).
+                limiter.record_spent(code)
+                challenge = f"{RESET_CHALLENGE_PREFIX}{reset_rec['intent']['intent_id']}:{secrets.token_hex(12)}"
+                with cfg.state.registry_lock():
+                    current = cfg.state.get_top_plane_record(reset_rec["id"])
+                    if (current is None or current.get("state") != "armed"
+                            or current.get("code_hash") != reset_rec.get("code_hash")):
+                        raise RegistrationExpiredError("the reset's code is not live - the host arms it again")
+                    if not self._reset_open(current):
+                        raise RegistrationExpiredError(
+                            "the reset closed (past its grace, or cancelled) before its code was redeemed; the host "
+                            "aborts it or starts a new one")
+                    current = dict(current)
+                    current.update(code_hash=None, challenge=None, challenge_mac=self._mac("challenge", challenge),
+                                   challenge_expires_at=int(time.time()) + 300)
+                    cfg.state.put_top_plane_record(current)
+                self._send_json(HTTPStatus.OK, {"challenge_b64u": challenge,
+                                                "expires_at_unix": current["challenge_expires_at"]})
+                return
+            if cfg.challenges.consume_pairing_code(code):
+                kind = "owner"
+            elif (binding := cfg.challenges.consume_member_pairing_code(code)) is not None:
+                # THE MEMBER PLANE (2026-09-30): a consumer's member code buys a MEMBER challenge - never an owner one.
+                # Since 2026-10-17 the challenge carries the code's (consumer, subject) binding (hard rule 15.n).
+                kind = "member"
+            elif limiter.was_spent(code):
+                raise RegistrationExpiredError("pairing code already used - get a new code")
+            else:
+                limiter.record_failure(client)
+                if client is not None:
+                    # Only the PUBLIC edge counts against a live reset code: a private-route or loopback pairer's typo
+                    # never burns the operator's reset.
+                    self._count_reset_code_failure()
+                raise RegistrationExpiredError("pairing code expired or invalid")
+            limiter.record_spent(code)
+            if client is not None and limiter.exposed(code):
+                # THE EXPOSURE BUDGET: a live code that sat through too many public wrong guesses is burned - consumed
+                # and never redeemed over the edge (the private route still redeems it until then).
+                logging.getLogger("recto.bootloader.codes").warning(
+                    "burned a pairing code redeemed over the public edge after too many wrong guesses")
+                raise RegistrationExpiredError("this pairing code was exposed to too many wrong guesses - get a new code")
+        challenge, expires_at = (
+            cfg.challenges.issue_owner_challenge() if kind == "owner"
+            else cfg.challenges.issue_member_challenge(binding=binding)
+        )
+        self._send_json(HTTPStatus.OK, {
+            "challenge_b64u": challenge,
+            "expires_at_unix": expires_at,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/register
+    # ------------------------------------------------------------------
+
+    def _handle_register(self, body: dict[str, Any]) -> None:
+        cfg = self.config
+        if cfg.state is None or cfg.challenges is None:
+            raise BootloaderError("server not initialized")
+        proof = body.get("registration_proof") or {}
+        challenge = proof.get("challenge", "")
+        sig = proof.get("signature_b64u", "")
+        public_key_b64u = body.get("public_key_b64u", "")
+        device_label = body.get("device_label")
+        # GATE 2a (2026-08-17). This read `body.get("supported_algorithms",
+        # ["ed25519"])` -- an ABSENT field enrolled the phone as software-keyed,
+        # and line 814 below re-defaulted an EMPTY list the same way. Two
+        # independent defaults, both resolving silence to the software path, in
+        # a substrate whose entire claim is a hardware-held key.
+        #
+        # REFUSE instead. A phone that cannot say what it signs with does not
+        # enroll. This is safe to make fatal HERE and nowhere else: it binds
+        # only FUTURE enrollments, so no live phone can be locked out by it --
+        # see _registered_algorithm() for why the read sites only warn.
+        raw_algos = body.get("supported_algorithms")
+        if not isinstance(raw_algos, list) or not raw_algos:
+            raise BootloaderError(
+                "registration refused: supported_algorithms is absent or empty. "
+                "A hardware-root system does not enroll a software key by "
+                f"omission. Send one of {list(SUPPORTED_ALGORITHMS)}."
+            )
+        algos = tuple(str(a) for a in raw_algos)
+        unknown = [a for a in algos if a not in SUPPORTED_ALGORITHMS]
+        if unknown:
+            raise BootloaderError(
+                f"registration refused: unsupported algorithm(s) {unknown}. "
+                f"This bootloader verifies {list(SUPPORTED_ALGORITHMS)}. "
+                "Previously an unknown string was passed straight to "
+                "verification and surfaced as an opaque signature failure."
+            )
+        if body.get("v0_4_protocol") != PROTOCOL_VERSION:
+            raise BootloaderError(
+                f"protocol version mismatch: server={PROTOCOL_VERSION}, "
+                f"phone={body.get('v0_4_protocol')!r}"
+            )
+        # THE ORDER (hard rule 14.4, amended): the challenge's KIND, then the proof and the poll delegation, and only
+        # then any slot question or any word about another phone. Before this order the 409 named the occupant to a
+        # made-up challenge, and the slot's authority was a claim signed by the INCOMING key.
+        _require_canonical_key(public_key_b64u, algos[0])
+        incoming_ref = _phone_ref(public_key_b64u)
+        # THE LABEL (2026-10-17, hard rule 15.r): a phone that sends no label gets one derived from its own key - the
+        # registry never asks a person for a name.
+        if not isinstance(device_label, str) or not device_label.strip() or device_label == "(unnamed)":
+            device_label = generated_device_label(incoming_ref)
+        reset_rec = self._reset_for_challenge(challenge) if challenge.startswith(RESET_CHALLENGE_PREFIX) else None
+        member = reset_rec is None and cfg.challenges.is_member_challenge(challenge)
+        owner = reset_rec is None and not member and cfg.challenges.is_owner_challenge(challenge)
+        if reset_rec is None and not member and not owner:
+            raise RegistrationExpiredError(
+                "registration challenge unknown or expired, or fetched without a pairing code - a phone registers "
+                "only on a challenge bought with a pairing code; pair again with a new code"
+            )
+        # Pick the algorithm the phone declared. The registration body's
+        # `supported_algorithms` is a list (phone enumerates what it
+        # CAN sign with); for v1 we treat the first entry as the algo
+        # actually used to sign the registration challenge. iOS Secure
+        # Enclave phones send ["ecdsa-p256"]; Android StrongBox / software
+        # fallback phones send ["ed25519"]. Both paths are supported by
+        # recto.bootloader.sessions.verify_signature.
+        # `algos` is now guaranteed non-empty and vocabulary-checked above,
+        # so this no longer needs -- or is permitted -- a fallback.
+        chosen_algo = algos[0]
+        # Verify the phone's signature over the challenge using the
+        # claimed public key. This proves possession of the private
+        # key without disclosing it.
+        ok = verify_signature(
+            payload=challenge.encode("ascii"),
+            signature_b64u=sig,
+            public_key_b64u=public_key_b64u,
+            algorithm=chosen_algo,
+        )
+        if not ok:
+            raise BootloaderError(
+                f"registration proof signature invalid (algorithm={chosen_algo!r})"
+            )
+        # Optional silent-push wake routing (wave C): the phone supplies
+        # its APNs / FCM token at registration when it has one. Absent /
+        # empty means poll-only. Platform values are validated so a
+        # future platform string doesn't silently register unroutable.
+        push_token = body.get("push_token") or None
+        push_platform = body.get("push_platform") or None
+        if push_token is not None and push_platform not in ("apns", "fcm"):
+            raise BootloaderError(
+                f"unknown push_platform {push_platform!r}; "
+                "expected 'apns' or 'fcm'"
+            )
+        # THE POLL KEY (2026-09-21, rule 14.2; REQUIRED -
+        # pre-launch, no compatibility window). A phone enrolls with a second, non-gated
+        # enclave key and the identity key's delegation over it, or it does
+        # not enroll: there is one way to read from this registry, and it is
+        # a signature by the delegated poll key. A poll key nobody delegated
+        # is refused, never dropped.
+        poll_public_key_b64u = body.get("poll_public_key_b64u") or None
+        poll_key_delegation_b64u = body.get("poll_key_delegation_b64u") or None
+        if not (poll_public_key_b64u and poll_key_delegation_b64u):
+            raise BootloaderError(
+                "registration refused: poll_public_key_b64u and "
+                "poll_key_delegation_b64u are required (hard rule 14.2). A phone "
+                "that has not delegated a poll key cannot read from this registry."
+            )
+        # The poll key has one spelling too (it signs with the identity key's algorithm), so the comparison below is a
+        # comparison of keys.
+        _require_canonical_key(poll_public_key_b64u, chosen_algo, name="poll_public_key_b64u")
+        if poll_public_key_b64u == public_key_b64u:
+            raise BootloaderError(
+                "registration refused: the poll key must not be the identity key"
+            )
+        delegated = verify_signature(
+            payload=poll_key_delegation_payload(public_key_b64u, poll_public_key_b64u),
+            signature_b64u=poll_key_delegation_b64u,
+            public_key_b64u=public_key_b64u,
+            algorithm=chosen_algo,
+        )
+        if not delegated:
+            raise BootloaderError(
+                "registration refused: poll_key_delegation_b64u does not verify "
+                f"against the identity key (algorithm={chosen_algo!r})"
+            )
+
+        def _new(slot_: str, bindings: tuple[tuple[str, str], ...] | None = None) -> PhoneRegistration:
+            # A key that re-registers keeps the member bindings it holds unless the caller names new ones.
+            if bindings is None:
+                known = cfg.state.get_phone(incoming_ref)
+                bindings = known.member_bindings if known is not None else ()
+            return PhoneRegistration.new(
+                device_label=str(device_label),
+                public_key_b64u=public_key_b64u,
+                supported_algorithms=algos,
+                push_token=push_token,
+                push_platform=push_platform if push_token else None,
+                poll_public_key_b64u=poll_public_key_b64u,
+                slot=slot_,
+                member_bindings=bindings,
+            )
+
+        if reset_rec is not None:
+            # THE OWNER RESET'S FRESH DEVICE (hard rule 14.7): proof and delegation verified above. It is NOT
+            # registered here: the host completes the reset with the passphrase over the reset entry, and only the
+            # chain entry seats it. Until then nothing about it is live. Re-read under the registry lock: a re-arm or
+            # a cancel since the challenge was issued wins.
+            with cfg.state.registry_lock():
+                current = self._reset_for_challenge(challenge)
+                if current is None or current.get("id") != reset_rec.get("id"):
+                    raise RegistrationExpiredError("the reset's challenge is not live - arm it again")
+                if not self._reset_open(current):
+                    # The challenge outlived the reset's grace: the reset closed before this device answered.
+                    raise RegistrationExpiredError(
+                        "the reset passed its grace before this device answered; the host aborts it or starts a new "
+                        "one")
+                known_cs = top_plane.chain_state(cfg.state, cfg.expect_sealed_id)
+                if cfg.state.get_phone(incoming_ref) is not None or any(
+                        top_plane.b64u(m.pubkey) == public_key_b64u for m in (known_cs.members.values() if known_cs
+                                                                              else [])):
+                    # A reset seats a FRESH device: a key that is already a registered phone or a sealed member is
+                    # never one.
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "owner_reset_key_known",
+                        "detail": "this key is already a registered phone or a sealed member; a reset seats a fresh "
+                                  "device - pair a new one with the code"})
+                    return
+                rec = dict(current)
+                rec["state"] = "registered"
+                rec["fresh"] = {
+                    "public_key_b64u": public_key_b64u, "algorithm": chosen_algo, "proof_b64u": sig,
+                    "poll_public_key_b64u": poll_public_key_b64u, "device_label": str(device_label),
+                    "push_token": push_token, "push_platform": push_platform if push_token else None,
+                }
+                rec.update(challenge=challenge, challenge_mac=None, challenge_expires_at=0)
+                cfg.state.put_top_plane_record(rec)
+            logging.getLogger("recto.bootloader.top_plane").info(
+                "owner reset %s: a fresh device %s answered the reset code; the host completes it with the passphrase",
+                rec["id"], incoming_ref)
+            self._send_json(HTTPStatus.ACCEPTED, {
+                "status": "reset_pending_completion", "phone_ref": incoming_ref,
+                "detail": "the owner reset waits for the host to complete it with the passphrase; then pair again "
+                          "with an owner code and this key re-pairs into its slot",
+            })
+            return
+
+        # THE MEMBER PLANE (2026-09-30). A challenge bought with a consumer's MEMBER code carries none of the owner's
+        # authority: the phone registers BESIDE the slots (MEMBER_SLOT), the slot question is never asked, and a
+        # replace claim is refused by name - a member key never displaces a business phone. A key that already HOLDS
+        # a business slot keeps it (the owner's phone scanning a member code is still the owner's phone).
+        if member:
+            if body.get("slot_replace_b64u"):
+                raise BootloaderError(
+                    "registration refused: a member registration answers no slot question - "
+                    "slot_replace_b64u is the business owner's act, never a member code's"
+                )
+            rebind_sig = body.get("member_rebind_b64u") or None
+            with cfg.state.registry_lock():
+                phones = cfg.state.list_phones()
+                held = next((p for p in phones if p.public_key_b64u == public_key_b64u),
+                            None) or cfg.state.get_phone(incoming_ref)
+                slot = held.slot if held is not None and held.slot in SLOTS else MEMBER_SLOT
+                binding = cfg.challenges.consume_member_challenge(challenge)
+                if binding is None:
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                consumer, subject = binding
+                own = held.member_bindings if held is not None else ()
+                # THE MEMBER BINDING (2026-10-17, hard rule 15.n). One subject per consumer on a phone, one phone per
+                # (consumer, subject): a phone already bound to ANOTHER subject of this consumer is refused, and a pair
+                # bound to another phone moves only by that phone's signature (or the operator's host reset).
+                if any(c == consumer and s_ != subject for c, s_ in own):
+                    self._send_json(HTTPStatus.FORBIDDEN, {
+                        "error": "member_phone_bound_elsewhere",
+                        "detail": "this phone is already bound to another subject of this consumer",
+                    })
+                    return
+                bound = next((p for p in phones if binding in p.member_bindings
+                              and p.public_key_b64u != public_key_b64u), None)
+                if bound is not None:
+                    rebind_ok = bool(rebind_sig) and verify_signature(
+                        payload=member_rebind_payload(consumer, subject, bound.phone_id, public_key_b64u, challenge),
+                        signature_b64u=rebind_sig or "",
+                        public_key_b64u=bound.public_key_b64u,
+                        algorithm=_registered_algorithm(bound, "member-rebind"),
+                    )
+                    if not rebind_ok:
+                        self._send_json(HTTPStatus.CONFLICT, {
+                            "error": "member_subject_bound",
+                            "bound_phone_ref": bound.phone_id,
+                            "detail": (
+                                "this subject is bound to another phone; it moves only with that phone's signature - "
+                                f"pair again with member_rebind_b64u = the bound phone's identity-key signature over "
+                                f"{MEMBER_REBIND_PREFIX}|<consumer>|<subject>|{bound.phone_id}|<public_key_b64u>|"
+                                "<the fresh challenge>, on a new member code (this challenge is spent), "
+                                "or ask the operator for a host reset"
+                            ),
+                        })
+                        return
+                    cfg.state.register_phone(replace(
+                        bound, member_bindings=tuple(b for b in bound.member_bindings if b != binding)))
+                    logging.getLogger("recto.bootloader.members").warning(
+                        "member binding moved from phone_id=%s to phone_id=%s by the bound phone's signature",
+                        bound.phone_id, incoming_ref)
+                bindings = tuple(b for b in own if b != binding) + (binding,)
+                reg = cfg.state.register_phone(_new(slot, bindings))
+            self._send_registered(reg, displaced_ref=None)
+            return
+
+        requested = body.get("slot") or "primary"
+        if requested not in SLOTS:
+            raise BootloaderError(
+                f"registration refused: slot must be one of {list(SLOTS)}; got {requested!r}"
+            )
+        replace_sig = body.get("slot_replace_b64u") or None
+        slots_log = logging.getLogger("recto.bootloader.slots")
+        with cfg.state.registry_lock():
+            phones = cfg.state.list_phones()
+            mine = next((p for p in phones if p.public_key_b64u == public_key_b64u), None) or next(
+                (p for p in phones if p.phone_id == incoming_ref), None)
+            if mine is not None and mine.slot not in SLOTS:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "member_key_refused",
+                    "detail": "a member key never moves into an owner slot - this key is registered as a member",
+                })
+                return
+            committed = None
+            if mine is None:
+                try:
+                    committed = next((r for r in cfg.state.list_top_plane_records()
+                                      if r.get("type") == "reset" and r.get("state") == "registered"
+                                      and (r.get("fresh") or {}).get("public_key_b64u") == public_key_b64u
+                                      and reset_entry_on_chain(cfg.state, r)), None)
+                except top_plane.TopPlaneRefused:
+                    committed = None  # the pointer is advisory; an unreadable file or chain asks the slot question
+                if committed is not None:
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "owner_reset_committed",
+                        "detail": f"this phone is seated by owner reset {committed['id']}, whose entry is on the "
+                                  "chain; on the host run "
+                                  f"`recto bootloader owner-reset --complete {committed['id']}`, "
+                                  "then pair again",
+                    })
+                    return
+            owners = [p for p in phones if p.slot in SLOTS]
+            # SAME-KEY RE-PAIR (rule 14.3): a key that holds an owner slot is the same phone; it re-pairs into THE SLOT
+            # IT HOLDS by the code alone, whatever the body names (a phone forgets its slot on 'unpair, keep vault').
+            if mine is not None:
+                if not cfg.challenges.consume_owner_challenge(challenge):
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                reg = cfg.state.register_phone(_new(mine.slot))
+                self._send_registered(reg, displaced_ref=None)
+                return
+            # GENESIS: while owner genesis is open (no owner yet, or the host reset reopened it), an owner code alone
+            # enrolls the first owner, and the marker closes in the same locked act. Only the host reset opens it again.
+            if not owners and cfg.state.get_owner_genesis() == "open":
+                try:
+                    sealed_now = self._sealed_chain_or_none()
+                except top_plane.TopPlaneRefused as e:
+                    self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+                    return
+                if sealed_now is not None:
+                    self._send_json(HTTPStatus.FORBIDDEN, {
+                        "error": "owner_genesis_sealed",
+                        "detail": "the top plane is sealed: no owner enters by a code alone - the owner reset (the "
+                                  "passphrase, its window, a fresh device) is the way back in (hard rule 14.4)",
+                    })
+                    return
+                if not cfg.challenges.consume_owner_challenge(challenge):
+                    raise RegistrationExpiredError("registration challenge expired or invalid")
+                reg = cfg.state.register_phone(_new(requested))
+                cfg.state.set_owner_genesis("closed")
+                slots_log.warning("owner genesis: slot=%s enrolled phone_id=%s; genesis closed", requested, reg.phone_id)
+                self._send_registered(reg, displaced_ref=None)
+                return
+            slot = requested
+            window_unknown: top_plane.TopPlaneRefused | None = None
+            try:
+                in_reset = next((r for r in cfg.state.list_top_plane_records()
+                                 if self._reset_open(r) and slot in r["intent"]["slots"]), None)
+            except top_plane.TopPlaneRefused as exc:
+                # The slot question stands, but no key is SEATED while the reset window cannot be read (the landing
+                # below refuses by this name).
+                in_reset, window_unknown = None, exc
+            if in_reset is not None:
+                self._send_json(HTTPStatus.CONFLICT, {
+                    "error": "owner_reset_open",
+                    "detail": f"owner reset {in_reset['id']} is open for the {slot} slot; no phone enters that slot "
+                              "until it is cancelled, aborted or completed",
+                })
+                return
+            occupants = [p for p in owners if p.slot == slot]
+            if occupants and not replace_sig:
+                # The slot question - asked only now, after the kind, the proof and the delegation. The challenge is
+                # not consumed: the phone answers on the same one with slot_replace_b64u.
+                occ = occupants[0]
+                self._send_json(HTTPStatus.CONFLICT, {
+                    "error": "slot_occupied",
+                    "slot": slot,
+                    "occupant": {
+                        "phone_ref": occ.phone_id,
+                        "device_label": occ.device_label,
+                        "last_seen_unix": occ.last_seen_unix,
+                        "registered_at_unix": occ.registered_at_unix,
+                    },
+                    "detail": (
+                        f"the {slot} slot holds {occ.device_label!r}; to replace it, "
+                        "retry the same registration with slot_replace_b64u = the identity "
+                        f"key's signature over {SLOT_REPLACE_PREFIX}|{slot}|{occ.phone_id}|<public_key_b64u>"
+                    ),
+                })
+                return
+            occupant = None
+            if occupants:
+                # The incoming key's replace claim names the occupant it displaces - verified before any approval is
+                # parked or spent. It binds the key's intent; the AUTHORITY is the owner phone's approval below.
+                occupant = next((o for o in occupants if verify_signature(
+                    payload=slot_replace_payload(slot, o.phone_id, public_key_b64u),
+                    signature_b64u=replace_sig or "",
+                    public_key_b64u=public_key_b64u,
+                    algorithm=chosen_algo,
+                )), None)
+                if occupant is None:
+                    raise BootloaderError(
+                        "registration refused: slot_replace_b64u does not verify against the incoming identity key "
+                        f"for the occupant of the {slot} slot"
+                    )
+            # THE APPROVERS: every owner phone this enrollment does not displace (the other slot's holder; a registry
+            # from before the slots can hold two). With none, the occupant approves its own replacement (the upgrade
+            # with the old phone in hand). With no owner at all and genesis closed, only the host reset helps.
+            approvers = [p for p in owners if occupant is None or p.phone_id != occupant.phone_id]
+            if not approvers and occupant is not None:
+                approvers = [occupant]
+            # THE TOP PLANE (hard rule 14.4/14.7): once the id is sealed, a slot entry is a chain entry, and only a
+            # sealed DEVICE MEMBER's approval counts as its device leg - the passphrase signs the same act on the host.
+            try:
+                sealed_cs = self._sealed_chain_or_none()
+            except top_plane.TopPlaneRefused as e:
+                self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+                return
+            if sealed_cs is not None:
+                approvers = [p for p in approvers if top_plane.device_kind_of(sealed_cs, p) is not None]
+                if not approvers and occupant is not None and top_plane.device_kind_of(sealed_cs, occupant):
+                    approvers = [occupant]
+                if not approvers:
+                    self._send_json(HTTPStatus.FORBIDDEN, {
+                        "error": "no_device_member_can_approve",
+                        "detail": "no sealed owner device can approve this slot - the owner reset (its window "
+                                  "included) is the way back in (hard rule 14.4)",
+                    })
+                    return
+            if not approvers:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "no_owner_can_approve",
+                    "detail": "no owner phone can approve - the operator's host reset (recto bootloader owner-reset "
+                              "--reopen-genesis) reopens enrollment",
+                })
+                return
+            approver_refs = sorted(p.phone_id for p in approvers)
+            occupant_ref = occupant.phone_id if occupant is not None else None
+            now = int(time.time())
+            records = cfg.state.list_owner_enrolls()
+            # An approval on file for THIS key, THIS slot, the same occupant, given by a phone that is one of the
+            # approvers the rules name NOW (an occupant's self-approval stops counting once another owner exists):
+            # consume it (atomically) with the challenge, and enroll.
+            approver_now = {p.phone_id for p in approvers}
+            for rec in records:
+                if (rec.get("state") == "approved" and rec.get("incoming_pubkey") == public_key_b64u
+                        and rec.get("slot") == slot and rec.get("occupant_ref") == occupant_ref
+                        and int(rec.get("approved_until", 0)) > now and rec.get("approved_by") in approver_now):
+                    tp = rec.get("top_plane")
+                    if tp is None and sealed_cs is not None:
+                        self._send_json(HTTPStatus.FORBIDDEN, {
+                            "error": "owner_enroll_from_before_the_seal",
+                            "detail": "this approval was given before the top plane was sealed - pair again",
+                        })
+                        return
+                    if tp is not None and not tp.get("passphrase_sig"):
+                        self._send_json(HTTPStatus.FORBIDDEN, {
+                            "error": "owner_passphrase_required",
+                            "detail": "the owner phone approved; the passphrase has not signed this slot entry yet - "
+                                      "run `recto vault approve-enroll` on the host, then pair again",
+                        })
+                        return
+                    if window_unknown is not None:
+                        self._send_json(HTTPStatus(window_unknown.status), {"error": window_unknown.name,
+                                                                            "detail": window_unknown.detail})
+                        return
+                    # The challenge first: a lapsed one leaves the approval for the next pass.
+                    if not cfg.challenges.consume_owner_challenge(challenge):
+                        raise RegistrationExpiredError("registration challenge expired or invalid")
+                    if cfg.state.delete_owner_enroll(rec["request_id"]) is None:
+                        raise BootloaderError("registration refused: that approval was already spent - pair again")
+                    if tp is not None:
+                        # THE ACT LANDS ON THE CHAIN FIRST (hard rule 14.7): the store replays the whole chain with
+                        # this entry and refuses unless the passphrase AND a sealed device signed the same digest.
+                        try:
+                            cfg.state.append_genesis_chain_entry(top_plane.record_of(
+                                top_plane.Draft.from_wire(tp["draft"]), [tp["passphrase_sig"], tp["approver_sig"]]))
+                        except ChainError as exc:
+                            self._send_json(HTTPStatus.CONFLICT, {
+                                "error": "top_plane_chain_refused",
+                                "detail": f"the slot entry did not append to the genesis chain ({exc}) - pair again",
+                            })
+                            return
+                        logging.getLogger("recto.bootloader.top_plane").info(
+                            "top plane: slot=%s seated %s on the chain (seq %s)", slot, incoming_ref,
+                            tp["draft"]["seq"])
+                    if occupant is not None:
+                        # One write: the displaced key's registration, sessions and pending queue go and the incoming
+                        # key lands together, so at no moment do two keys - or none - hold the slot.
+                        reg = cfg.state.replace_phone(occupant.phone_id, _new(slot))
+                        if reg is None:
+                            raise BootloaderError("registration refused: the occupant changed - pair again")
+                        slots_log.warning("slot=%s displaced phone_id=%s by phone_id=%s (approved by %s)",
+                                          slot, occupant.phone_id, incoming_ref, rec.get("approved_by"))
+                        void_owner_enrolls_for(cfg.state, occupant.phone_id)
+                    else:
+                        reg = cfg.state.register_phone(_new(slot))
+                    slots_log.warning("owner enroll: slot=%s phone_id=%s approved by %s",
+                                      slot, reg.phone_id, rec.get("approved_by"))
+                    self._send_registered(reg, displaced_ref=occupant_ref)
+                    return
+            # CONTESTED: another key asked for this slot inside the window - every such request is refused, both
+            # callers are told, and the cards are withdrawn. A person comparing two cards is never the only guard.
+            window = now - OWNER_CONTEST_WINDOW_SECONDS
+            rivals = [r for r in records if r.get("slot") == slot and r.get("incoming_pubkey") != public_key_b64u
+                      and int(r.get("created_unix", 0)) >= window]
+            if rivals:
+                for r in [r for r in records if r.get("slot") == slot and int(r.get("created_unix", 0)) >= window]:
+                    self._refuse_owner_enroll(r)
+                # The caller leaves a refused record too, so EITHER key's next ask inside the window is contested.
+                cfg.state.put_owner_enroll({
+                    "request_id": str(uuid.uuid4()), "cards": {}, "incoming_pubkey": public_key_b64u,
+                    "incoming_ref": incoming_ref, "slot": slot, "approver_refs": approver_refs,
+                    "occupant_ref": occupant_ref, "created_unix": now, "not_after": now, "state": "refused",
+                    "approved_by": None, "approved_until": 0, "expires_at_unix": now + OWNER_CONTEST_WINDOW_SECONDS,
+                })
+                cfg.challenges.consume_owner_challenge(challenge)
+                slots_log.warning("owner enroll: slot=%s contested by phone_id=%s - refused", slot, incoming_ref)
+                minutes = OWNER_CONTEST_WINDOW_SECONDS // 60
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "owner_slot_contested",
+                    "slot": slot,
+                    "phone_ref": incoming_ref,
+                    # A second by which no rival counts (exact when a rival was approved; a pending rival's record
+                    # is gone a second sooner). Another ask from the other phone moves it.
+                    "reopens_at_unix": max(int(r.get("created_unix", 0)) for r in rivals) + OWNER_CONTEST_WINDOW_SECONDS
+                    + 1,
+                    "detail": f"This phone is {grouped_ref(incoming_ref)}. Two phones asked for the {slot} slot - "
+                              f"both are refused. Use ONE phone: wait until {minutes} minutes have passed since the last "
+                              "try from EITHER phone, then start again with a new code. If this repeats, someone else "
+                              "holds an owner code.",
+                })
+                return
+            if not cfg.challenges.consume_owner_challenge(challenge):
+                raise RegistrationExpiredError("registration challenge expired or invalid")
+            # Re-use a pending request only while one of its cards is still on an approver's queue; else a fresh one.
+            pending_rec = next((r for r in records if r.get("state") == "pending"
+                                and r.get("incoming_pubkey") == public_key_b64u and r.get("slot") == slot
+                                and r.get("occupant_ref") == occupant_ref
+                                and sorted(r.get("approver_refs", [])) == approver_refs), None)
+            if pending_rec is not None and not self._owner_cards_queued(pending_rec):
+                cfg.state.delete_owner_enroll(pending_rec["request_id"])
+                pending_rec = None
+            if pending_rec is None:
+                self._queue_owner_enroll(slot=slot, incoming_pubkey=public_key_b64u, incoming_ref=incoming_ref,
+                                         approvers=approvers, occupant_ref=occupant_ref,
+                                         sealed_cs=sealed_cs, algorithm=chosen_algo)
+        minutes = max(1, int(cfg.owner_approval_ttl_seconds) // 60)
+        if occupant is not None and len(approvers) == 1 and approvers[0].phone_id == occupant.phone_id:
+            detail = (f"This phone is {grouped_ref(incoming_ref)}. Approve that id on the phone now in the {slot} slot "
+                      f"({grouped_ref(occupant.phone_id)}), then pair again with a new code within {minutes} minutes - "
+                      "that pairing removes the old phone. Lost it? The operator's host reset reopens enrollment.")
+        else:
+            where = " or ".join(f"{p.slot} phone ({grouped_ref(p.phone_id)})" for p in approvers)
+            detail = (f"This phone is {grouped_ref(incoming_ref)}. Approve that id on your {where}, then pair again "
+                      f"with a new code within {minutes} minutes.")
+        self._send_json(HTTPStatus.FORBIDDEN, {
+            "error": "owner_approval_required",
+            "slot": slot,
+            "phone_ref": incoming_ref,
+            "detail": detail,
+        })
+
+    def _send_registered(self, reg: PhoneRegistration, *, displaced_ref: str | None) -> None:
+        cfg = self.config
+        resp: dict[str, Any] = {
+            "registered": True,
+            "phone_id": reg.phone_id,
+            # phone_ref: the reference half of the split (2026-08-13), now
+            # also the id half for every new registration. Equal to
+            # phone_id unless the record predates the split.
+            "phone_ref": _phone_ref(reg.public_key_b64u),
+            # Rule 14.2: the key this registry verifies the phone's READS
+            # against. The phone signs reads only with the key echoed here.
+            "poll_public_key_b64u": reg.poll_public_key_b64u,
+            "slot": reg.slot,
+            **({"displaced_phone_ref": displaced_ref} if displaced_ref is not None else {}),
+            "bootloader_id": cfg.bootloader_id,
+            # Empty managed_secrets for now; the operator wires services
+            # to specific phone_ids via service.yaml's
+            # spec.secrets[].config.phone_id field (TBD once the launcher
+            # side lands).
+            "managed_secrets": [],
+        }
+        if cfg.public_urls:
+            # Additive multi-URL failover field (wave C): primary first.
+            # Phones persist the list; pre-wave-C phones ignore the
+            # unknown key. Emitted only when the operator configured
+            # public_urls, so single-host installs stay byte-identical.
+            resp["bootloader_urls"] = list(cfg.public_urls)
+        if cfg.bootloader_identity_inputs is not None:
+            # GATE 5b phone-recomputation half (additive, same convention
+            # as bootloader_urls): the derivation inputs that produced
+            # bootloader_id, so the phone can RECOMPUTE the id from the
+            # key set instead of trusting a name. Omitted when the id is
+            # not derived -- an rb1- id always travels with its inputs.
+            resp["bootloader_identity"] = cfg.bootloader_identity_inputs
+        if cfg.devices_pair_signing_pubkey_hex:
+            # 2026-09-16 (additive): the key the phone pins INSTEAD of the
+            # TLS leaf. Captured in the user-initiated pairing window, then
+            # every certificate change is answered by GET /v0.4/attest.
+            resp["devices_pair_pubkey"] = cfg.devices_pair_signing_pubkey_hex
+        self._send_json(HTTPStatus.CREATED, resp)
+
+    # ------------------------------------------------------------------
+    # THE OWNER SLOTS - the approval card and its record
+    # ------------------------------------------------------------------
+
+    def _queue_owner_enroll(self, *, slot: str, incoming_pubkey: str, incoming_ref: str,
+                            approvers: list[PhoneRegistration], occupant_ref: str | None,
+                            sealed_cs: Any = None, algorithm: str | None = None) -> None:
+        """One record, one card per approver. The card's text opens with the incoming key's ref - the same ref the new
+        phone shows - and carries no caller-chosen label; its hash binds the key, the slot, the approver, the
+        occupant, the card and its deadline. Caller holds the registry lock."""
+        cfg = self.config
+        now = int(time.time())
+        not_after = now + OWNER_CARD_TTL_SECONDS
+        record_id = str(uuid.uuid4())
+        minutes = max(1, int(cfg.owner_approval_ttl_seconds) // 60)
+        cards: list[PendingRequest] = []
+        tp: dict[str, Any] | None = None
+        tp_message: bytes | None = None
+        if sealed_cs is not None:
+            # The slot entry's passphrase leg is fresh like every opened act's: {nonce, not_after} inside the digest,
+            # so a stored signature never signs another request, and none after the card's deadline.
+            draft = top_plane.Draft(op="add", kind=top_plane.SLOT_KIND[slot], value=top_plane.unb64u(incoming_pubkey),
+                                    algorithm=str(algorithm), seq=sealed_cs.length, prev=sealed_cs.tip_hash,
+                                    meta=canonical_meta({"nonce": secrets.token_hex(16), "not_after": not_after}))
+            tp_message = top_plane.draft_message(sealed_cs, draft)
+            tp = {"draft": draft.as_wire(), "message_b64u": top_plane.b64u(tp_message), "passphrase_sig": None,
+                  "approver_sig": None}
+        for approver in approvers:
+            if occupant_ref is not None and approver.phone_id == occupant_ref:
+                effect = (f"If it pairs again within {minutes} minutes it takes the slot and "
+                          f"{grouped_ref(occupant_ref)} - THIS phone - is removed. Keep this phone until the new one "
+                          "shows paired.")
+            elif occupant_ref is not None:
+                effect = (f"When it pairs again (within {minutes} minutes) it replaces {grouped_ref(occupant_ref)} in "
+                          "that slot.")
+            else:
+                effect = "The slot is empty."
+            text = (f"{grouped_ref(incoming_ref)} wants the {slot} slot. Approve ONLY if the new phone in your hand "
+                    f"shows exactly this id. {effect} Not pairing a phone right now? Leave this card - it expires in "
+                    "5 minutes; Deny cannot remove it.")
+            if tp is not None:
+                text += " The passphrase must also sign this on the host (recto vault approve-enroll)."
+            card = PendingRequest.new(
+                kind="single_sign", service="recto", secret=f"owner-slot:{slot}", phone_id=approver.phone_id,
+                operation_description=text, payload_hash_b64u="", child_pid=0, child_argv0="(bootloader)",
+                ttl_seconds=OWNER_CARD_TTL_SECONDS,
+            )
+            digest = tp_message if tp_message is not None else owner_enroll_digest(
+                bootloader_id=cfg.bootloader_id, slot=slot, incoming_pubkey=incoming_pubkey,
+                incoming_ref=incoming_ref, approver_ref=approver.phone_id, occupant_ref=occupant_ref,
+                request_id=card.request_id, not_after=not_after,
+            )
+            from dataclasses import replace as _replace
+            cards.append(_replace(card, payload_hash_b64u=base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")))
+        cfg.state.put_owner_enroll({
+            "request_id": record_id,
+            "cards": {c.request_id: c.phone_id for c in cards},
+            "incoming_pubkey": incoming_pubkey,
+            "incoming_ref": incoming_ref,
+            "slot": slot,
+            "approver_refs": sorted(a.phone_id for a in approvers),
+            "occupant_ref": occupant_ref,
+            "created_unix": now,
+            "not_after": not_after,
+            "state": "pending",
+            "approved_by": None,
+            "approved_until": 0,
+            "expires_at_unix": now + max(OWNER_CONTEST_WINDOW_SECONDS, OWNER_CARD_TTL_SECONDS),
+            **({"top_plane": tp} if tp is not None else {}),
+        })
+        for card in cards:
+            cfg.state.add_pending(card)
+            self._notify_push(card)
+        logging.getLogger("recto.bootloader.slots").warning(
+            "owner enroll requested: slot=%s phone_id=%s approvers=%s occupant=%s",
+            slot, incoming_ref, [a.phone_id for a in approvers], occupant_ref)
+
+    def _owner_cards_queued(self, rec: dict[str, Any]) -> bool:
+        cfg = self.config
+        for card_id, phone_id in (rec.get("cards") or {}).items():
+            if any(p.request_id == card_id for p in cfg.state.list_pending_for_phone(phone_id)):
+                return True
+        return False
+
+    def _refuse_owner_enroll(self, rec: dict[str, Any]) -> None:
+        """Withdraw the record's cards and mark it refused (it stays until it expires, so a contest stays visible)."""
+        cfg = self.config
+        for card_id in (rec.get("cards") or {}):
+            cfg.state.take_pending(card_id)
+        rec = dict(rec)
+        rec["state"] = "refused"
+        cfg.state.put_owner_enroll(rec)
+
+    def _owner_enroll_for_card(self, request_id: str) -> dict[str, Any] | None:
+        cfg = self.config
+        if cfg.state is None:
+            return None
+        return next((r for r in cfg.state.list_owner_enrolls() if request_id in (r.get("cards") or {})), None)
+
+    def _respond_owner_enroll(self, request_id: str, body: dict[str, Any]) -> None:
+        """An owner-slot card is answered only by a VERIFIED approve: peek, check the deadline, verify the approver's
+        identity signature over the card's hash, and only then take the card. A deny - unsigned on today's phones,
+        so it cannot be told from a stranger's - or an approve that does not verify leaves card and record as they
+        were; the card expires on its own."""
+        cfg = self.config
+        decision = body.get("decision", "")
+        if decision != "approved":
+            self._send_json(HTTPStatus.CONFLICT, {
+                "error": "owner_enroll_not_denied_unsigned",
+                "detail": "an owner-slot card cannot be denied from the phone - leave it and it expires in 5 minutes "
+                          "(an unsigned deny cannot be told from a stranger's)",
+            })
+            return
+        with cfg.state.registry_lock():
+            rec = self._owner_enroll_for_card(request_id)
+            if rec is None:
+                raise PendingRequestNotFoundError(f"request_id {request_id!r} not found")
+            approver_id = rec["cards"][request_id]
+            card = next((p for p in cfg.state.list_pending_for_phone(approver_id) if p.request_id == request_id), None)
+            if card is None or card.is_expired or int(time.time()) >= int(rec.get("not_after", 0)):
+                raise PendingRequestNotFoundError(f"request_id {request_id!r} not found or expired")
+            if rec.get("state") != "pending":
+                self._send_json(HTTPStatus.CONFLICT, {"error": "owner_enroll_closed",
+                                                      "detail": f"this request is {rec.get('state')}"})
+                return
+            approver = cfg.state.get_phone(approver_id)
+            if approver is None or approver.slot not in SLOTS:
+                raise UnknownPhoneError(f"phone {approver_id!r} no longer holds an owner slot")
+            padding = "=" * (-len(card.payload_hash_b64u) % 4)
+            digest = base64.urlsafe_b64decode(card.payload_hash_b64u + padding)
+            ok = verify_signature(
+                payload=digest,
+                signature_b64u=body.get("signature_b64u", ""),
+                public_key_b64u=approver.public_key_b64u,
+                algorithm=_registered_algorithm(approver, approver.phone_id),
+            )
+            if not ok:
+                raise BootloaderError("approved-response signature invalid")
+            occupant_ref = rec.get("occupant_ref")
+            if occupant_ref is not None:
+                occ = cfg.state.get_phone(occupant_ref)
+                if occ is None or occ.slot != rec.get("slot"):
+                    self._refuse_owner_enroll(rec)
+                    self._send_json(HTTPStatus.CONFLICT, {"error": "owner_enroll_closed",
+                                                          "detail": "the slot's occupant changed - pair again"})
+                    return
+            for card_id in rec["cards"]:
+                cfg.state.take_pending(card_id)
+            now = int(time.time())
+            rec = dict(rec)
+            rec["state"] = "approved"
+            rec["approved_by"] = approver.phone_id
+            if rec.get("top_plane") is not None:
+                rec["top_plane"] = dict(rec["top_plane"], approver_sig=body.get("signature_b64u", ""))
+            rec["approved_until"] = now + int(cfg.owner_approval_ttl_seconds)
+            rec["expires_at_unix"] = max(int(rec.get("expires_at_unix", 0)), rec["approved_until"])
+            cfg.state.put_owner_enroll(rec)
+        logging.getLogger("recto.bootloader.slots").warning(
+            "owner enroll approved: slot=%s phone_id=%s by %s", rec.get("slot"), rec.get("incoming_ref"),
+            approver.phone_id)
+        self._send_json(HTTPStatus.OK, {"resolved": True})
+
+    def _notify_push(self, req: PendingRequest) -> None:
+        """Fire a best-effort silent wake push for a just-queued
+        request. Never raises, never blocks the request path -- the
+        dispatcher does the send on a daemon thread and logs failures
+        (push is a delivery HINT; polling remains the fallback).
+        No-op when no dispatcher is configured or the target phone has
+        no registered push token."""
+        cfg = self.config
+        dispatcher = cfg.push_dispatcher
+        if dispatcher is None or cfg.state is None:
+            return
+        try:
+            phone = cfg.state.get_phone(req.phone_id)
+            if phone is not None:
+                dispatcher.notify(phone, req.request_id)
+        except Exception:  # noqa: BLE001 - push must never break queueing
+            logging.getLogger("recto.bootloader.push").warning(
+                "push notify failed for request %s", req.request_id,
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Signed-poll gate (2026-08-13, phone_id split)
+    # ------------------------------------------------------------------
+
+    def _check_poll_signature(
+        self, phone: PhoneRegistration, path: str,
+    ) -> bool:
+        """Verify (or advise on) the phone's poll signature for one
+        possession-of-phone_id read surface.
+
+        Returns True when the request may proceed. Returns False after
+        having already sent the 401 refusal (required mode only). The
+        caller pattern is ``if not self._check_poll_signature(...):
+        return`` immediately after the get_phone possession lookup.
+
+        Signing input is the ASCII string
+        ``recto-poll-v1|{phone_id}|{ts}|{path}`` (ts = unix seconds as
+        sent in the header; path = URL path only). Verification runs
+        against the REGISTRATION's pubkey + declared algorithm via
+        recto.bootloader.sessions.verify_signature -- the same trust
+        anchor every approval already uses. Freshness is +/-
+        POLL_SIG_FRESHNESS_SECONDS around the server clock.
+
+        Logging discipline: verdicts and phone_id only -- NEVER the
+        signature or timestamp header values.
+        """
+        cfg = self.config
+        mode = getattr(cfg, "signed_poll_mode", "advisory") or "advisory"
+        if mode == "off":
+            return True
+        log = logging.getLogger("recto.bootloader.signed_polls")
+        sig = (self.headers.get(POLL_SIG_HEADER) or "").strip()
+        ts_raw = (self.headers.get(POLL_SIG_TS_HEADER) or "").strip()
+
+        if not sig and not ts_raw:
+            if mode == "required":
+                self._send_json(HTTPStatus.UNAUTHORIZED, {
+                    "error": "poll_signature_required",
+                    "detail": (
+                        f"{path} requires a signed poll "
+                        f"({POLL_SIG_HEADER} + {POLL_SIG_TS_HEADER} "
+                        "headers) when signed_poll_mode=required"
+                    ),
+                })
+                return False
+            log.info(
+                "poll verdict=unsigned mode=%s path=%s phone_id=%s",
+                mode, path, phone.phone_id,
+            )
+            return True
+
+        # A half-supplied pair (sig without ts, or ts without sig) can
+        # never verify; classify it as invalid rather than unsigned so
+        # the advisory log surfaces broken clients distinctly.
+        verdict = "signed-valid" if self._poll_signature_valid(phone, path) else "signed-invalid"
+
+        if verdict == "signed-valid":
+            log.info(
+                "poll verdict=signed-valid mode=%s path=%s phone_id=%s",
+                mode, path, phone.phone_id,
+            )
+            return True
+        if mode == "required":
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "poll_signature_invalid",
+                "detail": (
+                    "poll signature failed verification (bad signature, "
+                    "stale/invalid timestamp, or wrong key)"
+                ),
+            })
+            return False
+        log.warning(
+            "poll verdict=signed-invalid mode=%s path=%s phone_id=%s",
+            mode, path, phone.phone_id,
+        )
+        return True
+
+    def _poll_signature_valid(self, phone: PhoneRegistration, path: str) -> bool:
+        """True only for a fresh signature by the phone's delegated POLL key over this read - whatever the mode."""
+        sig = (self.headers.get(POLL_SIG_HEADER) or "").strip()
+        ts_raw = (self.headers.get(POLL_SIG_TS_HEADER) or "").strip()
+        if not (sig and ts_raw):
+            return False
+        try:
+            ts = int(ts_raw)
+        except ValueError:
+            return False
+        if abs(int(time.time()) - ts) > POLL_SIG_FRESHNESS_SECONDS:
+            return False
+        payload = f"{POLL_SIG_PREFIX}|{phone.phone_id}|{ts}|{path}"
+        # Rule 14.2: reads are signed by the delegated POLL key and
+        # only that key. The identity key is never accepted here, so a
+        # leaked identity signature over a poll is not replayable. A
+        # record with no poll key (only reachable by seeding the store
+        # directly) cannot verify anything: that is a verdict.
+        if not phone.poll_public_key_b64u:
+            return False
+        try:
+            return verify_signature(
+                payload=payload.encode("ascii"),
+                signature_b64u=sig,
+                public_key_b64u=phone.poll_public_key_b64u,
+                algorithm=_registered_algorithm(phone, phone.phone_id),
+            )
+        except BootloaderError:
+            # Undecodable pubkey / unsupported algo: the signature
+            # cannot be validated, which is a verdict, not a
+            # server error.
+            return False
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/manage/push_token
+    # ------------------------------------------------------------------
+
+    def _handle_push_token_update(self, body: dict[str, Any]) -> None:
+        """Phone-side push-token rotation. The phone calls this whenever
+        its FCM / APNs token changes (FCM rotates per Google guidance;
+        APNs tokens can change after backup-restore or reinstall).
+
+        Wire shape matches the phone app's PushTokenUpdateRequest:
+        ``{phone_id, push_token, push_platform}`` ->
+        ``{updated, phone_id}``. Same auth posture as the pending-fetch
+        surface (possession of the registered phone_id); the token is
+        wake-routing metadata, not authority -- a forged update can at
+        worst misroute delivery hints, never request content.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        phone_id = body.get("phone_id", "")
+        push_token = body.get("push_token") or None
+        push_platform = body.get("push_platform") or None
+        if not push_token or push_platform not in ("apns", "fcm"):
+            raise BootloaderError(
+                "push_token and push_platform ('apns' | 'fcm') are required"
+            )
+        phone = cfg.state.get_phone(phone_id)
+        if phone is None:
+            raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        # Signed-poll gate (phone_id split): possession of the phone_id
+        # string stops being the credential once required-mode flips.
+        if not self._check_poll_signature(phone, "/v0.4/manage/push_token"):
+            return
+        # The push fields of a phone the store STILL holds - never an upsert. A phone displaced or revoked between the
+        # read above and this write stays removed (the upsert this replaced put it back in its slot).
+        with cfg.state.registry_lock():
+            if not cfg.state.update_phone_push(phone_id, push_token, push_platform):
+                raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        self._send_json(HTTPStatus.OK, {
+            "updated": True,
+            "phone_id": phone_id,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/issue_session
+    # ------------------------------------------------------------------
+
+    def _handle_issue_session(self, body: dict[str, Any]) -> None:
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        phone_id = body.get("phone_id", "")
+        token = body.get("session_token_jwt", "")
+        phone = cfg.state.get_phone(phone_id)
+        if phone is None:
+            raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        # Verify the JWT signature against the phone's public key, and
+        # parse the claims.
+        claims = verify_jwt(
+            token,
+            public_key_b64u=phone.public_key_b64u,
+            audience=cfg.bootloader_id,
+        )
+        sess = Session(
+            service=claims.service,
+            secret=claims.secret,
+            phone_id=phone_id,
+            jwt=token,
+            expires_at_unix=claims.exp,
+            issued_at_unix=claims.iat,
+            max_uses=claims.recto_max_uses,
+            uses_so_far=0,
+        )
+        cfg.state.put_session(sess)
+        self._send_json(HTTPStatus.CREATED, {
+            "session_id": claims.jti,
+            "expires_at_unix": claims.exp,
+        })
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/pending?phone_id=<id>
+    # ------------------------------------------------------------------
+
+    def _handle_pending(self, url) -> None:
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        params = parse_qs(url.query)
+        phone_ids = params.get("phone_id", [])
+        if not phone_ids:
+            raise BootloaderError("phone_id query parameter required")
+        phone_id = phone_ids[0]
+        phone = cfg.state.get_phone(phone_id)
+        if phone is None:
+            raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        # Signed-poll gate (phone_id split): possession of the phone_id
+        # string stops being the credential once required-mode flips.
+        if not self._check_poll_signature(phone, "/v0.4/pending"):
+            return
+        pending = cfg.state.list_pending_for_phone(phone_id)
+        pending = [self._restamp_grant_window(p) for p in pending]
+        # A DEAD CARD IS WITHDRAWN, NOT SERVED (2026-09-21, operator: "I don't
+        # like that expired cards are sitting in the phone queue"). A
+        # capability card has two clocks: ttl_seconds bounds how long it may
+        # WAIT on the queue (default 3600) and the signed claims' exp bounds
+        # how long its AUTHORITY lives (the bridge posts ten minutes). When
+        # exp has passed the card can be neither approved nor denied -- the
+        # bootloader would refuse the signature -- yet the queue kept serving
+        # it for the rest of its ttl, and the phone rendered it as "window
+        # closed, nothing to tap here" for up to fifty minutes. Now the first
+        # poll after exp takes it off the queue; the phone's next poll simply
+        # does not see it. The agent that wanted it re-requests (it always
+        # had to). Restamping runs first, so a grant_ttl card's window is
+        # judged AFTER card-open sets it, never on the queue-time claims.
+        pending = [p for p in pending if not self._withdraw_if_authority_expired(p)]
+        # THE OWNER SLOTS: an owner-slot approval card is served only to a read whose poll signature verifies, in every
+        # mode - an unsigned read names a ref anyone knows, and the card's id would let a stranger work at it.
+        if not self._poll_signature_valid(phone, "/v0.4/pending"):
+            owner_cards = {cid for r in cfg.state.list_owner_enrolls() for cid in (r.get("cards") or {})}
+            pending = [p for p in pending if p.request_id not in owner_cards
+                       and not str(p.secret).startswith("top-plane:")]
+        body: dict[str, Any] = {
+            "requests": [self._pending_to_wire(p) for p in pending],
+        }
+        # THE GRANT REQUESTS (hard rule 15.z): held in memory, served only to the phone they ring, inside the same
+        # server-signed envelope as every other card. Only a read whose poll signature verifies sees them - the
+        # platform's words about its user never reach a reader who merely knows a phone_id.
+        if cfg.user_vault_grant_requests is not None and self._poll_signature_valid(phone, "/v0.4/pending"):
+            body["requests"].extend(self._grant_request_to_wire(r)
+                                    for r in cfg.user_vault_grant_requests.open_for_phone(phone_id))
+        # SERVER-SIGNED CARDS (2026-09-16). The phone dropped its TLS leaf pin
+        # for the bootloader's own key; attest proves WHO the server is but
+        # binds no channel, so an interposer holding a CA-issued cert could
+        # relay attest and still inject a card. This signature makes a card
+        # that did not come from this key impossible to RENDER. The digest is
+        # over the exact bytes the phone receives for `requests`: _send_json
+        # is json.dumps(sort_keys=True) and dumps is compositional, so the
+        # sub-list's text inside the body equals dumps(sub-list) here.
+        # sub = phone:<id> so one phone's envelope cannot be replayed to another.
+        if cfg.devices_pair_signing_key is not None:
+            body["pending_jws"] = self._sign_pending_envelope(phone_id, body["requests"])
+        self._send_json(HTTPStatus.OK, body)
+
+    def _sign_pending_envelope(self, phone_id: str, requests_wire: list) -> str:
+        from recto.capability.pair_record import CLOCK_SKEW_SECONDS, PENDING_ACTION, PENDING_WINDOW_SECONDS
+        from recto.capability.signing import mint_jws
+        from recto.capability.types import CapabilityClaims, CapabilityClause, CapabilityScope
+
+        cfg = self.config
+        requests_json = json.dumps(requests_wire, sort_keys=True).encode("utf-8")
+        now = int(time.time())
+        registry_version = "0"
+        if cfg.capability_manifest is not None:
+            registry_version = str(getattr(cfg.capability_manifest, "version", registry_version))
+        claims = CapabilityClaims(
+            iss=f"bootloader:{cfg.bootloader_id}",
+            sub=f"phone:{phone_id}",
+            aud=["recto-phone"],
+            iat=now,
+            nbf=now - CLOCK_SKEW_SECONDS,
+            exp=now + PENDING_WINDOW_SECONDS,
+            jti=f"pending-{uuid.uuid4().hex}",
+            cap=CapabilityClause(
+                tier=0,
+                registry_version=registry_version,
+                scope=CapabilityScope(payload_sha256=hashlib.sha256(requests_json).hexdigest()),
+                allow_actions=[PENDING_ACTION],
+            ),
+            purpose="bootloader pending envelope",
+            max_uses=1,
+        )
+        return mint_jws(claims, cfg.devices_pair_signing_key)
+
+    def _withdraw_if_authority_expired(self, req) -> bool:
+        """True (and the request is TAKEN off the queue) when a capability
+        card's signed authority has already expired. Other kinds, and cards
+        whose claims cannot be read, are left alone: withdrawing is only ever
+        done on a verdict, never on a parse failure."""
+        cfg = self.config
+        if req.kind != "capability_request" or not req.cap_payload_b64 or cfg.state is None:
+            return False
+        try:
+            pad = "=" * (-len(req.cap_payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(req.cap_payload_b64 + pad))
+            exp = int(payload["exp"])
+        except Exception:  # noqa: BLE001 - unreadable claims are not a verdict
+            return False
+        if exp > int(time.time()):
+            return False
+        cfg.state.take_pending(req.request_id)
+        logging.getLogger("recto.bootloader.pending").info(
+            "card withdrawn: authority expired request_id=%s phone_id=%s exp=%s",
+            req.request_id, req.phone_id, exp,
+        )
+        return True
+
+    def _restamp_grant_window(self, req):
+        """Re-stamp a queued capability_request's grant window at
+        card-open (v0.6+ queued-card flow).
+
+        A capability request that declared ``grant_ttl_seconds`` gets
+        its claims' iat/nbf/exp REBUILT — iat = nbf = now, exp = now +
+        grant_ttl — the FIRST time the phone fetches the pending list.
+        Card-open is the anchor: the authority window starts when the
+        operator looks, not when the requesting agent queued the card
+        (which can be many minutes earlier, while verifier-side
+        lifetime ceilings are deliberately short).
+
+        Stamped EXACTLY ONCE (``cap_window_stamped_at_unix`` guards):
+        the phone signs the bytes it fetched, and mutating them on a
+        later poll would make the returned signature verify against
+        nothing. A card opened but not approved within the grant
+        window yields a JWS the downstream verifier refuses as
+        expired — the designed failure; the agent re-requests.
+
+        Non-capability kinds and requests without a grant TTL pass
+        through untouched.
+        """
+        if (
+            req.kind != "capability_request"
+            or req.cap_grant_ttl_seconds is None
+            or req.cap_window_stamped_at_unix is not None
+            or not req.cap_payload_b64
+        ):
+            return req
+        import base64 as _base64
+        import json as _json
+        from dataclasses import replace as _replace
+
+        from recto.capability.jwt import (
+            _dict_to_claims as _to_claims,
+            build_signing_input,
+        )
+        try:
+            pad = "=" * (-len(req.cap_payload_b64) % 4)
+            payload = _json.loads(_base64.urlsafe_b64decode(req.cap_payload_b64 + pad))
+            now = int(time.time())
+            payload["iat"] = now
+            payload["nbf"] = now
+            payload["exp"] = now + req.cap_grant_ttl_seconds
+            claims = _to_claims(payload)
+            digest, header_b64, payload_b64 = build_signing_input(claims)
+        except Exception as exc:
+            # A claims set that queued cleanly but no longer rebuilds is
+            # a defect worth surfacing, not hiding behind a stale window.
+            raise BootloaderError(
+                f"grant-window re-stamp failed for {req.request_id}: {exc}"
+            ) from exc
+        payload_hash_b64u = (
+            base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        )
+        updated = _replace(
+            req,
+            cap_header_b64=header_b64,
+            cap_payload_b64=payload_b64,
+            payload_hash_b64u=payload_hash_b64u,
+            cap_window_stamped_at_unix=now,
+        )
+        self.config.state.add_pending(updated)
+        return updated
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/manage/phones?phone_id=<self>
+    # ------------------------------------------------------------------
+    #
+    # Returns every paired phone OTHER than the requesting phone. The
+    # MAUI client renders these as the "Registered phones" pane so the
+    # operator can see what other devices share the bootloader and
+    # revoke any that have been lost. Single-user-operator scoping
+    # today (Recto's current model: one operator, N paired devices);
+    # multi-tenant scoping (per-user filter) is a future v3 concern
+    # that adds a `user_id` filter clause without changing the contract.
+
+    def _handle_manage_phones(self, url) -> None:
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        params = parse_qs(url.query)
+        phone_ids = params.get("phone_id", [])
+        if not phone_ids:
+            raise BootloaderError("phone_id query parameter required")
+        requester_phone_id = phone_ids[0]
+        requester = cfg.state.get_phone(requester_phone_id)
+        if requester is None:
+            raise UnknownPhoneError(
+                f"phone_id {requester_phone_id!r} not registered"
+            )
+        # Signed-poll gate (phone_id split): possession of the phone_id
+        # string stops being the credential once required-mode flips.
+        if not self._check_poll_signature(requester, "/v0.4/manage/phones"):
+            return
+        # Rule 14.2 reads, ahead of the flip: the list of phones answers only a read whose poll signature verifies,
+        # in every signed_poll_mode, as an owner card does.
+        if not self._poll_signature_valid(requester, "/v0.4/manage/phones"):
+            sent = bool((self.headers.get(POLL_SIG_HEADER) or "").strip())
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "poll_signature_invalid" if sent else "poll_signature_required",
+                "detail": "/v0.4/manage/phones answers only a read signed by the phone's poll key",
+            })
+            return
+        # THE MEMBER PLANE: a member lists no business phone (and no other member).
+        if requester.slot not in SLOTS:
+            self._send_json(HTTPStatus.OK, {"phones": []})
+            return
+        others = [
+            p for p in cfg.state.list_phones()
+            if p.phone_id != requester_phone_id
+        ]
+        self._send_json(HTTPStatus.OK, {
+            "phones": [
+                {
+                    "phone_id": p.phone_id,
+                    # Additive reference field (phone_id split); never
+                    # auth. Unknown key to pre-split phone clients.
+                    "phone_ref": _phone_ref(p.public_key_b64u),
+                    "slot": p.slot,
+                    "device_label": p.device_label,
+                    "algorithm": (
+                        p.supported_algorithms[0]
+                        if p.supported_algorithms
+                        else ""
+                    ),
+                    "paired_at": datetime.fromtimestamp(
+                        p.registered_at_unix, tz=timezone.utc
+                    ).isoformat(),
+                }
+                for p in others
+            ],
+        })
+
+    @staticmethod
+    def _pending_to_wire(p: PendingRequest) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "child_pid": p.child_pid,
+            "child_argv0": p.child_argv0,
+            "requested_at_unix": p.requested_at_unix,
+            "operation_description": p.operation_description,
+            "payload_hash_b64u": p.payload_hash_b64u,
+        }
+        # ETH-specific context fields. Emitted only when actually set so
+        # non-ETH kinds keep an unchanged wire shape (kept-keys minimal,
+        # easier to assert in tests). Mirrors the C# PendingRequestContext
+        # additions in Recto.Shared.Protocol.V04.
+        if p.kind == "eth_sign":
+            context["eth_chain_id"] = p.eth_chain_id
+            context["eth_message_kind"] = p.eth_message_kind
+            context["eth_address"] = p.eth_address
+            context["eth_derivation_path"] = p.eth_derivation_path
+            if p.eth_message_text is not None:
+                context["eth_message_text"] = p.eth_message_text
+            if p.eth_typed_data_json is not None:
+                context["eth_typed_data_json"] = p.eth_typed_data_json
+            if p.eth_transaction_json is not None:
+                context["eth_transaction_json"] = p.eth_transaction_json
+        # BTC-specific context fields. Same pattern as ETH — emitted only
+        # for `btc_sign` kind so non-BTC wire shape is unchanged.
+        if p.kind == "btc_sign":
+            context["btc_network"] = p.btc_network
+            context["btc_message_kind"] = p.btc_message_kind
+            context["btc_address"] = p.btc_address
+            context["btc_derivation_path"] = p.btc_derivation_path
+            if p.btc_message_text is not None:
+                context["btc_message_text"] = p.btc_message_text
+            if p.btc_psbt_base64 is not None:
+                context["btc_psbt_base64"] = p.btc_psbt_base64
+            # Wave-7 multi-coin: emit btc_coin so the phone can pick the
+            # right preamble + address format. Default null at the wire
+            # layer so v0.5 phones (which would silently treat absent
+            # field as Bitcoin) don't break.
+            if p.btc_coin is not None and p.btc_coin != "btc":
+                context["btc_coin"] = p.btc_coin
+        # ED25519-chain context (kind == "ed_sign", wave-8). Same
+        # emit-only-when-set pattern as ETH/BTC so non-ed wire shape
+        # is unchanged. Mirrors the C# `PendingRequestContext` ED
+        # additions in `Recto.Shared.Protocol.V04`.
+        if p.kind == "ed_sign":
+            context["ed_chain"] = p.ed_chain
+            context["ed_message_kind"] = p.ed_message_kind
+            context["ed_address"] = p.ed_address
+            context["ed_derivation_path"] = p.ed_derivation_path
+            if p.ed_message_text is not None:
+                context["ed_message_text"] = p.ed_message_text
+            if p.ed_payload_hex is not None:
+                context["ed_payload_hex"] = p.ed_payload_hex
+        # TRON-specific context (kind == "tron_sign", wave-9). Same
+        # emit-only-when-set pattern. Mirrors the C# `PendingRequestContext`
+        # TRON additions in `Recto.Shared.Protocol.V04`.
+        if p.kind == "tron_sign":
+            context["tron_network"] = p.tron_network
+            context["tron_message_kind"] = p.tron_message_kind
+            context["tron_address"] = p.tron_address
+            context["tron_derivation_path"] = p.tron_derivation_path
+            if p.tron_message_text is not None:
+                context["tron_message_text"] = p.tron_message_text
+            if p.tron_payload_hex is not None:
+                context["tron_payload_hex"] = p.tron_payload_hex
+        # Capability-request context (kind == "capability_request",
+        # Phase 5 Wave B). Phone signs `SHA-256(f"{cap_header_b64}.{
+        # cap_payload_b64}".encode("ascii"))` with the operator's
+        # secp256k1 BIP-39-derived key and returns the 64-byte raw
+        # r||s on the respond endpoint. The phone-side render arm
+        # (Wave B part 2) decodes cap_payload_b64 to extract the
+        # CapabilityClaims and renders the structured-list approval
+        # UI with foundation-count breakdown; until part 2 lands, the
+        # current Home.razor falls through to the generic kind label
+        # which is fine for routing-layer testing.
+        if p.kind == "capability_request":
+            context["cap_header_b64"] = p.cap_header_b64
+            context["cap_payload_b64"] = p.cap_payload_b64
+            if p.cap_agent_id is not None:
+                context["cap_agent_id"] = p.cap_agent_id
+        # Profile-create context (kind == "profile_create", Phase 2.0.B
+        # integration). Phone-side render arm (Wave C.3 in
+        # Recto.Shared/Pages/Home.razor) reads candidate_kind /
+        # candidate_display_name / derivation purpose+coin_type+index +
+        # theme_hint / scim_provider to render the approval card. The
+        # signing input (canonical JSON of these fields plus the
+        # master_pubkey_hex) lives in cap_payload_b64 so the phone can
+        # re-derive the digest after injecting child_pubkey_hex at
+        # signing time.
+        if p.kind == "profile_create":
+            context["candidate_profile_id"] = p.candidate_profile_id
+            context["candidate_kind"] = p.candidate_kind
+            context["candidate_display_name"] = p.candidate_display_name
+            context["candidate_derivation_purpose"] = p.candidate_derivation_purpose
+            context["candidate_derivation_coin_type"] = p.candidate_derivation_coin_type
+            context["candidate_derivation_index"] = p.candidate_derivation_index
+            if p.candidate_theme_hint is not None:
+                context["candidate_theme_hint"] = p.candidate_theme_hint
+            if p.candidate_scim_provider is not None:
+                context["candidate_scim_provider"] = p.candidate_scim_provider
+            if p.cap_payload_b64 is not None:
+                context["cap_payload_b64"] = p.cap_payload_b64
+            if p.cap_agent_id is not None:
+                context["cap_agent_id"] = p.cap_agent_id
+        # Profile-add-device context (kind == "profile_add_device",
+        # Phase 2.0.C wave C.5 integration). Phone-side render arm
+        # displays addev_profile_id (target profile) + addev_new_phone_id
+        # (the new device being authorized) + optional friendly label.
+        # Signing input (canonical JSON of profile_id + new_phone_id +
+        # added_at_unix + request_id) lives in cap_payload_b64; phone
+        # SHA-256s it and signs with the operator master key. No
+        # phone-supplied field needs injection at respond time, unlike
+        # profile_create's child_pubkey_hex flow.
+        if p.kind == "profile_add_device":
+            context["addev_profile_id"] = p.addev_profile_id
+            context["addev_new_phone_id"] = p.addev_new_phone_id
+            if p.addev_new_phone_label is not None:
+                context["addev_new_phone_label"] = p.addev_new_phone_label
+            if p.cap_payload_b64 is not None:
+                context["cap_payload_b64"] = p.cap_payload_b64
+            if p.cap_agent_id is not None:
+                context["cap_agent_id"] = p.cap_agent_id
+        # Profile-revoke-device context (kind == "profile_revoke_device",
+        # Phase 2.0.C wave C.6 integration). Phone-side render arm
+        # displays revdev_profile_id (target) + revdev_phone_id_to_revoke
+        # (the device being removed) + optional revoker_label (the
+        # name of the device that's signing the revocation, for the
+        # operator's situational awareness). Signing input lives in
+        # cap_payload_b64; phone SHA-256s it and signs with the
+        # operator master key (m/44'/60'/0'/0/0). Same shape as
+        # profile_add_device's wire — no phone-supplied field at
+        # respond time.
+        if p.kind == "profile_revoke_device":
+            context["revdev_profile_id"] = p.revdev_profile_id
+            context["revdev_phone_id_to_revoke"] = p.revdev_phone_id_to_revoke
+            if p.revdev_revoker_label is not None:
+                context["revdev_revoker_label"] = p.revdev_revoker_label
+            if p.cap_payload_b64 is not None:
+                context["cap_payload_b64"] = p.cap_payload_b64
+            if p.cap_agent_id is not None:
+                context["cap_agent_id"] = p.cap_agent_id
+        # Phase 5 Wave C part 3: app_context. Generic top-level field
+        # (NOT capability-specific) so every phone-rendered request
+        # kind carries it. Bootloader injects from
+        # BootloaderConfig.principal_apps at queue time. Emit-only-
+        # when-set; nested object fields are also omit-when-null so
+        # the wire shape stays compact.
+        if p.app_context is not None:
+            ac = p.app_context
+            ac_obj: dict[str, Any] = {
+                "app_id": ac.app_id,
+                "app_name": ac.app_name,
+                "app_description": ac.app_description,
+            }
+            if ac.app_url is not None:
+                ac_obj["app_url"] = ac.app_url
+            if ac.app_icon_url is not None:
+                ac_obj["app_icon_url"] = ac.app_icon_url
+            if ac.app_version is not None:
+                ac_obj["app_version"] = ac.app_version
+            context["app_context"] = ac_obj
+        # Actor context (capability_request only): the consumer-supplied
+        # display identity of the acting agent. Emit-only-when-set;
+        # icon omitted when null. Transport, never a claim -- the phone
+        # cross-checks actor_id against the signed subject before it
+        # shows the name or the face.
+        if p.actor_context is not None:
+            actr = p.actor_context
+            actor_obj: dict[str, Any] = {
+                "actor_id": actr.actor_id,
+                "actor_name": actr.actor_name,
+            }
+            if actr.actor_icon_url is not None:
+                actor_obj["actor_icon_url"] = actr.actor_icon_url
+            context["actor_context"] = actor_obj
+        return {
+            "request_id": p.request_id,
+            "kind": p.kind,
+            "service": p.service,
+            "secret": p.secret,
+            "context": context,
+        }
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/respond/<request_id>
+    # ------------------------------------------------------------------
+
+    def _handle_respond(self, request_id: str, body: dict[str, Any]) -> None:
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if self._owner_enroll_for_card(request_id) is not None:
+            self._respond_owner_enroll(request_id, body)
+            return
+        card = cfg.state.peek_pending(request_id)
+        if card is not None and not str(card.secret).startswith("top-plane:"):
+            pass  # an ordinary card: the top-plane records are not read for it
+        elif self._top_plane_record_for_card(request_id) is not None:
+            self._top_plane_call(lambda: self._respond_top_plane_card(request_id, body))
+            return
+        elif any(request_id in (r.get("cards") or {}) for r in cfg.state.list_top_plane_records()):
+            # A top-plane card whose act expired, or whose reset was cancelled or completed, is answered by name and
+            # never falls through to the generic single_sign path.
+            cfg.state.take_pending(request_id)
+            self._send_json(HTTPStatus.GONE, {"error": "top_plane_card_expired",
+                                              "detail": "this act or reset is closed; start it again"})
+            return
+        req = cfg.state.take_pending(request_id)
+        if req is None:
+            raise PendingRequestNotFoundError(
+                f"request_id {request_id!r} not found"
+            )
+        decision = body.get("decision", "")
+        if decision == "denied":
+            # Operator declined; surface to whoever is awaiting the
+            # response. The waiting mechanism (an in-process Future or
+            # similar) is the launcher's responsibility; the bootloader
+            # just marks the pending as resolved-with-denial.
+            reason = body.get("reason", "denied")
+            self._notify_resolved(req, ok=False, signature_b64u=None,
+                                  eth_signature_rsv=None,
+                                  btc_signature_base64=None,
+                                  reason=reason)
+            # For capability_request, also stash a denied result so the
+            # requesting agent's poll endpoint can return a clean
+            # "denied" status with the operator's reason.
+            if req.kind == "capability_request":
+                self._store_capability_result(
+                    req,
+                    status="denied",
+                    capability_jws=None,
+                    reason=reason,
+                )
+            # For profile_create (Phase 2.0.B), same pattern — caller
+            # polls /v0.4/profile/result/<request_id> and gets a clean
+            # denied status without re-prompting the operator.
+            elif req.kind == "profile_create":
+                self._store_profile_create_result(
+                    req,
+                    status="denied",
+                    profile_id=None,
+                    reason=reason,
+                )
+            elif req.kind == "profile_add_device":
+                self._store_profile_add_device_result(
+                    req,
+                    status="denied",
+                    profile_id=None,
+                    new_phone_id=None,
+                    reason=reason,
+                )
+            elif req.kind == "profile_revoke_device":
+                self._store_profile_revoke_device_result(
+                    req,
+                    status="denied",
+                    profile_id=None,
+                    phone_id_revoked=None,
+                    reason=reason,
+                )
+            self._send_json(HTTPStatus.OK, {"resolved": True})
+            return
+        if decision != "approved":
+            raise BootloaderError(f"unknown decision {decision!r}")
+        sig = body.get("signature_b64u", "")
+        phone = cfg.state.get_phone(req.phone_id)
+        if phone is None:
+            raise UnknownPhoneError(f"phone {req.phone_id!r} no longer registered")
+        # Verify the phone's signature over the payload hash.
+        # The phone signs the BLAKE2b-256 hash, not the raw payload,
+        # so we verify against the hash bytes.
+        # For kind=="eth_sign" this Ed25519 envelope still applies — it
+        # proves the response came from the paired phone. The Ethereum
+        # secp256k1 r||s||v signature rides alongside as an opaque
+        # forwarded value (see protocol RFC §"Approval response").
+        padding = "=" * (-len(req.payload_hash_b64u) % 4)
+        hash_bytes = base64.urlsafe_b64decode(req.payload_hash_b64u + padding)
+        # The phone's registered algorithm (ed25519 or ecdsa-p256, etc.)
+        # determines the verify path. Without this, ecdsa-p256-pubkey
+        # phones fail with "ed25519 public key must decode to 32 bytes;
+        # got 64" because verify_signature defaults to ed25519.
+        phone_algo = _registered_algorithm(phone, phone.phone_id)
+        ok = verify_signature(
+            payload=hash_bytes,
+            signature_b64u=sig,
+            public_key_b64u=phone.public_key_b64u,
+            algorithm=phone_algo,
+        )
+        if not ok:
+            self._notify_resolved(req, ok=False, signature_b64u=None,
+                                  eth_signature_rsv=None,
+                                  btc_signature_base64=None,
+                                  reason="signature verification failed")
+            raise BootloaderError("approved-response signature invalid")
+        # Extract the Ethereum signature when the kind is eth_sign. Per
+        # the protocol RFC the bootloader does NOT validate the secp256k1
+        # signature itself — that's the consumer's responsibility (smart
+        # contract on chain, off-chain verifier, capability-JWT scope
+        # enforcer, etc.). We just enforce a structural shape so a
+        # malformed rsv doesn't propagate downstream silently.
+        eth_sig = None
+        if req.kind == "eth_sign":
+            eth_sig = body.get("eth_signature_rsv")
+            if not isinstance(eth_sig, str) or not eth_sig:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="eth_signature_rsv missing on eth_sign approval")
+                raise BootloaderError(
+                    "eth_sign approval missing eth_signature_rsv"
+                )
+            cleaned = eth_sig[2:] if eth_sig.startswith(("0x", "0X")) else eth_sig
+            # personal_sign + typed_data return a 65-byte r||s||v signature
+            # (130 hex chars). transaction returns the FULL signed raw-tx
+            # bytes (0x02 || rlp([fields..., yParity, r, s])) which varies
+            # in length depending on the access-list size and the byte
+            # widths of the signed integers (typical simple ETH transfer
+            # is ~108-114 bytes / ~216-228 hex chars; an EIP-1559 tx with
+            # accessList entries can be much longer). For transaction we
+            # accept any length above a sane minimum and let the consumer
+            # (RPC node / eth_sendRawTransaction) do the heavy validation.
+            kind = req.eth_message_kind or "personal_sign"
+            if kind == "transaction":
+                if len(cleaned) < 200:
+                    self._notify_resolved(req, ok=False, signature_b64u=None,
+                                          eth_signature_rsv=None,
+                                          btc_signature_base64=None,
+                                          reason="eth_signature_rsv too short for transaction")
+                    raise BootloaderError(
+                        f"eth_signature_rsv for transaction must be at least 200 hex chars (signed-tx is too short to be valid), got {len(cleaned)}"
+                    )
+            else:
+                if len(cleaned) != 130:
+                    self._notify_resolved(req, ok=False, signature_b64u=None,
+                                          eth_signature_rsv=None,
+                                          btc_signature_base64=None,
+                                          reason="eth_signature_rsv wrong length")
+                    raise BootloaderError(
+                        f"eth_signature_rsv for {kind} must be 130 hex chars after optional 0x prefix, got {len(cleaned)}"
+                    )
+            try:
+                bytes.fromhex(cleaned)
+            except ValueError as exc:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="eth_signature_rsv not hex")
+                raise BootloaderError(
+                    f"eth_signature_rsv must be hex, got {exc}"
+                ) from exc
+        # Same shape for btc_sign: structure-check only, opaque forward.
+        # BIP-137 compact signatures are 65 raw bytes base64-encoded,
+        # which is 88 chars (with padding) or 87 chars (without).
+        # Some encoders strip trailing `=` padding; accept both.
+        btc_sig = None
+        if req.kind == "btc_sign":
+            btc_sig = body.get("btc_signature_base64")
+            if not isinstance(btc_sig, str) or not btc_sig:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="btc_signature_base64 missing on btc_sign approval")
+                raise BootloaderError(
+                    "btc_sign approval missing btc_signature_base64"
+                )
+            try:
+                decoded = base64.b64decode(btc_sig.strip(), validate=False)
+            except Exception as exc:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="btc_signature_base64 not base64")
+                raise BootloaderError(
+                    f"btc_signature_base64 must be valid base64, got {exc}"
+                ) from exc
+            if len(decoded) != 65:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="btc_signature_base64 wrong decoded length")
+                raise BootloaderError(
+                    f"btc_signature_base64 must decode to 65 bytes, got {len(decoded)}"
+                )
+            header = decoded[0]
+            if header < 27 or header > 42:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      reason="btc_signature_base64 header byte out of range")
+                raise BootloaderError(
+                    f"BIP-137 header byte must be in 27..42, got {header}"
+                )
+        # Same shape for ed_sign: structure-check only, opaque forward.
+        # Raw ed25519 signatures are exactly 64 bytes (R||S). The
+        # response also carries ed_pubkey_hex (32-byte ed25519 public
+        # key, 64 hex chars) because XRP addresses are HASH160s and
+        # can't recover their pubkey — for protocol uniformity all
+        # three ed25519 chains carry the pubkey explicitly. The
+        # bootloader does NOT verify the ed25519 signature itself —
+        # that's the consumer's responsibility (chain RPC node /
+        # off-chain attestation verifier / capability-scope enforcer).
+        ed_sig: str | None = None
+        ed_pub: str | None = None
+        if req.kind == "ed_sign":
+            ed_sig = body.get("ed_signature_base64")
+            if not isinstance(ed_sig, str) or not ed_sig:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_signature_base64 missing on ed_sign approval")
+                raise BootloaderError(
+                    "ed_sign approval missing ed_signature_base64"
+                )
+            try:
+                ed_decoded = base64.b64decode(ed_sig.strip(), validate=False)
+            except Exception as exc:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_signature_base64 not base64")
+                raise BootloaderError(
+                    f"ed_signature_base64 must be valid base64, got {exc}"
+                ) from exc
+            if len(ed_decoded) != 64:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_signature_base64 wrong decoded length")
+                raise BootloaderError(
+                    f"ed_signature_base64 must decode to 64 bytes, got {len(ed_decoded)}"
+                )
+            ed_pub = body.get("ed_pubkey_hex")
+            if not isinstance(ed_pub, str) or not ed_pub:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_pubkey_hex missing on ed_sign approval")
+                raise BootloaderError(
+                    "ed_sign approval missing ed_pubkey_hex"
+                )
+            ed_pub_clean = ed_pub.strip()
+            ed_pub_clean = ed_pub_clean[2:] if ed_pub_clean.startswith(("0x", "0X")) else ed_pub_clean
+            if len(ed_pub_clean) != 64:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_pubkey_hex wrong length")
+                raise BootloaderError(
+                    f"ed_pubkey_hex must be 64 hex chars (32-byte ed25519 pubkey) "
+                    f"after optional 0x prefix, got {len(ed_pub_clean)}"
+                )
+            try:
+                bytes.fromhex(ed_pub_clean)
+            except ValueError as exc:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      reason="ed_pubkey_hex not hex")
+                raise BootloaderError(
+                    f"ed_pubkey_hex must be hex, got {exc}"
+                ) from exc
+            # Normalize ed_pub to the un-prefixed form for downstream
+            # forwarding so consumers don't have to re-strip.
+            ed_pub = ed_pub_clean
+        # Same shape for tron_sign: structure-check only, opaque
+        # forward. TRON message-signing produces a 65-byte r||s||v
+        # secp256k1 signature exactly like Ethereum (130 hex chars
+        # after optional 0x prefix). The bootloader does NOT verify
+        # the secp256k1 signature itself -- consumers (chain RPC /
+        # off-chain verifier / capability-scope enforcer) recover
+        # the address via `recto.tron.recover_address` and compare
+        # to `tron_address` from the request context.
+        tron_sig: str | None = None
+        if req.kind == "tron_sign":
+            tron_sig = body.get("tron_signature_rsv")
+            if not isinstance(tron_sig, str) or not tron_sig:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="tron_signature_rsv missing on tron_sign approval")
+                raise BootloaderError(
+                    "tron_sign approval missing tron_signature_rsv"
+                )
+            cleaned = tron_sig[2:] if tron_sig.startswith(("0x", "0X")) else tron_sig
+            # message_signing returns 65-byte r||s||v = 130 hex chars.
+            # transaction is reserved (refused at construction time);
+            # add a length floor only when TRON transaction signing
+            # actually lands.
+            if len(cleaned) != 130:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="tron_signature_rsv wrong length")
+                raise BootloaderError(
+                    f"tron_signature_rsv must be 130 hex chars after optional "
+                    f"0x prefix, got {len(cleaned)}"
+                )
+            try:
+                bytes.fromhex(cleaned)
+            except ValueError as exc:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="tron_signature_rsv not hex")
+                raise BootloaderError(
+                    f"tron_signature_rsv must be hex, got {exc}"
+                ) from exc
+        # Capability-request approval (Phase 5 Wave B). Phone returns
+        # the secp256k1 sig over SHA-256(`{cap_header_b64}.{cap_payload_b64}`)
+        # via cap_signature_b64u (64 raw bytes, base64url-encoded). The
+        # bootloader assembles the final 3-part JWS and stores it as a
+        # CapabilityResult for the requesting agent to fetch via the
+        # result endpoint. If cfg.capability_operator_pubkey is set,
+        # the bootloader also verifies the JWS signature recovers to
+        # the expected operator pubkey before storing — production
+        # deployments MUST configure this; dev / test deployments may
+        # leave it None and trust the Ed25519 paired-phone envelope
+        # alone (the signature is still produced by the phone, just
+        # not pubkey-verified by the bootloader).
+        capability_jws: str | None = None
+        if req.kind == "capability_request":
+            cap_sig_b64u = body.get("cap_signature_b64u")
+            if not isinstance(cap_sig_b64u, str) or not cap_sig_b64u:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      capability_jws=None,
+                                      reason="cap_signature_b64u missing on capability_request approval")
+                self._store_capability_result(
+                    req, status="signature_error", capability_jws=None,
+                    reason="cap_signature_b64u missing",
+                )
+                raise BootloaderError(
+                    "capability_request approval missing cap_signature_b64u"
+                )
+            try:
+                cap_pad = "=" * (-len(cap_sig_b64u) % 4)
+                cap_sig_bytes = base64.urlsafe_b64decode(cap_sig_b64u + cap_pad)
+            except Exception as exc:  # noqa: BLE001
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      capability_jws=None,
+                                      reason="cap_signature_b64u not base64url")
+                self._store_capability_result(
+                    req, status="signature_error", capability_jws=None,
+                    reason=f"cap_signature_b64u not base64url: {exc}",
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must be base64url, got {exc}"
+                ) from exc
+            if len(cap_sig_bytes) != 64:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      capability_jws=None,
+                                      reason="cap_signature_b64u wrong decoded length")
+                self._store_capability_result(
+                    req, status="signature_error", capability_jws=None,
+                    reason=(
+                        f"cap_signature_b64u must decode to 64 bytes "
+                        f"(raw r||s); got {len(cap_sig_bytes)}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must decode to 64 bytes, "
+                    f"got {len(cap_sig_bytes)}"
+                )
+            # Assemble the final 3-part JWS. Imported lazily to keep
+            # the bootloader package importable without recto.capability
+            # for other endpoints.
+            from recto.capability.jwt import assemble_jws as _assemble_jws
+            capability_jws = _assemble_jws(
+                req.cap_header_b64, req.cap_payload_b64, cap_sig_bytes,
+            )
+            # Verify the assembled JWS signature recovers to the operator
+            # pubkey. Defense against a phone-side bug that signs the wrong
+            # digest.
+            #
+            # THIS BLOCK USED TO READ `if cfg.capability_operator_pubkey is
+            # not None:` — i.e. it SKIPPED verification entirely when no
+            # operator key was configured, and returned the assembled JWS
+            # anyway. Every other site that consumes this field already
+            # fails closed (:1981, :2189, :2385, :4946 all refuse when it is
+            # None); this one was the lone fail-open, and the default is
+            # None. A bootloader that has never been told who the operator
+            # is would mint on any signature it was handed.
+            #
+            # This is not necessarily the only verification of a minted
+            # capability: a consuming service is expected to verify the JWS
+            # against its own configured operator pubkey before acting on it.
+            # So the check here is defence in depth rather than the sole
+            # gate. It fails closed regardless, because a defence that
+            # silently disables itself is not one.
+            if cfg.capability_operator_pubkey is None:
+                reason = (
+                    "capability minting requires capability_operator_pubkey; "
+                    "none is configured. Provision it (vault_root.json in the "
+                    "bootloader state dir, written at spawn) and restart."
+                )
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      capability_jws=None,
+                                      reason=reason)
+                self._store_capability_result(
+                    req, status="not_configured", capability_jws=None,
+                    reason=reason,
+                )
+                raise BootloaderError(reason)
+
+            from recto.capability.jwt import verify_jws as _verify_jws
+            try:
+                _verify_jws(
+                    capability_jws,
+                    expected_pubkey=cfg.capability_operator_pubkey,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      capability_jws=None,
+                                      reason=f"capability JWS verify failed: {exc}")
+                self._store_capability_result(
+                    req, status="signature_error", capability_jws=None,
+                    reason=f"capability JWS verify failed: {exc}",
+                )
+                raise BootloaderError(
+                    f"capability JWS signature did not verify against "
+                    f"operator pubkey: {exc}"
+                ) from exc
+            # All structure / signature checks passed — stash the
+            # assembled JWS for the agent's result-poll fetch.
+            self._store_capability_result(
+                req, status="approved",
+                capability_jws=capability_jws, reason=None,
+            )
+        # Profile-create approval (Phase 2.0.B). Phone returns the
+        # secp256k1 master-attestation sig over
+        # SHA-256(canonical_json(candidate_fields)) via
+        # cap_signature_b64u (64 raw bytes, base64url-encoded — same
+        # field name and shape as capability_request's signature so
+        # phone-side respond logic doesn't fork). Bootloader:
+        #   1. Decodes + structurally validates the 64-byte raw r||s.
+        #   2. Re-derives the digest from cap_payload_b64 (the canonical-
+        #      JSON encoding stashed at queue time).
+        #   3. Recovers the secp256k1 pubkey from the signature; if it
+        #      matches cfg.capability_operator_pubkey, the master has
+        #      attested to this candidate profile shape.
+        #   4. **Persist-last (Milan commitment B)**: calls
+        #      profile.manage.create_child_profile to atomic-write the
+        #      new Profile row to master_identity.json.
+        #   5. Stashes a ProfileCreateResult with the new profile_id
+        #      for the caller's poll.
+        # Order is critical: every failure path stores a non-approved
+        # result with a clearly-prefixed reason so the caller can
+        # distinguish "phone signed wrong" from "disk write failed"
+        # (Milan commitment C — never claim success when source-of-truth
+        # failed).
+        if req.kind == "profile_create":
+            cap_sig_b64u = body.get("cap_signature_b64u")
+            if not isinstance(cap_sig_b64u, str) or not cap_sig_b64u:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u missing on profile_create approval")
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason="cap_signature_b64u missing",
+                )
+                raise BootloaderError(
+                    "profile_create approval missing cap_signature_b64u"
+                )
+            # Decode + length check
+            try:
+                cap_pad = "=" * (-len(cap_sig_b64u) % 4)
+                cap_sig_bytes = base64.urlsafe_b64decode(cap_sig_b64u + cap_pad)
+            except Exception as exc:  # noqa: BLE001
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u not base64url")
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=f"cap_signature_b64u not base64url: {exc}",
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must be base64url, got {exc}"
+                ) from exc
+            if len(cap_sig_bytes) != 64:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u wrong decoded length")
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"cap_signature_b64u must decode to 64 bytes "
+                        f"(raw r||s); got {len(cap_sig_bytes)}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must decode to 64 bytes, "
+                    f"got {len(cap_sig_bytes)}"
+                )
+            # v2.0.C wave C.1: child_pubkey_hex on the response body
+            # is REQUIRED. The phone derives this from the master
+            # mnemonic at the candidate's BIP-32 path and signs over
+            # the FULL canonical JSON (queue-time candidate fields +
+            # this pubkey). Bootloader reconstructs the same canonical
+            # JSON server-side, SHA-256s it, recovers the secp256k1
+            # signature against the operator pubkey. If the phone lied
+            # about the derived pubkey, the recovered pubkey won't
+            # match the operator and the request fails.
+            #
+            # v2.0.B-shaped responses (no child_pubkey_hex) are
+            # rejected with `protocol_violation` — no conditional
+            # fallback. Operators upgrading bootloader without
+            # upgrading phones get a clear actionable error per the
+            # SPEC.md C.1 design decision.
+            child_pubkey_hex_raw = body.get("child_pubkey_hex")
+            if not isinstance(child_pubkey_hex_raw, str) or not child_pubkey_hex_raw:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="child_pubkey_hex missing on profile_create approval (v2.0.C)")
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        "protocol_violation: child_pubkey_hex required in "
+                        "v2.0.C wire shape; v2.0.B clients must upgrade to "
+                        "a v2.0.C-aware phone build"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_create approval missing child_pubkey_hex (v2.0.C requirement)"
+                )
+            # Normalize: accept 0x / 0x04 prefixed forms (operator
+            # paste-shape footgun defense, same pattern as the vault-
+            # bootstrap pubkey accept path), lowercase, validate
+            # hex chars + length.
+            child_pubkey_clean = child_pubkey_hex_raw.strip().lower()
+            if child_pubkey_clean.startswith("0x"):
+                child_pubkey_clean = child_pubkey_clean[2:]
+            if child_pubkey_clean.startswith("04") and len(child_pubkey_clean) == 130:
+                child_pubkey_clean = child_pubkey_clean[2:]
+            if len(child_pubkey_clean) != 128:
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"child_pubkey_hex must be 128 hex chars after "
+                        f"optional 0x / 0x04 prefix strip; got "
+                        f"{len(child_pubkey_clean)}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_create child_pubkey_hex wrong length: "
+                    f"{len(child_pubkey_clean)}"
+                )
+            try:
+                bytes.fromhex(child_pubkey_clean)
+            except ValueError as exc:
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=f"child_pubkey_hex contains non-hex chars: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_create child_pubkey_hex non-hex: {exc}"
+                ) from exc
+
+            # Re-derive the digest the phone signed over. The signing
+            # input was stashed in cap_payload_b64 at queue time; we
+            # PARSE that JSON back, INJECT child_pubkey_hex (which the
+            # phone added before signing), re-canonicalize with the
+            # same encoder, then SHA-256 the resulting bytes to get
+            # the 32-byte digest the secp256k1 signature is over.
+            try:
+                pad = "=" * (-len(req.cap_payload_b64) % 4)
+                signing_input_bytes = base64.urlsafe_b64decode(req.cap_payload_b64 + pad)
+            except Exception as exc:  # noqa: BLE001
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=f"cap_payload_b64 malformed at verify time: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_create cap_payload_b64 malformed: {exc}"
+                ) from exc
+            try:
+                partial_fields = json.loads(signing_input_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"queue-time cap_payload_b64 not valid JSON at "
+                        f"verify time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_create cap_payload_b64 not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(partial_fields, dict):
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"queue-time cap_payload_b64 must be a JSON object, "
+                        f"got {type(partial_fields).__name__}"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_create cap_payload_b64 not a JSON object"
+                )
+            # Defense: reject any queue-time payload that already
+            # includes child_pubkey_hex (shouldn't happen — bootloader's
+            # _handle_profile_create never stashes it). Catches a
+            # malicious or buggy queue-time injection that would let an
+            # attacker pre-pin the pubkey and skip the master-attestation
+            # binding.
+            if "child_pubkey_hex" in partial_fields:
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        "queue-time cap_payload_b64 unexpectedly includes "
+                        "child_pubkey_hex; expected to be absent until phone "
+                        "supplies"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_create queue-time payload pre-populated child_pubkey_hex"
+                )
+            from recto.capability.jwt import _canonical_json as _to_canonical
+            partial_fields["child_pubkey_hex"] = child_pubkey_clean
+            full_signing_input_bytes = _to_canonical(partial_fields)
+            digest = hashlib.sha256(full_signing_input_bytes).digest()
+            # Verify the master attestation. The operator pubkey MUST
+            # be configured for profile_create to be usable in
+            # production — without it, anyone with a paired phone could
+            # mint profiles. Dev / test deployments that leave it None
+            # MUST treat the Ed25519 paired-phone envelope as the only
+            # signal of authenticity (still meaningful, just not
+            # operator-master-attested).
+            if cfg.capability_operator_pubkey is None:
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        "operator pubkey not configured; profile_create "
+                        "verification requires capability_operator_pubkey "
+                        "to be set via `recto vault bootstrap`"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_create requires capability_operator_pubkey "
+                    "to be configured on the bootloader"
+                )
+            # The phone signs raw r||s (64 bytes); recto.ethereum.recover_public_key
+            # expects the 65-byte r||s||v form, so we try both rec_id
+            # candidates by constructing synthetic rsv signatures —
+            # same pattern recto.capability.jwt.verify_jws uses for the
+            # capability_request flow.
+            from recto.ethereum import recover_public_key as _recover_secp256k1_pubkey
+            matched = False
+            recovery_error: Exception | None = None
+            for rec_id in (0, 1):
+                synthetic_rsv = cap_sig_bytes + bytes([27 + rec_id])
+                try:
+                    candidate = _recover_secp256k1_pubkey(digest, synthetic_rsv)
+                    if candidate == cfg.capability_operator_pubkey:
+                        matched = True
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    recovery_error = exc
+                    continue
+            if not matched:
+                reason_detail = (
+                    f": last error {recovery_error}"
+                    if recovery_error is not None else ""
+                )
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"master attestation did not recover to the "
+                        f"configured operator pubkey{reason_detail}"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_create master attestation did not "
+                    "recover to operator pubkey"
+                )
+            # Milan commitment B — persist BEFORE storing the result.
+            # The atomic write to master_identity.json is the source
+            # of truth; if it fails, the caller's poll will see a
+            # "signature_error: persist_error: <diag>" result and can
+            # diagnose disk state without re-prompting the operator.
+            from recto.profile.manage import (
+                create_child_profile as _create_child_profile,
+            )
+            # Pass the bootloader's state directory through so the
+            # persist lands in the same location as the rest of the
+            # bootloader's persistent state (and same location the
+            # POST endpoint's idempotency precheck loaded from).
+            _state_dir = cfg.state.state_dir
+            try:
+                new_profile = _create_child_profile(
+                    kind=req.candidate_kind,
+                    display_name=req.candidate_display_name,
+                    theme_hint=req.candidate_theme_hint,
+                    scim_provider=req.candidate_scim_provider,
+                    profile_index_override=req.candidate_derivation_index,
+                    profile_id_override=req.candidate_profile_id,
+                    derived_pubkey_hex=child_pubkey_clean,
+                    state_dir=_state_dir,
+                )
+            except FileNotFoundError as exc:
+                # Master not bootstrapped (shouldn't happen — the
+                # _handle_profile_create endpoint checks this before
+                # queueing — but defense-in-depth).
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=(
+                        f"persist_error: MasterIdentity not bootstrapped "
+                        f"at persist time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_create persist failed: master not bootstrapped: {exc}"
+                ) from exc
+            except (OSError, ValueError) as exc:
+                # Filesystem error (permission denied, disk full) OR
+                # validation regression (kind / display_name rejected
+                # at the manage-layer despite passing endpoint
+                # validation). Either way: persist failed, don't lie.
+                self._store_profile_create_result(
+                    req, status="signature_error", profile_id=None,
+                    reason=f"persist_error: {type(exc).__name__}: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_create persist failed: {exc}"
+                ) from exc
+            # Persist succeeded — stash the approved result for the
+            # caller's poll. If the result-store itself fails (in-memory
+            # dict insert is effectively unfailable, but defense-in-depth
+            # for the case where a future durable result-store throws),
+            # log + continue: the profile is on disk and recoverable
+            # via `recto profile list` (Milan commitment B).
+            try:
+                self._store_profile_create_result(
+                    req, status="approved",
+                    profile_id=new_profile.profile_id, reason=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Log via the bootloader's stderr convention; the
+                # caller will see request_not_found and recover via
+                # list. The DISK state is consistent — that's what
+                # matters.
+                print(
+                    f"[bootloader] WARNING: profile_create persist succeeded "
+                    f"(profile_id={new_profile.profile_id!r}) but result-store "
+                    f"failed: {type(exc).__name__}: {exc}. Caller should "
+                    f"recover via `recto profile list`.",
+                    flush=True,
+                )
+        # ----------------------------------------------------------
+        # profile_add_device branch (Phase 2.0.C wave C.5)
+        # ----------------------------------------------------------
+        # Sister of profile_create's branch above but simpler — no
+        # phone-supplied field needs injection at respond time. The
+        # full canonical-JSON signing input was stashed in
+        # cap_payload_b64 at queue time; phone signs SHA-256 of those
+        # exact bytes. Bootloader at respond time decodes
+        # cap_payload_b64, SHA-256s, recovers the secp256k1 signature
+        # against the operator master pubkey, then calls
+        # profile.manage.profile_add_device to append the new phone_id
+        # to the target profile's device_ids tuple.
+        #
+        # Milan partial-failure discipline (same as profile_create):
+        #   * Idempotency-key (caller's request_id) handled at the
+        #     endpoint layer's pre-flight check.
+        #   * Persist BEFORE storing the result (commitment B).
+        #   * Never claim success when persist failed (commitment C):
+        #     all failure paths store status="signature_error" with
+        #     a "persist_error: ..." reason prefix when disk-write
+        #     bombed.
+        if req.kind == "profile_add_device":
+            cap_sig_b64u = body.get("cap_signature_b64u")
+            if not isinstance(cap_sig_b64u, str) or not cap_sig_b64u:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u missing on profile_add_device approval")
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason="cap_signature_b64u missing",
+                )
+                raise BootloaderError(
+                    "profile_add_device approval missing cap_signature_b64u"
+                )
+            try:
+                cap_pad = "=" * (-len(cap_sig_b64u) % 4)
+                cap_sig_bytes = base64.urlsafe_b64decode(cap_sig_b64u + cap_pad)
+            except Exception as exc:  # noqa: BLE001
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u not base64url")
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=f"cap_signature_b64u not base64url: {exc}",
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must be base64url, got {exc}"
+                ) from exc
+            if len(cap_sig_bytes) != 64:
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=(
+                        f"cap_signature_b64u must decode to 64 bytes "
+                        f"(raw r||s); got {len(cap_sig_bytes)}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must decode to 64 bytes, "
+                    f"got {len(cap_sig_bytes)}"
+                )
+            # Decode the queue-time canonical-JSON signing input.
+            try:
+                pad = "=" * (-len(req.cap_payload_b64) % 4)
+                signing_input_bytes = base64.urlsafe_b64decode(
+                    req.cap_payload_b64 + pad
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=f"cap_payload_b64 malformed at verify time: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_add_device cap_payload_b64 malformed: {exc}"
+                ) from exc
+            digest = hashlib.sha256(signing_input_bytes).digest()
+            # Master pubkey required
+            if cfg.capability_operator_pubkey is None:
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=(
+                        "operator pubkey not configured; profile_add_device "
+                        "verification requires capability_operator_pubkey "
+                        "to be set via `recto vault bootstrap`"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_add_device requires capability_operator_pubkey "
+                    "to be configured on the bootloader"
+                )
+            # Recover signature; try both rec_id candidates (same pattern
+            # as profile_create + capability_request).
+            from recto.ethereum import (
+                recover_public_key as _recover_secp256k1_pubkey,
+            )
+            matched = False
+            recovery_error: Exception | None = None
+            for rec_id in (0, 1):
+                synthetic_rsv = cap_sig_bytes + bytes([27 + rec_id])
+                try:
+                    candidate = _recover_secp256k1_pubkey(digest, synthetic_rsv)
+                    if candidate == cfg.capability_operator_pubkey:
+                        matched = True
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    recovery_error = exc
+                    continue
+            if not matched:
+                reason_detail = (
+                    f": last error {recovery_error}"
+                    if recovery_error is not None else ""
+                )
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=(
+                        f"master attestation did not recover to the "
+                        f"configured operator pubkey{reason_detail}"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_add_device master attestation did not "
+                    "recover to operator pubkey"
+                )
+            # Verified — persist via manage.py. Milan commitment B.
+            from recto.profile.manage import (
+                profile_add_device as _profile_add_device,
+            )
+            _state_dir = cfg.state.state_dir
+            try:
+                updated_profile = _profile_add_device(
+                    profile_id=req.addev_profile_id,
+                    new_phone_id=req.addev_new_phone_id,
+                    state_dir=_state_dir,
+                )
+            except KeyError as exc:
+                # Profile not found under the master (rare —
+                # the endpoint pre-flight checks this — but
+                # defense-in-depth).
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=(
+                        f"persist_error: profile_id not found at "
+                        f"persist time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_add_device persist failed: profile not found: {exc}"
+                ) from exc
+            except FileNotFoundError as exc:
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=(
+                        f"persist_error: MasterIdentity not bootstrapped "
+                        f"at persist time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_add_device persist failed: master not bootstrapped: {exc}"
+                ) from exc
+            except (OSError, ValueError) as exc:
+                # ValueError: revoked-profile guard, malformed inputs
+                # OSError: disk full / permission denied at write
+                self._store_profile_add_device_result(
+                    req, status="signature_error",
+                    profile_id=None, new_phone_id=None,
+                    reason=f"persist_error: {type(exc).__name__}: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_add_device persist failed: {exc}"
+                ) from exc
+            # Persist succeeded — stash the approved result for the
+            # caller's poll. Same defense-in-depth as profile_create.
+            try:
+                self._store_profile_add_device_result(
+                    req, status="approved",
+                    profile_id=updated_profile.profile_id,
+                    new_phone_id=req.addev_new_phone_id, reason=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[bootloader] WARNING: profile_add_device persist succeeded "
+                    f"(profile_id={updated_profile.profile_id!r}, "
+                    f"new_phone_id={req.addev_new_phone_id!r}) but result-store "
+                    f"failed: {type(exc).__name__}: {exc}. Caller should "
+                    f"recover via `recto profile show <profile_id>`.",
+                    flush=True,
+                )
+        # ----------------------------------------------------------
+        # profile_revoke_device branch (Phase 2.0.C wave C.6)
+        # ----------------------------------------------------------
+        # Sister of profile_add_device's branch but calls
+        # profile_revoke_device on the manage.py side instead of
+        # profile_add_device. Same Milan partial-failure discipline:
+        # verify signature first, persist via manage.py, store result
+        # only after persist succeeds.
+        #
+        # At v1 this branch handles K=1 master-only signing (the
+        # operator master phone signs the canonical-JSON binding with
+        # its BIP-39-derived secp256k1 key, bootloader recovers
+        # against vault_root.json's operator pubkey). K>=2 quorum
+        # aggregation is rejected at the endpoint pre-flight with
+        # quorum_not_yet_implemented before any queue happens, so by
+        # the time we get here only K=1 requests exist.
+        if req.kind == "profile_revoke_device":
+            cap_sig_b64u = body.get("cap_signature_b64u")
+            if not isinstance(cap_sig_b64u, str) or not cap_sig_b64u:
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u missing on profile_revoke_device approval")
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason="cap_signature_b64u missing",
+                )
+                raise BootloaderError(
+                    "profile_revoke_device approval missing cap_signature_b64u"
+                )
+            try:
+                cap_pad = "=" * (-len(cap_sig_b64u) % 4)
+                cap_sig_bytes = base64.urlsafe_b64decode(cap_sig_b64u + cap_pad)
+            except Exception as exc:  # noqa: BLE001
+                self._notify_resolved(req, ok=False, signature_b64u=None,
+                                      eth_signature_rsv=None,
+                                      btc_signature_base64=None,
+                                      ed_signature_base64=None,
+                                      ed_pubkey_hex=None,
+                                      tron_signature_rsv=None,
+                                      reason="cap_signature_b64u not base64url")
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=f"cap_signature_b64u not base64url: {exc}",
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must be base64url, got {exc}"
+                ) from exc
+            if len(cap_sig_bytes) != 64:
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=(
+                        f"cap_signature_b64u must decode to 64 bytes "
+                        f"(raw r||s); got {len(cap_sig_bytes)}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"cap_signature_b64u must decode to 64 bytes, "
+                    f"got {len(cap_sig_bytes)}"
+                )
+            # Decode the queue-time canonical-JSON signing input.
+            try:
+                pad = "=" * (-len(req.cap_payload_b64) % 4)
+                signing_input_bytes = base64.urlsafe_b64decode(
+                    req.cap_payload_b64 + pad
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=f"cap_payload_b64 malformed at verify time: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_revoke_device cap_payload_b64 malformed: {exc}"
+                ) from exc
+            digest = hashlib.sha256(signing_input_bytes).digest()
+            if cfg.capability_operator_pubkey is None:
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=(
+                        "operator pubkey not configured; "
+                        "profile_revoke_device verification requires "
+                        "capability_operator_pubkey to be set via "
+                        "`recto vault bootstrap`"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_revoke_device requires capability_operator_pubkey "
+                    "to be configured on the bootloader"
+                )
+            from recto.ethereum import (
+                recover_public_key as _recover_secp256k1_pubkey,
+            )
+            matched = False
+            recovery_error: Exception | None = None
+            for rec_id in (0, 1):
+                synthetic_rsv = cap_sig_bytes + bytes([27 + rec_id])
+                try:
+                    candidate = _recover_secp256k1_pubkey(digest, synthetic_rsv)
+                    if candidate == cfg.capability_operator_pubkey:
+                        matched = True
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    recovery_error = exc
+                    continue
+            if not matched:
+                reason_detail = (
+                    f": last error {recovery_error}"
+                    if recovery_error is not None else ""
+                )
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=(
+                        f"master attestation did not recover to the "
+                        f"configured operator pubkey{reason_detail}"
+                    ),
+                )
+                raise BootloaderError(
+                    "profile_revoke_device master attestation did not "
+                    "recover to operator pubkey"
+                )
+            # Verified — persist via manage.py. Milan commitment B.
+            from recto.profile.manage import (
+                profile_revoke_device as _profile_revoke_device,
+            )
+            _state_dir = cfg.state.state_dir
+            try:
+                updated_profile = _profile_revoke_device(
+                    profile_id=req.revdev_profile_id,
+                    phone_id_to_revoke=req.revdev_phone_id_to_revoke,
+                    state_dir=_state_dir,
+                )
+            except KeyError as exc:
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=(
+                        f"persist_error: profile_id not found at "
+                        f"persist time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_revoke_device persist failed: profile not found: {exc}"
+                ) from exc
+            except FileNotFoundError as exc:
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=(
+                        f"persist_error: MasterIdentity not bootstrapped "
+                        f"at persist time: {exc}"
+                    ),
+                )
+                raise BootloaderError(
+                    f"profile_revoke_device persist failed: master not bootstrapped: {exc}"
+                ) from exc
+            except (OSError, ValueError) as exc:
+                # ValueError: revoked-profile guard OR last-device
+                # guard fired at storage layer (the endpoint pre-flight
+                # should have caught both, but defense-in-depth).
+                # OSError: filesystem error at persist time.
+                self._store_profile_revoke_device_result(
+                    req, status="signature_error",
+                    profile_id=None, phone_id_revoked=None,
+                    reason=f"persist_error: {type(exc).__name__}: {exc}",
+                )
+                raise BootloaderError(
+                    f"profile_revoke_device persist failed: {exc}"
+                ) from exc
+            # Persist succeeded. Note: the idempotent "not a member"
+            # path doesn't reach here — the endpoint pre-flight
+            # short-circuits with already_not_member 200 before
+            # queueing. If a respond-time race somehow gets us here
+            # AND the phone wasn't actually in device_ids, the
+            # manage.py primitive returns the unchanged profile and
+            # we still mark approved (the desired end-state — phone
+            # not in device_ids — IS achieved).
+            try:
+                self._store_profile_revoke_device_result(
+                    req, status="approved",
+                    profile_id=updated_profile.profile_id,
+                    phone_id_revoked=req.revdev_phone_id_to_revoke,
+                    reason=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[bootloader] WARNING: profile_revoke_device persist succeeded "
+                    f"(profile_id={updated_profile.profile_id!r}, "
+                    f"phone_id_revoked={req.revdev_phone_id_to_revoke!r}) but "
+                    f"result-store failed: {type(exc).__name__}: {exc}. Caller "
+                    f"should recover via `recto profile show <profile_id>`.",
+                    flush=True,
+                )
+        self._notify_resolved(req, ok=True, signature_b64u=sig,
+                              eth_signature_rsv=eth_sig,
+                              btc_signature_base64=btc_sig,
+                              ed_signature_base64=ed_sig,
+                              ed_pubkey_hex=ed_pub,
+                              tron_signature_rsv=tron_sig,
+                              capability_jws=capability_jws, reason=None)
+        self._send_json(HTTPStatus.OK, {"resolved": True})
+
+    def _notify_resolved(
+        self,
+        req: PendingRequest,
+        *,
+        ok: bool,
+        signature_b64u: str | None,
+        reason: str | None,
+        eth_signature_rsv: str | None = None,
+        btc_signature_base64: str | None = None,
+        ed_signature_base64: str | None = None,
+        ed_pubkey_hex: str | None = None,
+        tron_signature_rsv: str | None = None,
+        capability_jws: str | None = None,
+    ) -> None:
+        """Surface a request resolution to the waiting launcher.
+
+        Production wires this through an in-process map of
+        request_id -> threading.Event / Future. For v0.4.0 this is
+        intentionally a no-op stub -- the integration hook lives on
+        the BootloaderConfig and tests inject their own callable.
+
+        ``eth_signature_rsv`` is populated only when ``req.kind ==
+        "eth_sign"`` and the operator approved; ``btc_signature_base64``
+        only when ``req.kind == "btc_sign"`` and approved;
+        ``ed_signature_base64`` + ``ed_pubkey_hex`` only when ``req.kind
+        == "ed_sign"`` and approved; ``tron_signature_rsv`` only when
+        ``req.kind == "tron_sign"`` and approved; ``capability_jws``
+        only when ``req.kind == "capability_request"`` and approved
+        (carries the assembled 3-part JWS the requesting agent will
+        fetch from the result endpoint). The launcher forwards all of
+        these to the consumer (smart contract / off-chain verifier /
+        wallet performing on-chain verification / capability-scope
+        enforcer) without further validation. ``signature_b64u`` is
+        the Ed25519 paired-phone identity proof and is populated for
+        every approval regardless of kind.
+        """
+        notify_fn = getattr(self.config, "notify_resolved_fn", None)
+        if notify_fn is not None:
+            # Be tolerant of older notify_fn signatures that don't
+            # accept the new kwargs. Try the full signature first;
+            # if the callable doesn't accept capability_jws, retry
+            # without it; if it doesn't accept tron_*, retry without
+            # those; etc., all the way down to the v0.4.0 base 4-arg
+            # shape.
+            try:
+                notify_fn(
+                    req=req,
+                    ok=ok,
+                    signature_b64u=signature_b64u,
+                    eth_signature_rsv=eth_signature_rsv,
+                    btc_signature_base64=btc_signature_base64,
+                    ed_signature_base64=ed_signature_base64,
+                    ed_pubkey_hex=ed_pubkey_hex,
+                    tron_signature_rsv=tron_signature_rsv,
+                    capability_jws=capability_jws,
+                    reason=reason,
+                )
+                return
+            except TypeError:
+                pass
+            try:
+                notify_fn(
+                    req=req,
+                    ok=ok,
+                    signature_b64u=signature_b64u,
+                    eth_signature_rsv=eth_signature_rsv,
+                    btc_signature_base64=btc_signature_base64,
+                    ed_signature_base64=ed_signature_base64,
+                    ed_pubkey_hex=ed_pubkey_hex,
+                    tron_signature_rsv=tron_signature_rsv,
+                    reason=reason,
+                )
+                return
+            except TypeError:
+                pass
+            try:
+                notify_fn(
+                    req=req,
+                    ok=ok,
+                    signature_b64u=signature_b64u,
+                    eth_signature_rsv=eth_signature_rsv,
+                    btc_signature_base64=btc_signature_base64,
+                    ed_signature_base64=ed_signature_base64,
+                    ed_pubkey_hex=ed_pubkey_hex,
+                    reason=reason,
+                )
+                return
+            except TypeError:
+                pass
+            try:
+                notify_fn(
+                    req=req,
+                    ok=ok,
+                    signature_b64u=signature_b64u,
+                    eth_signature_rsv=eth_signature_rsv,
+                    btc_signature_base64=btc_signature_base64,
+                    reason=reason,
+                )
+                return
+            except TypeError:
+                pass
+            try:
+                notify_fn(
+                    req=req,
+                    ok=ok,
+                    signature_b64u=signature_b64u,
+                    eth_signature_rsv=eth_signature_rsv,
+                    reason=reason,
+                )
+                return
+            except TypeError:
+                pass
+            notify_fn(req=req, ok=ok, signature_b64u=signature_b64u,
+                      reason=reason)
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/capability/request  (Phase 5 Wave B)
+    # ------------------------------------------------------------------
+
+    def _handle_capability_request(self, body: dict[str, Any]) -> None:
+        """Queue a capability request for operator approval.
+
+        External agents (downstream consumer chatbots, automation
+        runners, etc.) call this endpoint when they need a capability
+        JWT to act on the operator's behalf. The bootloader:
+
+        1. Authenticates the agent via X-Recto-Agent-Id +
+           X-Recto-Agent-Token headers (matched against
+           cfg.capability_agent_tokens).
+        2. Validates the proposed CapabilityClaims (shape + future exp
+           + non-empty groups/allow_actions).
+        3. Canonical-JSON-encodes the claims into JWS header_b64 +
+           payload_b64 segments via build_signing_input.
+        4. Constructs a PendingRequest via
+           PendingRequest.new_capability_request and queues it on the
+           operator's phone.
+        5. Returns request_id + result_url so the agent can poll for
+           the assembled JWS once the operator approves.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            # Endpoint is disabled when no tokens are configured.
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        # Auth headers
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required",
+                 "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        if agent_id in cfg.capability_agent_auth_only:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "agent_auth_only",
+                "detail": f"agent {agent_id!r} authenticates to a substrate only and may raise no capability card",
+            })
+            return
+        # Body shape
+        phone_id = body.get("phone_id", "")
+        if not phone_id or not isinstance(phone_id, str):
+            raise BootloaderError("phone_id required in capability_request body")
+        if cfg.state.get_phone(phone_id) is None:
+            raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        claims_raw = body.get("claims")
+        if not isinstance(claims_raw, dict):
+            raise BootloaderError(
+                "claims required in capability_request body (CapabilityClaims as JSON object)"
+            )
+        operation_description = body.get(
+            "operation_description",
+            f"capability_request from {agent_id}",
+        )
+        if not isinstance(operation_description, str):
+            raise BootloaderError("operation_description must be a string")
+        # Optional override for the request TTL (capped to a sane
+        # ceiling so a buggy agent can't park requests on the queue
+        # forever).
+        ttl_seconds = body.get("ttl_seconds", 3600)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 60 or ttl_seconds > 86400:
+            raise BootloaderError(
+                "ttl_seconds must be an integer in [60, 86400] (1 minute - 24 hours)"
+            )
+        # Optional grant-window TTL (v0.6+ queued-card flow). Distinct
+        # from ttl_seconds: that bounds how long the CARD waits on the
+        # queue; this bounds how long the signed AUTHORITY lives. When
+        # set, the claims' iat/nbf/exp are REBUILT at card-open (the
+        # first phone fetch of the pending list — see _handle_pending)
+        # so a short authority window and a long queue wait can coexist.
+        grant_ttl_seconds = body.get("grant_ttl_seconds")
+        if grant_ttl_seconds is not None and (
+            not isinstance(grant_ttl_seconds, int)
+            or grant_ttl_seconds < 30
+            or grant_ttl_seconds > 900
+        ):
+            raise BootloaderError(
+                "grant_ttl_seconds must be an integer in [30, 900] when provided"
+            )
+        # Optional ``actor``: the consumer-supplied display identity of
+        # the agent the request is FOR (name + face), as distinct from
+        # the app delivering it. Transport, never a claim -- it is not
+        # in the signed bytes, and the phone shows it only beside a
+        # signed subject whose acting-agent half equals ``actor_id``.
+        # Malformed = refused here, so a card never carries a half-
+        # built actor; absent = the card renders as before.
+        actor_raw = body.get("actor")
+        actor_context: ActorContext | None = None
+        if actor_raw is not None:
+            if not isinstance(actor_raw, dict):
+                raise BootloaderError("actor must be a JSON object when provided")
+            try:
+                actor_context = ActorContext(
+                    actor_id=actor_raw.get("actor_id", ""),
+                    actor_name=actor_raw.get("actor_name", ""),
+                    actor_icon_url=actor_raw.get("actor_icon_url"),
+                )
+            except ValueError as exc:
+                raise BootloaderError(f"actor is malformed: {exc}") from exc
+        # Convert dict -> typed CapabilityClaims to drive validation
+        # through the same code path verifiers use. Lazy-imported to
+        # keep the bootloader package free of recto.capability when
+        # this endpoint is disabled.
+        from recto.capability.jwt import (
+            _dict_to_claims as _to_claims,
+            build_signing_input,
+        )
+        try:
+            claims = _to_claims(claims_raw)
+        except (ValueError, KeyError) as exc:
+            raise BootloaderError(
+                f"claims failed CapabilityClaims validation: {exc}"
+            ) from exc
+        if reserved_reset_jti(claims.jti):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "claims_jti_reserved",
+                "detail": f"a jti beginning {top_plane.REVOKED_RESET_PREFIX!r} is the top plane's; a grant never "
+                          "carries one, so no card asks for it"})
+            return
+        # A connection act (enable / disable / delete one connection) is
+        # carded only for the exact tuple it will act on, and only with the
+        # bootloader's own rendering of that tuple as its purpose - the card
+        # shows the purpose, not the pinned fingerprint. The same verifier
+        # runs again at POST /v0.4/connections/act. The grant window is never
+        # re-stamped at card-open: the tuple's not_after IS the grant's exp.
+        from recto.connections.act_record import (
+            ActRecord as _ActRecord,
+            ActRefused as _ActRefused,
+            names_connection_act as _names_connection_act,
+            verify_act_grant as _verify_act_grant,
+        )
+        act_raw = body.get("connections_act")
+        if act_raw is not None or _names_connection_act(claims):
+            if act_raw is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "act_record_required",
+                    "detail": "a connections:* request carries its connections_act record",
+                })
+                return
+            if grant_ttl_seconds is not None:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "grant_ttl_not_admitted",
+                    "detail": "a connection act's window is its record's not_after; it is never re-stamped",
+                })
+                return
+            try:
+                act_record = _ActRecord.from_dict(act_raw)
+                _verify_act_grant(claims, act_record, bootloader_id=cfg.bootloader_id, admit_set=True)
+            except _ActRefused as e:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+                return
+            if claims.exp <= int(time.time()):
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "expired", "detail": "the act's window has already closed",
+                })
+                return
+        # Requestable-action policy: evaluated BEFORE carding, so a
+        # request outside the agent's declared surface is refused here
+        # and never spends the operator's attention. Deny-by-default
+        # for agents that carry a policy; agents without one pass
+        # through unchanged (approval remains their gate). The refusal
+        # names the disallowed actions and the allowed set — a refusal
+        # that names what is missing beats a silent drop.
+        #
+        # The policy judges what the clause NAMES on its allow side:
+        # allow_actions plus every group's members. deny_actions is NOT
+        # subtracted first. A deny narrows a grant at a verifier that
+        # honours it, but it never turns an action the agent may not ask
+        # for into a passing request: "allow [x], deny [x]" still names
+        # x, and a verifier that reads allow_actions alone would grant x.
+        requestable = cfg.capability_agent_requestable.get(agent_id)
+        if requestable is not None:
+            asked = set(claims.cap.allow_actions)
+            if claims.cap.groups:
+                manifest = cfg.capability_manifest
+                if manifest is None:
+                    # Cannot expand groups without a manifest: fail
+                    # CLOSED. Letting group-carried actions through
+                    # unexpanded would make "add a group" the bypass
+                    # for a policy stated in actions.
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "action_policy_unevaluable",
+                         "detail": ("agent carries a requestable-action policy "
+                                    "but no action manifest is loaded to expand "
+                                    "the claims' groups; refusing rather than "
+                                    "passing unexpanded scope")},
+                    )
+                    return
+                from recto.capability.manifest import resolve_actions
+                # resolve_actions validates the clause against the
+                # manifest (its registry version, every group and every
+                # allow_action declared) and raises on the first unknown.
+                # Its deny-subtracted result is what a verifier grants,
+                # not what the request asks for, so it is not the set
+                # judged here.
+                try:
+                    resolve_actions(claims.cap, manifest)
+                except ValueError as exc:
+                    raise BootloaderError(
+                        f"claims failed action resolution against the "
+                        f"manifest: {exc}"
+                    ) from exc
+                for group_key in claims.cap.groups:
+                    asked.update(manifest.groups[group_key].actions)
+            disallowed = sorted(asked - set(requestable))
+            if disallowed:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "action_not_requestable",
+                     "agent_id": agent_id,
+                     "disallowed_actions": disallowed,
+                     "requestable_actions": sorted(requestable)},
+                )
+                return
+        # Requestable-audience policy: the same pre-carding filter, for
+        # WHERE the grant could be spent. The check reads the RAW `aud`
+        # (the typed round-trip would turn a bare string into a list of
+        # its characters) and compares exactly. An empty `aud` is refused
+        # too: a grant that names no audience is accepted by any verifier
+        # that does not insist on one, which is the widest grant there is.
+        audience_policy = cfg.capability_agent_audiences.get(agent_id)
+        if audience_policy is not None:
+            raw_aud = claims_raw.get("aud")
+            if not isinstance(raw_aud, list) or not all(
+                isinstance(a, str) for a in raw_aud
+            ):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "audience_not_requestable",
+                     "agent_id": agent_id,
+                     "detail": ("agent carries a requestable-audience policy; "
+                                "aud must be a JSON array of strings"),
+                     "requestable_audiences": sorted(audience_policy)},
+                )
+                return
+            outside = sorted({a for a in raw_aud if a not in audience_policy})
+            if not raw_aud or outside:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "audience_not_requestable",
+                     "agent_id": agent_id,
+                     "detail": ("the request names no audience" if not raw_aud
+                                else "the request names an audience outside "
+                                     "the agent's policy"),
+                     "disallowed_audiences": outside,
+                     "requestable_audiences": sorted(audience_policy)},
+                )
+                return
+        # Build the JWS signing input via the same canonical-JSON
+        # encoder verifiers use — guarantees the cap_*_b64 fields the
+        # phone signs over are byte-identical to what verify_jws
+        # consumes downstream.
+        digest, header_b64, payload_b64 = build_signing_input(claims)
+        # The Ed25519 paired-phone envelope rides on payload_hash_b64u,
+        # which we set to base64url(SHA-256(signing_input)) — same
+        # digest the secp256k1 cap-signature is over, so the operator's
+        # consent on the envelope binds 1:1 to the JWS they sign.
+        payload_hash_b64u = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        try:
+            req = PendingRequest.new_capability_request(
+                service=body.get("service", "recto"),
+                secret=body.get("secret", "capability"),
+                phone_id=phone_id,
+                operation_description=operation_description,
+                payload_hash_b64u=payload_hash_b64u,
+                child_pid=0,
+                child_argv0="(external-agent)",
+                cap_header_b64=header_b64,
+                cap_payload_b64=payload_b64,
+                cap_agent_id=agent_id,
+                ttl_seconds=ttl_seconds,
+                grant_ttl_seconds=grant_ttl_seconds,
+                actor_context=actor_context,
+            )
+        except ValueError as exc:
+            raise BootloaderError(
+                f"capability_request construction failed: {exc}"
+            ) from exc
+        # Phase 5 Wave C part 3: inject app_context. Look up by
+        # cap_agent_id first (capability_request flow); fall back to
+        # service name if no agent registration but a service one
+        # exists. None when no registration matches -- phone renders
+        # "Unknown app" warning banner.
+        app_ctx = (
+            cfg.principal_apps.get(agent_id)
+            or cfg.principal_apps.get(req.service)
+        )
+        if app_ctx is not None:
+            from dataclasses import replace as _replace
+            req = _replace(req, app_context=app_ctx)
+        cfg.state.add_pending(req)
+        self._notify_push(req)
+        self._send_json(HTTPStatus.CREATED, {
+            "request_id": req.request_id,
+            "expires_at_unix": req.expires_at_unix,
+            "result_url": f"/v0.4/capability/result/{req.request_id}",
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/devices/pair  (Phase H end-user device pairing relay,
+    # 2026-05-19)
+    # ------------------------------------------------------------------
+
+    def _handle_devices_pair(self, body: dict[str, Any]) -> None:
+        """Verify a device-pairing record + grant, then relay to the consumer.
+
+        Body:
+          ``consumer_base_url``: target consumer; must be a key in
+            ``cfg.devices_pair_consumer_webhook_tokens``.
+          ``record``: ``{bootloader_id, subject, phone_pubkey, code,
+            not_after}`` — see ``recto.capability.pair_record``.
+          ``user_jws``: the phone's ES256K grant. Must recover to
+            ``record.phone_pubkey``, name this bootloader in ``aud``,
+            allow ``devices:pair``, and carry
+            ``cap.scope.payload_sha256`` == the record's fingerprint.
+
+        Refusals are by name (400 for shape, 403 for the grant):
+        ``record_required``, the ``record_*`` / ``grant_*`` names from
+        ``pair_record``, ``record_bootloader_mismatch``,
+        ``grant_signature_invalid``, ``grant_replayed``. A grant is
+        spent on admission (its jti joins the revocation list until exp).
+
+        On admission the bootloader POSTs
+        ``{code, masterPubkeyHex, capabilityJws, record, fingerprint,
+        bootloaderJws}`` to ``{consumer}/api/v1/devices/pairing/complete``
+        with the consumer's registered webhook token and relays the
+        response verbatim. ``bootloaderJws`` is this bootloader's signed
+        attestation of the act (``devices:pair_result``, the fingerprint
+        in scope, 300 s, single-use) when a signing key is configured;
+        consumers that pin the key need no webhook token. No auth on the
+        incoming request: the grant is the auth. Disabled (404) when no
+        consumer is registered.
+        """
+        cfg = self.config
+        if not cfg.devices_pair_consumer_webhook_tokens:
+            # No consumers registered → endpoint is disabled.
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+
+        # Body shape validation. The request carries the pairing RECORD
+        # and the grant that names it; the code alone admits nothing.
+        consumer_base_url = body.get("consumer_base_url")
+        record_raw = body.get("record")
+        user_jws = body.get("user_jws")
+
+        if not isinstance(consumer_base_url, str) or not consumer_base_url.strip():
+            raise BootloaderError("consumer_base_url is required")
+        if not isinstance(user_jws, str) or not user_jws.strip():
+            raise BootloaderError("user_jws is required")
+        if not isinstance(record_raw, dict):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "record_required",
+                 "detail": "body.record {bootloader_id, subject, phone_pubkey, code, not_after} is required"},
+            )
+            return
+
+        from recto.capability.jwt import verify_jws as _verify_jws
+        from recto.capability.pair_record import (
+            PAIR_RESULT_ACTION,
+            PairRecord,
+            PairRefused,
+            verify_pair_grant,
+        )
+
+        try:
+            record = PairRecord.from_dict(record_raw)
+        except PairRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+
+        if record.bootloader_id != cfg.bootloader_id:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "record_bootloader_mismatch",
+                 "detail": "the record names another bootloader"},
+            )
+            return
+        # THE PLACEHOLDER RULE (2026-10-17, hard rules 15.m/15.o): the record's `subject` field carries the consumer's
+        # OPAQUE subject handle, never its user id - Recto signs and relays handles only. Another shape is refused.
+        from recto.subject_handle import normalize_subject as _normalize_subject
+        try:
+            _normalize_subject(record.subject)
+        except ValueError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "record_subject_invalid",
+                 "detail": "record.subject must carry the consumer's opaque subject handle "
+                           "(43 base64url characters), never a user id"},
+            )
+            return
+
+        try:
+            claims = _verify_jws(
+                user_jws,
+                expected_pubkey=bytes.fromhex(record.phone_pubkey),
+                expected_aud=cfg.bootloader_id,
+            )
+        except ValueError as e:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "grant_signature_invalid", "detail": str(e)},
+            )
+            return
+
+        if reserved_reset_jti(claims.jti):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_jti_reserved",
+                "detail": f"a jti beginning {top_plane.REVOKED_RESET_PREFIX!r} is the top plane's; a grant never "
+                          "carries one"})
+            return
+        if cfg.state.is_revoked(claims.jti):
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "grant_replayed", "detail": "jti already spent or revoked"},
+            )
+            return
+
+        now = int(time.time())
+        try:
+            fingerprint = verify_pair_grant(
+                claims, record,
+                signer_pubkey_hex=record.phone_pubkey,
+                bootloader_id=cfg.bootloader_id,
+                now=now,
+            )
+        except PairRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+
+        # Single use: spend the jti before anything leaves this body.
+        cfg.state.add_revocation(RevocationEntry(
+            jti=claims.jti,
+            revoked_at_unix=now,
+            original_exp_unix=int(claims.exp),
+            reason="spent: devices:pair",
+        ))
+
+        # The signed result: this bootloader attests it verified THIS act.
+        # aud = the consumer audiences the phone named (everything but us);
+        # scope.payload_sha256 = the fingerprint; single-use jti; 300 s.
+        bootloader_jws: str | None = None
+        if cfg.devices_pair_signing_key is not None:
+            from recto.capability.signing import mint_jws
+            from recto.capability.types import (
+                CapabilityClaims,
+                CapabilityClause,
+                CapabilityScope,
+            )
+
+            result_claims = CapabilityClaims(
+                iss=f"bootloader:{cfg.bootloader_id}",
+                sub=f"user:{record.subject}",
+                aud=[a for a in claims.aud if a != cfg.bootloader_id] or [consumer_base_url.rstrip("/")],
+                iat=now,
+                nbf=now - 60,   # CLOCK_SKEW_SECONDS: the consumer's clock is not ours either
+                exp=now + 300,
+                jti=f"pair-result-{uuid.uuid4().hex}",
+                cap=CapabilityClause(
+                    tier=0,
+                    registry_version=claims.cap.registry_version,
+                    scope=CapabilityScope(pairing_code=record.code, payload_sha256=fingerprint),
+                    allow_actions=[PAIR_RESULT_ACTION],
+                ),
+                purpose="devices:pair result",
+                max_uses=1,
+            )
+            bootloader_jws = mint_jws(result_claims, cfg.devices_pair_signing_key)
+
+        pairing_code = record.code
+        user_pubkey_hex = record.phone_pubkey
+
+        # Strip trailing slash for canonical-lookup parity (operator
+        # may have registered the URL with or without trailing slash).
+        normalized_url = consumer_base_url.rstrip("/")
+        webhook_token = cfg.devices_pair_consumer_webhook_tokens.get(normalized_url)
+        if webhook_token is None:
+            # Also try the variant with trailing slash, since some
+            # operator-paste workflows leave it in. Idiosyncratic
+            # forgiveness rather than reject-and-retry friction.
+            webhook_token = cfg.devices_pair_consumer_webhook_tokens.get(
+                normalized_url + "/"
+            )
+        if webhook_token is None:
+            print(
+                f"[bootloader] devices/pair: unknown consumer_base_url={consumer_base_url!r}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "unknown_consumer",
+                    "detail": "consumer_base_url not registered with this bootloader",
+                },
+            )
+            return
+
+        # Build the forward payload. Field names mirror the consumer's
+        # CompletePairingRequest schema (CamelCase JSON property names);
+        # the consumer's binder is case-insensitive on most stacks but
+        # we match the canonical shape so other consumers replicating
+        # the schema get clean field-binding.
+        #
+        # relay_url override (commitment #17, three-zone architecture):
+        # when the consumer manifest declares a relay_url, the outbound
+        # request targets that hostname instead of the phone-supplied
+        # base_url.  This lets the phone know the .com URL while the
+        # bootloader relays through the .ai agent-zone hostname.
+        relay_base = cfg.devices_pair_consumer_relay_urls.get(normalized_url)
+        if relay_base is None:
+            relay_base = normalized_url
+        forward_url = relay_base + "/api/v1/devices/pairing/complete"
+        forward_body_bytes = json.dumps({
+            "code": pairing_code,
+            "masterPubkeyHex": user_pubkey_hex,
+            "capabilityJws": user_jws,
+            "record": record.to_dict(),
+            "fingerprint": fingerprint,
+            "bootloaderJws": bootloader_jws,
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            forward_url,
+            data=forward_body_bytes,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Openclaw-Token": webhook_token,
+                "User-Agent": "recto-bootloader/v0.4 devices-pair-relay",
+            },
+        )
+
+        timeout = cfg.devices_pair_consumer_timeout_seconds
+        consumer_status: int
+        consumer_body: Any
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                consumer_status = response.status
+                raw = response.read()
+                try:
+                    consumer_body = json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    # Consumer returned non-JSON — pass back as a string
+                    # in the relayed response so the phone can surface
+                    # SOMETHING actionable instead of swallowing the body.
+                    consumer_body = {"raw": raw.decode("utf-8", errors="replace")}
+        except urllib.error.HTTPError as e:
+            # Consumer returned a non-2xx with a body — we want to relay
+            # the consumer's diagnostic to the caller verbatim so the
+            # phone can show "pubkey_already_bound" / "capability_invalid"
+            # etc. rather than a generic "bootloader 502".
+            consumer_status = e.code
+            try:
+                raw = e.read()
+                # The status only (hard rule 15.q): the consumer's headers and body may carry its users' data.
+                print(f"[bootloader] devices/pair: HTTPError {e.code} from the consumer", flush=True)
+                consumer_body = json.loads(raw) if raw else None
+            except (json.JSONDecodeError, Exception):
+                consumer_body = {"raw": str(e)}
+        except urllib.error.URLError as e:
+            # Network-level failure (DNS, connection refused, TLS, etc.)
+            # — the consumer's endpoint didn't respond at all. 502 maps
+            # this cleanly: "got nothing useful from the upstream."
+            print(
+                f"[bootloader] devices/pair: URLError forwarding to {forward_url}: {e}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "consumer_unreachable",
+                    "detail": f"could not reach {forward_url}: {e.reason}",
+                },
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[bootloader] devices/pair: unexpected error forwarding to "
+                f"{forward_url}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "consumer_forwarding_failed",
+                    "detail": f"{type(e).__name__}: {e}",
+                },
+            )
+            return
+
+        print(
+            f"[bootloader] devices/pair: relayed to {forward_url} "
+            f"(status={consumer_status})",
+            flush=True,
+        )
+
+        # Relay status + body. Use the same HTTPStatus mapping as the
+        # consumer so callers can switch on the status verbatim.
+        try:
+            relayed_status = HTTPStatus(consumer_status)
+        except ValueError:
+            # Consumer returned a status outside HTTPStatus's known
+            # range (rare; some custom proxies emit 9xx). Pass through
+            # as a raw int — _send_json handles that.
+            relayed_status = consumer_status  # type: ignore[assignment]
+
+        self._send_json(relayed_status, {
+            "consumer_status": consumer_status,
+            "consumer_body": consumer_body,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/devices/unpair  (Phase H end-user device unpairing relay,
+    # 2026-06-21)
+    # ------------------------------------------------------------------
+
+    def _handle_devices_unpair(self, body: dict[str, Any]) -> None:
+        """Relay an end-user device-UNPAIR request to a consumer.
+
+        The cryptographic teardown sibling of ``_handle_devices_pair``.
+        Recto Phone's per-service unpair (Build 6) removes the binding
+        from the phone's local Connected Services registry; this relay
+        is what tears the binding down on the CONSUMER side too, so a
+        later re-pair isn't blocked by the consumer's one-pubkey-one-user
+        constraint (downstream commitment #11). Without it, granular
+        unpair is local-only and the operator has to NULL the consumer's
+        bound-pubkey column out of band.
+
+        Flow (mirrors devices/pair minus the pairing code):
+
+          1. User taps "Unpair this service" on a real (non-demo)
+             Connected Service in the Recto Phone app.
+          2. Phone enclave signs a JWS with the user's secp256k1 master
+             key. JWS payload has ``cap.allow_actions =
+             ["devices:pairing_revoke"]`` and ``cap.scope.user_id =
+             "<consumer account being unpaired>"``.
+          3. Phone POSTs ``/v0.4/devices/unpair`` to this bootloader with
+             ``{consumer_base_url, user_pubkey_hex, user_jws}`` — no
+             pairing code (the binding is identified by the pubkey, not a
+             fresh code), no auth on the incoming request (the JWS IS the
+             user-side auth).
+          4. Bootloader looks up the consumer's webhook token in
+             ``cfg.devices_pair_consumer_webhook_tokens`` — the SAME
+             registry pair uses; a consumer that brokers pairing brokers
+             unpairing.
+          5. Bootloader POSTs to ``{consumer_base_url}/api/v1/devices/pairing/revoke``
+             with ``X-Openclaw-Token: <looked-up token>`` and body
+             ``{masterPubkeyHex: user_pubkey_hex, capabilityJws:
+             user_jws}``.
+          6. Consumer recovers the JWS signature against the master
+             pubkey currently bound on the user row (self-attested, the
+             same model devices/pair uses), confirms it matches, NULLs
+             the binding + records an audit row, and returns its
+             response, which the bootloader relays verbatim.
+
+        **Self-attested, authority-removing.** The JWS proves the phone
+        holds the master key that was bound at pair time; the consumer's
+        X-Openclaw-Token gate proves the request came through THIS
+        authorized bootloader. The action only REMOVES authority (tears
+        down a binding), so its blast radius is strictly smaller than
+        the devices:pair it reverses — Tier 0 in the manifest.
+
+        **Endpoint disabled** when
+        ``cfg.devices_pair_consumer_webhook_tokens`` is empty — returns
+        404 ``unknown_endpoint``, same zero-attack-surface posture as
+        devices/pair.
+
+        Body:
+          ``consumer_base_url``: full URL of the target consumer. MUST
+            match a key in ``cfg.devices_pair_consumer_webhook_tokens``.
+          ``user_pubkey_hex``: 128-hex secp256k1 master pubkey (X||Y, no
+            0x04 prefix). The signature on ``user_jws`` must recover to
+            this value (consumer-side check).
+          ``user_jws``: full 3-part JWS string the phone enclave signed.
+
+        Response: ``{consumer_status: int, consumer_body: <consumer's
+        JSON>}`` — relays the consumer's HTTP status + body verbatim so
+        the phone can surface specific reasons (``not_paired``,
+        ``capability_invalid``, ``pubkey_mismatch``, etc.) without the
+        bootloader re-interpreting them. The phone removes its local
+        Connected Service entry only on a success status.
+        """
+        cfg = self.config
+        if not cfg.devices_pair_consumer_webhook_tokens:
+            # No consumers registered → endpoint is disabled.
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+
+        # Body shape validation (no pairing_code — unpair identifies the
+        # binding by the bound pubkey, not a fresh code).
+        consumer_base_url = body.get("consumer_base_url")
+        user_pubkey_hex = body.get("user_pubkey_hex")
+        user_jws = body.get("user_jws")
+
+        if not isinstance(consumer_base_url, str) or not consumer_base_url.strip():
+            raise BootloaderError("consumer_base_url is required")
+        if not isinstance(user_pubkey_hex, str) or not user_pubkey_hex.strip():
+            raise BootloaderError("user_pubkey_hex is required")
+        if not isinstance(user_jws, str) or not user_jws.strip():
+            raise BootloaderError("user_jws is required")
+
+        # Canonical-lookup parity with the trailing-slash forgiveness
+        # devices/pair uses (operator may register URL with or without).
+        normalized_url = consumer_base_url.rstrip("/")
+        webhook_token = cfg.devices_pair_consumer_webhook_tokens.get(normalized_url)
+        if webhook_token is None:
+            webhook_token = cfg.devices_pair_consumer_webhook_tokens.get(
+                normalized_url + "/"
+            )
+        if webhook_token is None:
+            print(
+                f"[bootloader] devices/unpair: unknown consumer_base_url={consumer_base_url!r}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "unknown_consumer",
+                    "detail": "consumer_base_url not registered with this bootloader",
+                },
+            )
+            return
+
+        # relay_url override (commitment #17 three-zone architecture):
+        # same .com-known / .ai-relayed split devices/pair uses.
+        relay_base = cfg.devices_pair_consumer_relay_urls.get(normalized_url)
+        if relay_base is None:
+            relay_base = normalized_url
+        forward_url = relay_base + "/api/v1/devices/pairing/revoke"
+        forward_body_bytes = json.dumps({
+            "masterPubkeyHex": user_pubkey_hex,
+            "capabilityJws": user_jws,
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            forward_url,
+            data=forward_body_bytes,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Openclaw-Token": webhook_token,
+                "User-Agent": "recto-bootloader/v0.4 devices-unpair-relay",
+            },
+        )
+
+        timeout = cfg.devices_pair_consumer_timeout_seconds
+        consumer_status: int
+        consumer_body: Any
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                consumer_status = response.status
+                raw = response.read()
+                try:
+                    consumer_body = json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    consumer_body = {"raw": raw.decode("utf-8", errors="replace")}
+        except urllib.error.HTTPError as e:
+            # Relay the consumer's diagnostic verbatim (not_paired /
+            # capability_invalid / pubkey_mismatch / etc.).
+            consumer_status = e.code
+            try:
+                raw = e.read()
+                # The status only (hard rule 15.q): the consumer's headers and body may carry its users' data.
+                print(f"[bootloader] devices/unpair: HTTPError {e.code} from the consumer", flush=True)
+                consumer_body = json.loads(raw) if raw else None
+            except (json.JSONDecodeError, Exception):
+                consumer_body = {"raw": str(e)}
+        except urllib.error.URLError as e:
+            print(
+                f"[bootloader] devices/unpair: URLError forwarding to {forward_url}: {e}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "consumer_unreachable",
+                    "detail": f"could not reach {forward_url}: {e.reason}",
+                },
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[bootloader] devices/unpair: unexpected error forwarding to "
+                f"{forward_url}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "consumer_forwarding_failed",
+                    "detail": f"{type(e).__name__}: {e}",
+                },
+            )
+            return
+
+        print(
+            f"[bootloader] devices/unpair: relayed to {forward_url} "
+            f"(status={consumer_status})",
+            flush=True,
+        )
+
+        try:
+            relayed_status = HTTPStatus(consumer_status)
+        except ValueError:
+            relayed_status = consumer_status  # type: ignore[assignment]
+
+        self._send_json(relayed_status, {
+            "consumer_status": consumer_status,
+            "consumer_body": consumer_body,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/profile/create  (Phase 2.0.B multi-profile integration)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_create(self, body: dict[str, Any]) -> None:
+        """Queue a profile-create request for operator approval.
+
+        Phase 2.0.B integration. Multi-profile-identity callers (CLI's
+        ``recto profile create``, SCIM provisioning glue, future
+        automation) submit a candidate profile shape; bootloader queues
+        the request on the operator's phone; phone displays an approval
+        card with the proposed kind / display_name / derivation path;
+        on approval, phone signs a master-attestation over the
+        canonical-JSON encoding of the candidate fields; bootloader
+        verifies the attestation against the operator pubkey loaded
+        via vault_root.json, atomic-writes the new Profile row to
+        master_identity.json, and stashes a ProfileCreateResult for
+        the caller to poll.
+
+        Partial-failure design (banked from Milan Jovanović's "use
+        case is a unit of intent, not a unit of atomicity"):
+
+          * **A — caller-authored idempotency key.** ``candidate_profile_id``
+            is generated by the caller (CLI / SCIM / etc.) at submit
+            time and used as the canonical key throughout the flow:
+            queue lookup, persist-store check, result-store key. A
+            retry with the same key is safe. If the candidate_profile_id
+            already corresponds to a persisted Profile (caller restarted
+            mid-poll, network glitched, etc.), the bootloader returns
+            HTTP 200 with status="already_exists" + the existing
+            profile_id WITHOUT re-prompting the operator. The phone
+            never sees a duplicate approval card for the same key.
+
+          * **B — persist last; in-memory result is derived.** The
+            atomic write to master_identity.json is the source of
+            truth. The ProfileCreateResult store is a derived projection;
+            if it fails or expires before caller polls, the caller can
+            recover via ``recto profile list`` filtered by candidate
+            id. Step ordering in _handle_respond's profile_create
+            branch: (1) verify attestation, (2) atomic persist, (3)
+            store result — never reversed.
+
+          * **C — never claim success when persist failed.** If the
+            atomic write throws (filesystem error, permission denied,
+            disk full), the bootloader stores ``signature_error``
+            status with reason ``"persist_error: <diagnostic>"`` so the
+            caller knows recovery requires fixing the host's disk state
+            (NOT re-prompting the phone). The reason-prefix lets
+            callers distinguish without forking the status enum.
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token`` headers,
+        same posture as ``/v0.4/capability/request``. Endpoint is
+        disabled (404) when ``cfg.capability_agent_tokens`` is empty.
+
+        Body shape:
+            {
+                "phone_id": "<paired-phone-id>",
+                "candidate_profile_id": "<caller-authored UUID4>",
+                "kind": "personal:child|work|school|contractor|custom:...",
+                "display_name": "Personal (pseudonym)",
+                "theme_hint": <optional str>,
+                "scim_provider": <optional str>,
+                "ttl_seconds": <optional int, default 600, range 60..86400>,
+                "operation_description": <optional str>
+            }
+
+        Response (201, new request queued):
+            {
+                "request_id": "<uuid>",
+                "candidate_profile_id": "<echo from body>",
+                "expires_at_unix": <int>,
+                "result_url": "/v0.4/profile/result/<request_id>"
+            }
+
+        Response (200, idempotent hit on existing profile):
+            {
+                "status": "already_exists",
+                "profile_id": "<existing>",
+                "candidate_profile_id": "<echo from body>",
+                "reason": "candidate_profile_id was already used; profile exists"
+            }
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            # Same posture as capability_request: agent-token gate is the
+            # endpoint's existence trigger. No tokens configured -> no
+            # surface area.
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        # Auth headers
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required",
+                 "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        # Body shape — strict, with clear field-level errors so a buggy
+        # caller can diagnose without a debugger.
+        phone_id = body.get("phone_id", "")
+        if not phone_id or not isinstance(phone_id, str):
+            raise BootloaderError("phone_id required in profile_create body")
+        if cfg.state.get_phone(phone_id) is None:
+            raise UnknownPhoneError(f"phone_id {phone_id!r} not registered")
+        candidate_profile_id = body.get("candidate_profile_id", "")
+        if not candidate_profile_id or not isinstance(candidate_profile_id, str):
+            raise BootloaderError(
+                "candidate_profile_id required in profile_create body "
+                "(caller-authored UUID4 — see partial-failure docstring "
+                "for the idempotency-key contract)"
+            )
+        kind = body.get("kind", "")
+        if not kind or not isinstance(kind, str):
+            raise BootloaderError("kind required in profile_create body")
+        display_name = body.get("display_name", "")
+        if not display_name or not isinstance(display_name, str) or not display_name.strip():
+            raise BootloaderError(
+                "display_name required (non-empty after strip) in profile_create body"
+            )
+        theme_hint = body.get("theme_hint")
+        if theme_hint is not None and not isinstance(theme_hint, str):
+            raise BootloaderError("theme_hint must be a string or null")
+        scim_provider = body.get("scim_provider")
+        if scim_provider is not None and not isinstance(scim_provider, str):
+            raise BootloaderError("scim_provider must be a string or null")
+        ttl_seconds = body.get("ttl_seconds", 600)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 60 or ttl_seconds > 86400:
+            raise BootloaderError(
+                "ttl_seconds must be an integer in [60, 86400] (1 minute - 24 hours)"
+            )
+        operation_description = body.get(
+            "operation_description",
+            f"profile_create from {agent_id}: {kind} / {display_name}",
+        )
+        if not isinstance(operation_description, str):
+            raise BootloaderError("operation_description must be a string")
+
+        # Milan commitment A — idempotency-key precheck. If this
+        # candidate_profile_id has already been used, return the
+        # existing profile rather than re-prompting the operator. The
+        # CALLER is responsible for generating unique UUIDs per intent;
+        # collision detection here defends against retry-replay only,
+        # not against malicious or buggy callers reusing keys for
+        # different intents.
+        from recto.profile.manage import (
+            get_profile_by_id as _get_profile_by_id,
+            _resolve_coin_type,
+            _next_profile_index,
+            PROFILE_BIP32_PURPOSE as _PROFILE_BIP32_PURPOSE,
+        )
+        from recto.profile.store import load_master_identity as _load_mi
+        # The bootloader's StateStore knows the operator's chosen
+        # state directory (RECTO_BOOTLOADER_STATE_DIR env var or
+        # platform default). MasterIdentity lives in the SAME
+        # directory so the whole bootloader's persistent state is
+        # co-located — pass state.state_dir through every profile
+        # call so test fixtures + multi-instance hosts work
+        # correctly.
+        _state_dir = cfg.state.state_dir
+        existing = _get_profile_by_id(candidate_profile_id, state_dir=_state_dir)
+        if existing is not None:
+            self._send_json(HTTPStatus.OK, {
+                "status": "already_exists",
+                "profile_id": existing.profile_id,
+                "candidate_profile_id": candidate_profile_id,
+                "reason": "candidate_profile_id was already used; profile exists",
+            })
+            return
+
+        # Resolve the BIP-32 derivation slot at queue time so the
+        # operator's phone approval card shows the FINAL derivation
+        # path (not a placeholder that might shift if a concurrent
+        # create steals the index). The profile manage layer's
+        # _next_profile_index is stable as long as no other create
+        # is in-flight; the bootloader's single-threaded handler model
+        # serializes profile_create POSTs naturally.
+        mi = _load_mi(state_dir=_state_dir)
+        if mi is None:
+            raise BootloaderError(
+                "MasterIdentity not bootstrapped; "
+                "run `recto vault bootstrap` first"
+            )
+        try:
+            coin_type = _resolve_coin_type(kind)
+        except ValueError as exc:
+            raise BootloaderError(f"invalid kind: {exc}") from exc
+        derivation_index = _next_profile_index(mi, coin_type)
+
+        # Build the canonical-JSON signing input over the candidate
+        # fields. Same canonical encoder verifiers use elsewhere —
+        # guarantees byte-identical input on the phone's signing side
+        # and the bootloader's verify side. The phone signs
+        # SHA-256(canonical_json) per the Phase 2.0.B SPEC; the
+        # signing input is what the bootloader stashes in
+        # cap_payload_b64 so the phone can re-derive the digest after
+        # approving on screen.
+        from recto.capability.jwt import _canonical_json as _to_canonical
+        candidate_fields = {
+            "candidate_profile_id": candidate_profile_id,
+            "kind": kind,
+            "display_name": display_name.strip(),
+            "derivation_purpose": _PROFILE_BIP32_PURPOSE,
+            "derivation_coin_type": coin_type,
+            "derivation_index": derivation_index,
+            "theme_hint": theme_hint,
+            "scim_provider": scim_provider,
+            "master_pubkey_hex": mi.master_pubkey_hex,
+        }
+        signing_input_bytes = _to_canonical(candidate_fields)
+        digest = hashlib.sha256(signing_input_bytes).digest()
+        payload_hash_b64u = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        # Stash the canonical encoding as cap_payload_b64 so _handle_respond's
+        # profile_create branch can re-derive the digest for verification
+        # without re-loading the master identity (which may have changed
+        # by the time the operator approves on the phone).
+        cap_payload_b64 = base64.urlsafe_b64encode(signing_input_bytes).rstrip(b"=").decode("ascii")
+
+        try:
+            req = PendingRequest.new_profile_create(
+                service=body.get("service", "recto"),
+                secret=body.get("secret", "profile"),
+                phone_id=phone_id,
+                operation_description=operation_description,
+                payload_hash_b64u=payload_hash_b64u,
+                child_pid=0,
+                child_argv0="(external-agent)",
+                candidate_profile_id=candidate_profile_id,
+                candidate_kind=kind,
+                candidate_display_name=display_name.strip(),
+                candidate_derivation_purpose=_PROFILE_BIP32_PURPOSE,
+                candidate_derivation_coin_type=coin_type,
+                candidate_derivation_index=derivation_index,
+                candidate_theme_hint=theme_hint,
+                candidate_scim_provider=scim_provider,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            raise BootloaderError(
+                f"profile_create construction failed: {exc}"
+            ) from exc
+        # Stash the canonical-encoded payload + agent id alongside the
+        # candidate fields so _handle_respond can re-verify. cap_payload_b64
+        # holds the signing input; cap_agent_id pins ownership so only the
+        # submitting agent can fetch the result.
+        from dataclasses import replace as _replace
+        req = _replace(
+            req,
+            cap_payload_b64=cap_payload_b64,
+            cap_agent_id=agent_id,
+        )
+        # AppContext injection — phone shows the requesting app's
+        # branding at the top of the approval card.
+        app_ctx = (
+            cfg.principal_apps.get(agent_id)
+            or cfg.principal_apps.get(req.service)
+        )
+        if app_ctx is not None:
+            req = _replace(req, app_context=app_ctx)
+        cfg.state.add_pending(req)
+        self._notify_push(req)
+        self._send_json(HTTPStatus.CREATED, {
+            "request_id": req.request_id,
+            "candidate_profile_id": candidate_profile_id,
+            "expires_at_unix": req.expires_at_unix,
+            "result_url": f"/v0.4/profile/result/{req.request_id}",
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/profile/<profile_id>/add-device  (Phase 2.0.C wave C.5)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_add_device(
+        self, profile_id: str, body: dict[str, Any]
+    ) -> None:
+        """Queue a profile_add_device request for operator approval.
+
+        Phase 2.0.C wave C.5 integration. Multi-device-per-profile
+        callers (CLI's ``recto profile add-device``, SCIM
+        provisioning, future automation) submit a target profile_id +
+        the phone_id of an already-registered new device; bootloader
+        queues the request on the operator's master phone; phone
+        displays an approval card with target + new-device info; on
+        approval, phone signs a master-attestation over the canonical
+        -JSON encoding of (profile_id + new_phone_id + added_at_unix
+        + request_id); bootloader verifies the attestation against
+        the operator pubkey loaded via vault_root.json, atomic-writes
+        the appended phone_id to master_identity.json, and stashes a
+        ProfileAddDeviceResult for the caller to poll.
+
+        Partial-failure design (same shape as profile_create):
+
+          * **A — caller-authored idempotency key.** ``candidate_request_id``
+            is generated by the caller at submit time and used as
+            the canonical key. A retry with the same key returns the
+            existing PendingRequest or result without re-prompting.
+
+          * **B — persist last; in-memory result is derived.** The
+            atomic write to master_identity.json is the source of
+            truth. The ProfileAddDeviceResult store is a derived
+            projection.
+
+          * **C — never claim success when persist failed.** If the
+            atomic write throws, the bootloader stores
+            ``signature_error`` with reason ``"persist_error: ..."``
+            so the caller knows recovery requires fixing the host's
+            disk state.
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token`` headers.
+        Endpoint is disabled (404) when ``cfg.capability_agent_tokens``
+        is empty.
+
+        Pre-flight checks:
+          - profile_id (URL path) must exist under the bootstrapped master
+          - target profile must NOT be revoked
+          - new_phone_id (body) must be a registered phone_id
+          - new_phone_id must NOT already be in profile's device_ids
+            (returns 200 "already_member" idempotent hit without
+            queueing)
+
+        Body shape:
+            {
+                "master_phone_id": "<paired-phone-id of master>",
+                "new_phone_id": "<paired-phone-id of new device>",
+                "new_phone_label": <optional str>,
+                "candidate_request_id": <optional str>,
+                "ttl_seconds": <optional int, default 600, range 60..86400>,
+                "operation_description": <optional str>
+            }
+
+        Response (201, new request queued):
+            {
+                "request_id": "<uuid>",
+                "profile_id": "<echo from URL>",
+                "new_phone_id": "<echo from body>",
+                "expires_at_unix": <int>,
+                "result_url": "/v0.4/profile/add-device-result/<request_id>"
+            }
+
+        Response (200, idempotent hit on already-member):
+            {
+                "status": "already_member",
+                "profile_id": "<echo from URL>",
+                "new_phone_id": "<echo from body>",
+                "reason": "new_phone_id is already in the profile's device_ids tuple"
+            }
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        # Auth
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required",
+                 "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        # Body shape validation
+        if not profile_id or not isinstance(profile_id, str):
+            raise BootloaderError("profile_id required in URL path")
+        master_phone_id = body.get("master_phone_id", "")
+        if not master_phone_id or not isinstance(master_phone_id, str):
+            raise BootloaderError(
+                "master_phone_id required in profile_add_device body "
+                "(phone_id of the master's paired device that will sign "
+                "the attestation)"
+            )
+        if cfg.state.get_phone(master_phone_id) is None:
+            raise UnknownPhoneError(
+                f"master_phone_id {master_phone_id!r} not registered"
+            )
+        new_phone_id = body.get("new_phone_id", "")
+        if not new_phone_id or not isinstance(new_phone_id, str):
+            raise BootloaderError(
+                "new_phone_id required in profile_add_device body"
+            )
+        if cfg.state.get_phone(new_phone_id) is None:
+            raise UnknownPhoneError(
+                f"new_phone_id {new_phone_id!r} not registered; "
+                f"new device must complete the v0.4 pair flow before "
+                f"being added to a profile"
+            )
+        if new_phone_id == master_phone_id:
+            raise BootloaderError(
+                "new_phone_id must be different from master_phone_id"
+            )
+        new_phone_label = body.get("new_phone_label")
+        if new_phone_label is not None and not isinstance(new_phone_label, str):
+            raise BootloaderError("new_phone_label must be a string or null")
+        ttl_seconds = body.get("ttl_seconds", 600)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 60 or ttl_seconds > 86400:
+            raise BootloaderError(
+                "ttl_seconds must be an integer in [60, 86400]"
+            )
+        operation_description = body.get(
+            "operation_description",
+            f"profile_add_device from {agent_id}: append {new_phone_id} to {profile_id}",
+        )
+        if not isinstance(operation_description, str):
+            raise BootloaderError("operation_description must be a string")
+
+        # Pre-flight: profile must exist + not be revoked + new_phone_id
+        # must not already be a member. The respond branch will re-check
+        # these defensively but catching here saves a phone prompt for
+        # bad requests.
+        from recto.profile.manage import (
+            get_profile_by_id as _get_profile_by_id,
+        )
+        from recto.profile.store import load_master_identity as _load_mi
+        _state_dir = cfg.state.state_dir
+        mi = _load_mi(state_dir=_state_dir)
+        if mi is None:
+            raise BootloaderError(
+                "MasterIdentity not bootstrapped; "
+                "run `recto vault bootstrap` first"
+            )
+        target = _get_profile_by_id(profile_id, state_dir=_state_dir)
+        if target is None:
+            raise BootloaderError(
+                f"profile_id {profile_id!r} not found under master "
+                f"{mi.master_pubkey_hex[:16]}..."
+            )
+        if target.revoked:
+            raise BootloaderError(
+                f"profile_id {profile_id!r} is revoked; cannot add devices"
+            )
+        # Idempotent hit: new_phone_id already in device_ids → return
+        # already_member without queueing.
+        if new_phone_id in target.device_ids:
+            self._send_json(HTTPStatus.OK, {
+                "status": "already_member",
+                "profile_id": profile_id,
+                "new_phone_id": new_phone_id,
+                "reason": (
+                    "new_phone_id is already in the profile's "
+                    "device_ids tuple"
+                ),
+            })
+            return
+
+        # Build the canonical-JSON signing input. The request_id is
+        # part of the binding so that re-running with the same intent
+        # produces a fresh attestation (defends against replay across
+        # two simultaneous identical requests).
+        from recto.capability.jwt import _canonical_json as _to_canonical
+        added_at_unix = int(time.time())
+        request_id = str(uuid.uuid4())
+        signing_fields = {
+            "action": "profile_add_device",
+            "profile_id": profile_id,
+            "new_phone_id": new_phone_id,
+            "added_at_unix": added_at_unix,
+            "request_id": request_id,
+            "master_pubkey_hex": mi.master_pubkey_hex,
+        }
+        signing_input_bytes = _to_canonical(signing_fields)
+        digest = hashlib.sha256(signing_input_bytes).digest()
+        payload_hash_b64u = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        cap_payload_b64 = base64.urlsafe_b64encode(signing_input_bytes).rstrip(b"=").decode("ascii")
+
+        try:
+            req = PendingRequest.new_profile_add_device(
+                service=body.get("service", "recto"),
+                secret=body.get("secret", "profile"),
+                phone_id=master_phone_id,
+                operation_description=operation_description,
+                payload_hash_b64u=payload_hash_b64u,
+                child_pid=0,
+                child_argv0="(external-agent)",
+                addev_profile_id=profile_id,
+                addev_new_phone_id=new_phone_id,
+                addev_new_phone_label=new_phone_label,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            raise BootloaderError(
+                f"profile_add_device construction failed: {exc}"
+            ) from exc
+        # Override request_id so it matches the one embedded in the
+        # signing input (so signature verification at respond time
+        # has access to the actual request_id used).
+        from dataclasses import replace as _replace
+        req = _replace(
+            req,
+            request_id=request_id,
+            cap_payload_b64=cap_payload_b64,
+            cap_agent_id=agent_id,
+        )
+        # AppContext injection
+        app_ctx = (
+            cfg.principal_apps.get(agent_id)
+            or cfg.principal_apps.get(req.service)
+        )
+        if app_ctx is not None:
+            req = _replace(req, app_context=app_ctx)
+        cfg.state.add_pending(req)
+        self._notify_push(req)
+        self._send_json(HTTPStatus.CREATED, {
+            "request_id": req.request_id,
+            "profile_id": profile_id,
+            "new_phone_id": new_phone_id,
+            "expires_at_unix": req.expires_at_unix,
+            "result_url": f"/v0.4/profile/add-device-result/{req.request_id}",
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/profile/<profile_id>/revoke-device  (Phase 2.0.C wave C.6)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_revoke_device(
+        self, profile_id: str, body: dict[str, Any]
+    ) -> None:
+        """Queue a profile_revoke_device request for operator approval.
+
+        Phase 2.0.C wave C.6 integration. Multi-device-per-profile
+        revocation flow. The master phone signs an attestation over
+        the canonical-JSON binding (profile_id + phone_id_to_revoke +
+        revoked_at_unix + request_id), bootloader verifies + calls
+        profile.manage.profile_revoke_device.
+
+        At v1 only K=1 master-only signing is wired (the endpoint
+        rejects K>=2 with quorum_not_yet_implemented). K-of-N
+        aggregation across non-master devices is banked for v1.1.
+
+        Pre-flight checks (save the operator a phone prompt on bad
+        requests):
+          - profile_id exists under bootstrapped master
+          - profile is NOT revoked
+          - profile.revoke_quorum_k == 1 (K>=2 rejected with
+            quorum_not_yet_implemented)
+          - phone_id_to_revoke is registered with the bootloader
+          - master_phone_id (the signer) is registered
+          - phone_id_to_revoke IS in profile.device_ids (else returns
+            200 already_not_member idempotent without queueing)
+          - removing phone_id_to_revoke would NOT empty device_ids
+            (last-device guard surfaced as 400 here rather than
+            triggering the storage-primitive ValueError at respond
+            time)
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token`` headers.
+
+        Body shape:
+            {
+                "master_phone_id": "<paired-phone-id of master>",
+                "phone_id_to_revoke": "<paired-phone-id to remove>",
+                "revoker_label": <optional str>,
+                "ttl_seconds": <optional int, default 600, range 60..86400>,
+                "operation_description": <optional str>
+            }
+
+        Response (201, queued):
+            {
+                "request_id": "<uuid>",
+                "profile_id": "<echo>",
+                "phone_id_to_revoke": "<echo>",
+                "expires_at_unix": <int>,
+                "result_url": "/v0.4/profile/revoke-device-result/<request_id>"
+            }
+
+        Response (200, idempotent hit on already_not_member):
+            {
+                "status": "already_not_member",
+                "profile_id": "<echo>",
+                "phone_id_to_revoke": "<echo>",
+                "reason": "phone_id_to_revoke is not in profile.device_ids"
+            }
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required",
+                 "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        if not profile_id or not isinstance(profile_id, str):
+            raise BootloaderError("profile_id required in URL path")
+        master_phone_id = body.get("master_phone_id", "")
+        if not master_phone_id or not isinstance(master_phone_id, str):
+            raise BootloaderError(
+                "master_phone_id required in profile_revoke_device body"
+            )
+        if cfg.state.get_phone(master_phone_id) is None:
+            raise UnknownPhoneError(
+                f"master_phone_id {master_phone_id!r} not registered"
+            )
+        phone_id_to_revoke = body.get("phone_id_to_revoke", "")
+        if not phone_id_to_revoke or not isinstance(phone_id_to_revoke, str):
+            raise BootloaderError(
+                "phone_id_to_revoke required in profile_revoke_device body"
+            )
+        revoker_label = body.get("revoker_label")
+        if revoker_label is not None and not isinstance(revoker_label, str):
+            raise BootloaderError("revoker_label must be a string or null")
+        ttl_seconds = body.get("ttl_seconds", 600)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 60 or ttl_seconds > 86400:
+            raise BootloaderError(
+                "ttl_seconds must be an integer in [60, 86400]"
+            )
+        operation_description = body.get(
+            "operation_description",
+            f"profile_revoke_device from {agent_id}: remove {phone_id_to_revoke} from {profile_id}",
+        )
+        if not isinstance(operation_description, str):
+            raise BootloaderError("operation_description must be a string")
+
+        from recto.profile.manage import (
+            get_profile_by_id as _get_profile_by_id,
+        )
+        from recto.profile.store import load_master_identity as _load_mi
+        _state_dir = cfg.state.state_dir
+        mi = _load_mi(state_dir=_state_dir)
+        if mi is None:
+            raise BootloaderError(
+                "MasterIdentity not bootstrapped; "
+                "run `recto vault bootstrap` first"
+            )
+        target = _get_profile_by_id(profile_id, state_dir=_state_dir)
+        if target is None:
+            raise BootloaderError(
+                f"profile_id {profile_id!r} not found under master "
+                f"{mi.master_pubkey_hex[:16]}..."
+            )
+        if target.revoked:
+            raise BootloaderError(
+                f"profile_id {profile_id!r} is revoked; cannot mutate "
+                f"device_ids on a revoked profile"
+            )
+        # K-of-N quorum at v1: only K=1 is wired end-to-end. Reject
+        # K>=2 with a clear error rather than silently queueing a
+        # request that the respond branch wouldn't know how to
+        # aggregate.
+        #
+        # THE AGGREGATION PRIMITIVE NOW EXISTS: `recto.quorum.verify_quorum`
+        # (2026-08-19), built plane-agnostic precisely so this path and the
+        # genesis member set share ONE definition of "k distinct signatures"
+        # instead of growing two that drift. It counts MEMBERS satisfied,
+        # never signatures accepted.
+        #
+        # WHAT ACTUALLY REMAINS, and it is NOT what the message below used to
+        # claim. The old text said this was blocked on "the schema bump that
+        # adds secp256k1 pubkeys to non-master phone registrations" -- that
+        # blocker is GONE and probably has been for a while: `public_key_b64u`
+        # is a required field on every `PhoneRegistration`, master or not,
+        # and this very endpoint already resolves one (`revoker.public_key_b64u`).
+        # A reader would have concluded the work was waiting on a schema
+        # change that had already landed.
+        #
+        # The real remainder is a STATE MACHINE, not a verifier: K>=2 means
+        # N approvals accumulating against ONE PendingRequest across time and
+        # devices, which needs partial-signature persistence, per-signer
+        # replay protection, and an expiry rule for a half-collected quorum.
+        # `verify_quorum` is the last step of that flow, not the flow.
+        if target.revoke_quorum_k != 1:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "quorum_not_yet_implemented",
+                "profile_id": profile_id,
+                "revoke_quorum_k": target.revoke_quorum_k,
+                "detail": (
+                    f"profile_id {profile_id!r} requires "
+                    f"{target.revoke_quorum_k}-of-N signatures to "
+                    f"revoke a device. The signature-aggregation "
+                    f"primitive exists (recto.quorum.verify_quorum); "
+                    f"what remains is collecting N approvals against a "
+                    f"single pending request over time -- partial-"
+                    f"signature persistence, per-signer replay "
+                    f"protection, and an expiry rule for a half-"
+                    f"collected quorum. At v1 only profiles with K=1 "
+                    f"can be revoked from."
+                ),
+            })
+            return
+        # phone_id_to_revoke must be a registered phone (defense:
+        # revoking a never-registered phone_id would be a bug
+        # upstream).
+        if cfg.state.get_phone(phone_id_to_revoke) is None:
+            raise UnknownPhoneError(
+                f"phone_id_to_revoke {phone_id_to_revoke!r} not registered"
+            )
+        # Idempotent already_not_member: phone isn't in device_ids at
+        # all → return 200 without queueing. Sister of add-device's
+        # already_member pattern.
+        if phone_id_to_revoke not in target.device_ids:
+            self._send_json(HTTPStatus.OK, {
+                "status": "already_not_member",
+                "profile_id": profile_id,
+                "phone_id_to_revoke": phone_id_to_revoke,
+                "reason": (
+                    "phone_id_to_revoke is not in the profile's "
+                    "device_ids tuple"
+                ),
+            })
+            return
+        # Last-device guard: surfacing here saves the operator a phone
+        # prompt. Storage-primitive enforces too (defense-in-depth).
+        if len(target.device_ids) == 1:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "last_device_guard",
+                "profile_id": profile_id,
+                "phone_id_to_revoke": phone_id_to_revoke,
+                "detail": (
+                    f"cannot revoke the only device on profile "
+                    f"{profile_id!r}; would make the profile "
+                    f"unreachable. Add a replacement device via "
+                    f"profile_add_device first."
+                ),
+            })
+            return
+
+        # Build canonical-JSON signing input.
+        from recto.capability.jwt import _canonical_json as _to_canonical
+        revoked_at_unix = int(time.time())
+        request_id = str(uuid.uuid4())
+        signing_fields = {
+            "action": "profile_revoke_device",
+            "profile_id": profile_id,
+            "phone_id_to_revoke": phone_id_to_revoke,
+            "revoked_at_unix": revoked_at_unix,
+            "request_id": request_id,
+            "master_pubkey_hex": mi.master_pubkey_hex,
+        }
+        signing_input_bytes = _to_canonical(signing_fields)
+        digest = hashlib.sha256(signing_input_bytes).digest()
+        payload_hash_b64u = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        cap_payload_b64 = base64.urlsafe_b64encode(signing_input_bytes).rstrip(b"=").decode("ascii")
+
+        try:
+            req = PendingRequest.new_profile_revoke_device(
+                service=body.get("service", "recto"),
+                secret=body.get("secret", "profile"),
+                phone_id=master_phone_id,
+                operation_description=operation_description,
+                payload_hash_b64u=payload_hash_b64u,
+                child_pid=0,
+                child_argv0="(external-agent)",
+                revdev_profile_id=profile_id,
+                revdev_phone_id_to_revoke=phone_id_to_revoke,
+                revdev_revoker_label=revoker_label,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            raise BootloaderError(
+                f"profile_revoke_device construction failed: {exc}"
+            ) from exc
+        from dataclasses import replace as _replace
+        req = _replace(
+            req,
+            request_id=request_id,
+            cap_payload_b64=cap_payload_b64,
+            cap_agent_id=agent_id,
+        )
+        app_ctx = (
+            cfg.principal_apps.get(agent_id)
+            or cfg.principal_apps.get(req.service)
+        )
+        if app_ctx is not None:
+            req = _replace(req, app_context=app_ctx)
+        cfg.state.add_pending(req)
+        self._notify_push(req)
+        self._send_json(HTTPStatus.CREATED, {
+            "request_id": req.request_id,
+            "profile_id": profile_id,
+            "phone_id_to_revoke": phone_id_to_revoke,
+            "expires_at_unix": req.expires_at_unix,
+            "result_url": f"/v0.4/profile/revoke-device-result/{req.request_id}",
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/pairing/code  (operator-trusted fresh-code mint)
+    # ------------------------------------------------------------------
+
+    def _handle_mint_pairing_code(self, body: dict[str, Any]) -> None:
+        """Mint a fresh pairing code without restarting the bootloader.
+
+        Operator-trusted agents (downstream consumer chatbots,
+        automation runners, the launcher itself when running
+        supervised) call this endpoint to obtain a fresh 6-digit
+        pairing code on demand. Removes the friction of bouncing the
+        bootloader to issue a new code when the existing code's TTL
+        has elapsed -- a real pain point during multi-phone bring-ups
+        where the foreground bootloader's startup-printed code times
+        out before all phones have completed pairing.
+
+        Auth: same agent-token posture as
+        ``/v0.4/capability/request`` -- operator-trusted agents only
+        via ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token``. Endpoint
+        is disabled (404) when no agent tokens are configured,
+        matching the rest of the agent-trusted surface (an operator
+        who hasn't issued any agent tokens has no need for fresh-
+        code minting via HTTP -- the launcher's stdout-printed
+        startup code is sufficient). THE OWNER SLOTS: past genesis an
+        owner enrollment spends a code on each of its two passes, so
+        adding or replacing an owner phone needs an agent flagged
+        may_mint_owner_codes; the launcher prints a startup code only
+        while owner genesis is open (the first owner, or after a host
+        reset).
+
+        Body (optional): ``{"ttl_seconds": int}``
+          - default: 300 (5 minutes)
+          - min: 60 (1 minute)
+          - max: 3600 (1 hour) -- ceiling so a buggy/malicious
+            caller can't park codes on the bootloader's in-memory
+            store indefinitely.
+
+        Response (200):
+          ``{"code": "NNNNNN", "expires_at_unix": int, "ttl_seconds": int}``
+
+        The minted code is consumable via
+        ``GET /v0.4/registration_challenge?code=...`` on the very
+        next pairing flow (no restart needed).
+        """
+        cfg = self.config
+        if cfg.challenges is None:
+            raise BootloaderError("challenge store not initialized")
+        if not cfg.capability_agent_tokens:
+            # Endpoint is disabled when no tokens are configured.
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        # Auth headers (mirror capability_request shape exactly so
+        # operator-side conventions stay consistent across the
+        # agent-trusted surface).
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required",
+                 "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        # Body shape: optional ttl_seconds with bounds enforcement
+        ttl_seconds = body.get("ttl_seconds", 300)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 60 or ttl_seconds > 3600:
+            raise BootloaderError(
+                "ttl_seconds must be an integer in [60, 3600] (1 minute - 1 hour)"
+            )
+        # THE MEMBER PLANE (2026-09-30): a consumer mints a code for one of ITS MEMBERS by naming who it is for.
+        # That code registers beside the business slots and carries none of the owner's authority; a code minted
+        # without member_of keeps its meaning (the owner's, e.g. the owner's own re-pair lane).
+        # Since 2026-10-17 it names the user by the consumer's OPAQUE subject handle (hard rules 15.m/15.o), and the code
+        # carries (consumer, subject) into the registration it buys (15.n).
+        member_of = body.get("member_of")
+        if member_of is not None:
+            if (not isinstance(member_of, dict)
+                    or not isinstance(member_of.get("consumer"), str) or not member_of["consumer"].strip()
+                    or "subject" not in member_of):
+                raise BootloaderError(
+                    "member_of must be {\"consumer\": <base url>, \"subject\": <opaque handle>}")
+            from recto.subject_handle import normalize_subject as _normalize_subject
+            try:
+                subject = _normalize_subject(member_of["subject"])
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {
+                    "error": "subject_invalid",
+                    "detail": "member_of.subject must be an opaque handle of 43 base64url characters",
+                })
+                return
+            code, exp = cfg.challenges.issue_member_pairing_code(
+                ttl_seconds=ttl_seconds, binding=(member_of["consumer"].strip(), subject))
+            print(f"[bootloader] minted MEMBER pairing code via /v0.4/pairing/code "
+                  f"(agent={agent_id}, consumer={member_of['consumer']}, expires_at_unix={exp})", flush=True)
+            self._send_json(HTTPStatus.OK, {"code": code, "expires_at_unix": exp, "ttl_seconds": ttl_seconds,
+                                            "plane": "member"})
+            return
+        # THE OWNER SLOTS: an OWNER code is the operator's - only an agent whose entry carries
+        # "may_mint_owner_codes": true mints one. Every other agent mints member codes (member_of above).
+        if agent_id not in cfg.owner_code_minters:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "owner_code_mint_not_allowed",
+                "detail": f"agent {agent_id!r} may mint member codes only (member_of); an owner code needs "
+                          "\"may_mint_owner_codes\": true on the agent's entry",
+            })
+            return
+        # Mint via the in-process ChallengeStore primitive
+        code, exp = cfg.challenges.issue_pairing_code(ttl_seconds=ttl_seconds)
+        # Operator-friendly stdout for the foreground-bootloader case
+        # (matches the existing startup-print convention).
+        print(f"[bootloader] minted pairing code via /v0.4/pairing/code "
+              f"(agent={agent_id}, expires_at_unix={exp})", flush=True)
+        self._send_json(HTTPStatus.OK, {
+            "code": code,
+            "expires_at_unix": exp,
+            "ttl_seconds": ttl_seconds,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/manage/phones/revoke
+    # ------------------------------------------------------------------
+
+    def _handle_revoke_phone(self, body: dict[str, Any]) -> None:
+        """Revoke a paired phone: a phone retiring itself (self-revoke) or another phone (sibling-revoke).
+
+        THE REVOKE PLANE (hard rule 14.4, amended):
+          - a member phone revokes only itself;
+          - an owner phone revokes an owner phone or a member, 1-of-N (a quorum is v2);
+          - the last owner phone is never revoked - a lost sole phone is the host's act
+            (`recto bootloader owner-reset`).
+        Decided under the registry lock, so two owners revoking each other leave one.
+
+        Auth: a signed challenge from the revoking phone, not an agent token. The caller fetches a
+        challenge with GET /v0.4/registration_challenge (no code: a plain challenge), signs the ASCII
+        bytes of ``f"{challenge_b64u}:{target_phone_id}"`` with its identity key (the colon binding
+        keeps a signature for one target from being replayed against another), and POSTs:
+
+          ``{"revoker_phone_id": str, "target_phone_id": str,
+             "challenge_b64u": str, "signature_b64u": str}``
+
+        Response (200):
+          ``{"revoked": true, "revoked_phone_id": str,
+             "was_self_revoke": bool, "remaining_phones_count": int}``
+
+        Errors:
+          - 400: a missing or malformed field, an expired challenge, an unknown revoker or target
+          - 401 revoke_signature_invalid: the signature does not verify against the revoker's key
+          - 403 revoke_plane: a member phone named another phone
+          - 403 last_owner: the target is the last owner phone
+        """
+        cfg = self.config
+        if cfg.state is None or cfg.challenges is None:
+            raise BootloaderError("server not initialized")
+        revoker_phone_id = body.get("revoker_phone_id", "")
+        target_phone_id = body.get("target_phone_id", "")
+        challenge = body.get("challenge_b64u", "")
+        sig = body.get("signature_b64u", "")
+        for name, val in [
+            ("revoker_phone_id", revoker_phone_id),
+            ("target_phone_id", target_phone_id),
+            ("challenge_b64u", challenge),
+            ("signature_b64u", sig),
+        ]:
+            if not isinstance(val, str) or not val:
+                raise BootloaderError(f"{name} required (non-empty string)")
+        revoker = cfg.state.get_phone(revoker_phone_id)
+        if revoker is None:
+            raise UnknownPhoneError(
+                f"revoker phone_id {revoker_phone_id!r} not registered"
+            )
+        target = cfg.state.get_phone(target_phone_id)
+        if target is None:
+            raise UnknownPhoneError(
+                f"target phone_id {target_phone_id!r} not registered"
+            )
+        # Consume challenge (single-use; same surface the registration
+        # flow uses, just consumed by a different POST handler).
+        if not cfg.challenges.consume_challenge(challenge):
+            raise RegistrationExpiredError(
+                "challenge expired or invalid (fetch a fresh one via "
+                "GET /v0.4/registration_challenge)"
+            )
+        # Verify the revoker's signature over the colon-bound payload.
+        # The colon binding is what prevents replay -- a sig captured
+        # for one target can't be reused against a different target.
+        # Algorithm comes from the revoker's registered supported_algorithms
+        # (first entry, matching the registration flow convention).
+        chosen_algo = _registered_algorithm(revoker, revoker.phone_id)
+        payload = f"{challenge}:{target_phone_id}".encode("ascii")
+        ok = verify_signature(
+            payload=payload,
+            signature_b64u=sig,
+            public_key_b64u=revoker.public_key_b64u,
+            algorithm=chosen_algo,
+        )
+        if not ok:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "revoke_signature_invalid",
+                 "detail": (
+                     f"signature did not verify against revoker's "
+                     f"pubkey (algorithm={chosen_algo!r}). The phone "
+                     "must sign the ASCII bytes of "
+                     "f'{challenge_b64u}:{target_phone_id}'."
+                 )},
+            )
+            return
+        was_self_revoke = (revoker_phone_id == target_phone_id)
+        # THE REVOKE PLANE (hard rule 14.4, amended): a slot holder revokes a slot holder or a member; a member revokes
+        # only itself; the LAST owner phone is never revoked - a lost sole phone is the operator's host reset. Decided
+        # and done under the registry lock, so two phones revoking each other leave one owner, never none.
+        with cfg.state.registry_lock():
+            revoker = cfg.state.get_phone(revoker_phone_id)
+            target = cfg.state.get_phone(target_phone_id)
+            if revoker is None or target is None:
+                raise UnknownPhoneError("revoker or target phone_id no longer registered")
+            if revoker.slot not in SLOTS and not was_self_revoke:
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "revoke_plane",
+                    "detail": "a member phone revokes only itself",
+                })
+                return
+            sealed_cs = None
+            if not was_self_revoke and target.slot in SLOTS:
+                # THE TOP PLANE (hard rule 14.7), decided under the registry lock. While an owner reset is open no
+                # owner phone is removed by another, so every owner phone keeps its cancel. And once the plane is
+                # sealed, a SEALED DEVICE MEMBER is never removed by a sibling's signature alone: its removal is a
+                # top-plane act - a chain `remove` signed by the passphrase and the revoking device.
+                if any(self._reset_open(r) for r in cfg.state.list_top_plane_records()):
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "owner_reset_open",
+                        "detail": "an owner reset is open; until it completes or is cancelled no owner phone is "
+                                  "revoked by another (every owner phone keeps its cancel)",
+                    })
+                    return
+                try:
+                    sealed_cs = self._sealed_chain_or_none()
+                except top_plane.TopPlaneRefused as e:
+                    self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+                    return
+                if sealed_cs is not None and top_plane.device_kind_of(sealed_cs, target) is not None:
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "top_plane_revoke_required",
+                        "detail": "this phone is a sealed device member: removing it is a top-plane act - on the "
+                                  "host, `recto vault remove-device --slot <slot>` (the passphrase), then approve the "
+                                  "card on another sealed device (hard rule 14.7)",
+                    })
+                    return
+            if target.slot in SLOTS and len([p for p in cfg.state.list_phones() if p.slot in SLOTS]) <= 1:
+                if sealed_cs is None:
+                    try:
+                        sealed_cs = self._sealed_chain_or_none()
+                    except top_plane.TopPlaneRefused:
+                        sealed_cs = None
+                lost_path = (
+                    "`recto bootloader owner-reset --start --slot <slot> --confirm <phone_ref>`"
+                    if sealed_cs is not None else
+                    "`recto bootloader owner-reset --slot <slot> --confirm <phone_ref> --reopen-genesis`"
+                )
+                self._send_json(HTTPStatus.FORBIDDEN, {
+                    "error": "last_owner",
+                    "detail": "This is the only owner phone, so it is never revoked. To move to a new phone: pair it "
+                              "with an owner code, approve its card here, and pair it again - that removes this one. "
+                              f"Lost phone: on the bootloader host, {lost_path}.",
+                })
+                return
+            removed = cfg.state.revoke_phone(target_phone_id)
+            if removed:
+                # Its approvals, and the requests naming it as the occupant, die with it (a re-pair of the same key
+                # never revives them).
+                void_owner_enrolls_for(cfg.state, target_phone_id)
+            # Should always be True since we verified target exists above,
+            # but be defensive: a concurrent revoke from another caller
+            # could race us between the get_phone check and this delete.
+            if not removed:
+                raise UnknownPhoneError(
+                    f"target phone_id {target_phone_id!r} no longer registered "
+                    "(concurrent revoke from another caller?)"
+                )
+            remaining = len(cfg.state.list_phones())
+        print(
+            f"[bootloader] phone revoked: target={target_phone_id} "
+            f"by revoker={revoker_phone_id} "
+            f"(self={was_self_revoke}, remaining={remaining})",
+            flush=True,
+        )
+        self._send_json(HTTPStatus.OK, {
+            "revoked": True,
+            "revoked_phone_id": target_phone_id,
+            "was_self_revoke": was_self_revoke,
+            "remaining_phones_count": remaining,
+        })
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/capability/result/<request_id>  (Phase 5 Wave B)
+    # ------------------------------------------------------------------
+
+    def _handle_capability_result(self, request_id: str) -> None:
+        """Poll for a resolved capability_request result.
+
+        Three response states:
+        - 200 + status="approved" + capability_jws=<3-part JWS> when the
+          operator approved and the bootloader assembled the JWS. Single
+          fetch only — the result is removed from the store on read.
+        - 200 + status="denied" + reason=<operator's reason> when the
+          operator declined.
+        - 200 + status="signature_error" + reason when the bootloader
+          rejected a malformed signature from the phone (rare).
+        - 200 + status="pending" when the request is still on the
+          queue waiting for operator action.
+        - 404 when the request_id has expired (TTL elapsed) or never
+          existed. Agent should treat as "request lost" and re-submit.
+
+        Auth via the same X-Recto-Agent-Id + X-Recto-Agent-Token
+        headers used by /capability/request — only the agent that
+        created the request can fetch its result, AND the result is
+        scoped to that agent (cap_agent_id pinned at request time).
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        # Check the resolved-results store first; if nothing's there,
+        # check the pending queue (still waiting). 404 if neither.
+        result = cfg.state.get_capability_result(request_id)
+        if result is None:
+            # Could still be pending. We don't expose the pending list
+            # by id here — just check existence in the queue. (The
+            # pending dict is private to StateStore; we use the public
+            # take_pending None-test pattern by glancing at a peek
+            # method... actually the easiest correct thing is to ask
+            # the store directly via _pending dict access.)
+            # Cleaner: the StateStore has list_pending_for_phone but
+            # not get_pending_by_id; we can sweep the phone's queue
+            # for the id. Acceptable cost — the queue is small.
+            # As a simpler inline impl:
+            still_pending = False
+            for _phone_id_unused in (
+                phone.phone_id for phone in cfg.state.list_phones()
+            ):
+                for p in cfg.state.list_pending_for_phone(_phone_id_unused):
+                    if p.request_id == request_id:
+                        # Validate ownership before disclosing pending
+                        # state — only the agent that submitted the
+                        # request can poll for it.
+                        if p.cap_agent_id != agent_id:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND,
+                                {"error": "request_not_found"},
+                            )
+                            return
+                        still_pending = True
+                        break
+                if still_pending:
+                    break
+            if still_pending:
+                self._send_json(HTTPStatus.OK, {"status": "pending"})
+                return
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        # Result found — enforce agent ownership before disclosing.
+        if result.agent_id != agent_id:
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        # Single-use semantics: take the result so subsequent fetches
+        # return 404. Agent is responsible for caching the JWT
+        # locally if it needs to re-use it.
+        cfg.state.take_capability_result(request_id)
+        out: dict[str, Any] = {"status": result.status}
+        if result.capability_jws is not None:
+            out["capability_jws"] = result.capability_jws
+        if result.reason is not None:
+            out["reason"] = result.reason
+        self._send_json(HTTPStatus.OK, out)
+
+    def _store_capability_result(
+        self,
+        req: PendingRequest,
+        *,
+        status: str,
+        capability_jws: str | None,
+        reason: str | None,
+    ) -> None:
+        """Stash a CapabilityResult for the requesting agent's later
+        poll. Called from _handle_respond after the bootloader has
+        decided whether to approve, deny, or signature-error.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            return
+        now = int(time.time())
+        ttl = max(60, int(cfg.capability_result_ttl_seconds))
+        result = CapabilityResult(
+            request_id=req.request_id,
+            status=status,
+            capability_jws=capability_jws,
+            reason=reason,
+            agent_id=req.cap_agent_id,
+            resolved_at_unix=now,
+            expires_at_unix=now + ttl,
+        )
+        cfg.state.put_capability_result(result)
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/profile/result/<request_id>  (Phase 2.0.B)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_create_result(self, request_id: str) -> None:
+        """Poll for a resolved profile_create result.
+
+        Sister of ``_handle_capability_result`` for the multi-profile
+        identity flow. Single-use fetch (the result is removed from
+        the store on read); cap_agent_id ownership pin (only the agent
+        that submitted the request can fetch its result).
+
+        Response states:
+          - 200 + status="approved" + profile_id=<new uuid>:
+              operator approved; new profile is persisted in
+              master_identity.json.
+          - 200 + status="denied" + reason=<operator's note>:
+              operator declined at the phone.
+          - 200 + status="signature_error" + reason=<diagnostic>:
+              phone returned an attestation that didn't verify against
+              the operator pubkey. If reason starts with "persist_error:",
+              the attestation verified but the disk write failed
+              (recovery = fix the disk state, retry with same key).
+          - 200 + status="pending": waiting for operator action.
+          - 404: request_id expired (TTL elapsed) or never existed;
+              caller should treat as "request lost" and re-submit
+              (with the SAME candidate_profile_id — retry is safe
+              per the idempotency-key contract).
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token`` headers,
+        matched against ``cap_agent_id`` on the pending/result entry.
+        Endpoint is disabled (404) when no agent tokens are configured.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        # Check the resolved-results store first; if not present, check
+        # the pending queue for a still-in-flight request matching the
+        # id.
+        result = cfg.state.get_profile_create_result(request_id)
+        if result is None:
+            still_pending = False
+            for _phone_id_unused in (
+                phone.phone_id for phone in cfg.state.list_phones()
+            ):
+                for p in cfg.state.list_pending_for_phone(_phone_id_unused):
+                    if p.request_id == request_id:
+                        # Ownership check — only the submitting agent
+                        # can poll for the result.
+                        if p.cap_agent_id != agent_id:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND,
+                                {"error": "request_not_found"},
+                            )
+                            return
+                        still_pending = True
+                        break
+                if still_pending:
+                    break
+            if still_pending:
+                self._send_json(HTTPStatus.OK, {"status": "pending"})
+                return
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        # Result found — single-use semantics: take the result so
+        # subsequent fetches return 404. Caller is responsible for
+        # caching the profile_id locally if it needs to re-use it.
+        # Note: the profile itself is persisted in master_identity.json
+        # and remains discoverable via `recto profile list` even after
+        # this result is consumed (Milan commitment B — persist is the
+        # source of truth; result-store is a convenience projection).
+        cfg.state.take_profile_create_result(request_id)
+        out: dict[str, Any] = {"status": result.status}
+        if result.profile_id is not None:
+            out["profile_id"] = result.profile_id
+        if result.reason is not None:
+            out["reason"] = result.reason
+        self._send_json(HTTPStatus.OK, out)
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/profile/add-device-result/<request_id>  (Phase 2.0.C wave C.5)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_add_device_result(self, request_id: str) -> None:
+        """Poll for a resolved profile_add_device result.
+
+        Sister of ``_handle_profile_create_result`` for the device-set
+        mutation flow. Single-use fetch (the result is removed from
+        the store on read); cap_agent_id ownership pin (only the agent
+        that submitted the request can fetch its result).
+
+        Response states:
+          - 200 + status="approved" + profile_id + new_phone_id:
+              operator approved; new phone_id is now in the profile's
+              device_ids tuple.
+          - 200 + status="already_member" + profile_id + new_phone_id:
+              idempotent hit at endpoint pre-flight; no phone prompt
+              occurred.
+          - 200 + status="denied" + reason: operator declined.
+          - 200 + status="signature_error" + reason: phone returned an
+              attestation that didn't verify, OR disk write failed
+              (reason prefix "persist_error:" for the latter).
+          - 200 + status="pending": waiting for operator action.
+          - 404: request_id expired or never existed.
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token`` headers.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        result = cfg.state.get_profile_add_device_result(request_id)
+        if result is None:
+            still_pending = False
+            for _phone_id_unused in (
+                phone.phone_id for phone in cfg.state.list_phones()
+            ):
+                for p in cfg.state.list_pending_for_phone(_phone_id_unused):
+                    if p.request_id == request_id:
+                        if p.cap_agent_id != agent_id:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND,
+                                {"error": "request_not_found"},
+                            )
+                            return
+                        still_pending = True
+                        break
+                if still_pending:
+                    break
+            if still_pending:
+                self._send_json(HTTPStatus.OK, {"status": "pending"})
+                return
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        cfg.state.take_profile_add_device_result(request_id)
+        out: dict[str, Any] = {"status": result.status}
+        if result.profile_id is not None:
+            out["profile_id"] = result.profile_id
+        if result.new_phone_id is not None:
+            out["new_phone_id"] = result.new_phone_id
+        if result.reason is not None:
+            out["reason"] = result.reason
+        self._send_json(HTTPStatus.OK, out)
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/profile/revoke-device-result/<request_id>  (Phase 2.0.C wave C.6)
+    # ------------------------------------------------------------------
+
+    def _handle_profile_revoke_device_result(self, request_id: str) -> None:
+        """Poll for a resolved profile_revoke_device result.
+
+        Sister of ``_handle_profile_add_device_result``. Single-use
+        fetch; cap_agent_id ownership pin (only the agent that
+        submitted the request can fetch its result).
+
+        Response states:
+          - 200 + status="approved" + profile_id + phone_id_revoked
+          - 200 + status="already_not_member" + profile_id + phone_id_revoked
+          - 200 + status="denied" + reason
+          - 200 + status="signature_error" + reason
+          - 200 + status="pending"
+          - 404: request_id expired or never existed.
+
+        Auth: ``X-Recto-Agent-Id`` + ``X-Recto-Agent-Token``.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_agent_tokens:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_required"},
+            )
+            return
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "agent_auth_failed"},
+            )
+            return
+        result = cfg.state.get_profile_revoke_device_result(request_id)
+        if result is None:
+            still_pending = False
+            for _phone_id_unused in (
+                phone.phone_id for phone in cfg.state.list_phones()
+            ):
+                for p in cfg.state.list_pending_for_phone(_phone_id_unused):
+                    if p.request_id == request_id:
+                        if p.cap_agent_id != agent_id:
+                            self._send_json(
+                                HTTPStatus.NOT_FOUND,
+                                {"error": "request_not_found"},
+                            )
+                            return
+                        still_pending = True
+                        break
+                if still_pending:
+                    break
+            if still_pending:
+                self._send_json(HTTPStatus.OK, {"status": "pending"})
+                return
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        cfg.state.take_profile_revoke_device_result(request_id)
+        out: dict[str, Any] = {"status": result.status}
+        if result.profile_id is not None:
+            out["profile_id"] = result.profile_id
+        if result.phone_id_revoked is not None:
+            out["phone_id_revoked"] = result.phone_id_revoked
+        if result.reason is not None:
+            out["reason"] = result.reason
+        self._send_json(HTTPStatus.OK, out)
+
+    def _store_profile_create_result(
+        self,
+        req: PendingRequest,
+        *,
+        status: str,
+        profile_id: str | None,
+        reason: str | None,
+    ) -> None:
+        """Stash a ProfileCreateResult for the submitting agent's later
+        poll. Called from _handle_respond's profile_create branch after
+        the bootloader has decided approve / deny / signature_error.
+
+        Milan commitment B: this is the DERIVED projection of the
+        persistent state in master_identity.json. The on-disk Profile
+        is the source of truth; this result is a poll-convenience
+        layer that survives only until expires_at_unix.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            return
+        now = int(time.time())
+        ttl = max(60, int(cfg.capability_result_ttl_seconds))
+        result = ProfileCreateResult(
+            request_id=req.request_id,
+            status=status,
+            profile_id=profile_id,
+            reason=reason,
+            resolved_at_unix=now,
+            expires_at_unix=now + ttl,
+        )
+        cfg.state.put_profile_create_result(result)
+
+    def _store_profile_add_device_result(
+        self,
+        req: PendingRequest,
+        *,
+        status: str,
+        profile_id: str | None,
+        new_phone_id: str | None,
+        reason: str | None,
+    ) -> None:
+        """Stash a ProfileAddDeviceResult for the submitting agent's
+        later poll. Called from _handle_respond's profile_add_device
+        branch after the bootloader has decided approve / deny /
+        signature_error.
+
+        Milan commitment B: this is the DERIVED projection of the
+        persistent device_ids tuple state in master_identity.json.
+        The on-disk Profile is the source of truth; this result is a
+        poll-convenience layer that survives only until expires_at_unix.
+        """
+        from recto.bootloader.state import ProfileAddDeviceResult
+        cfg = self.config
+        if cfg.state is None:
+            return
+        now = int(time.time())
+        ttl = max(60, int(cfg.capability_result_ttl_seconds))
+        result = ProfileAddDeviceResult(
+            request_id=req.request_id,
+            status=status,
+            profile_id=profile_id,
+            new_phone_id=new_phone_id,
+            reason=reason,
+            resolved_at_unix=now,
+            expires_at_unix=now + ttl,
+        )
+        cfg.state.put_profile_add_device_result(result)
+
+    def _store_profile_revoke_device_result(
+        self,
+        req: PendingRequest,
+        *,
+        status: str,
+        profile_id: str | None,
+        phone_id_revoked: str | None,
+        reason: str | None,
+    ) -> None:
+        """Stash a ProfileRevokeDeviceResult for the submitting agent's
+        later poll. Called from _handle_respond's profile_revoke_device
+        branch after the bootloader has decided approve / deny /
+        signature_error.
+
+        Milan commitment B: the on-disk Profile (with the phone removed
+        from device_ids) is the source of truth; this result is a
+        poll-convenience layer that survives only until expires_at_unix.
+        """
+        from recto.bootloader.state import ProfileRevokeDeviceResult
+        cfg = self.config
+        if cfg.state is None:
+            return
+        now = int(time.time())
+        ttl = max(60, int(cfg.capability_result_ttl_seconds))
+        result = ProfileRevokeDeviceResult(
+            request_id=req.request_id,
+            status=status,
+            profile_id=profile_id,
+            phone_id_revoked=phone_id_revoked,
+            reason=reason,
+            resolved_at_unix=now,
+            expires_at_unix=now + ttl,
+        )
+        cfg.state.put_profile_revoke_device_result(result)
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/capability/revoke  (Phase 5 Wave C part 2)
+    # ------------------------------------------------------------------
+
+    def _handle_capability_revoke(self, body: dict[str, Any]) -> None:
+        """Add a JWT jti to the persistent revocation list.
+
+        Auth: pre-shared operator token via the
+        ``X-Recto-Operator-Token`` header. v1 deliberately uses a
+        shared secret rather than capability-JWT gating because
+        revocation needs to work for the chicken-and-egg case of
+        "revoke a compromised JWT" -- gating revocation behind
+        another JWT would create a cycle. Future iteration may layer
+        a tier-3 ``capability:revoke-other`` check ON TOP of the
+        operator-token check (revocation requires BOTH), but v1
+        keeps it simple.
+
+        Endpoint disabled (returns 404) when
+        ``cfg.capability_operator_token`` is None / empty.
+
+        Body shape: ``{jti, original_exp_unix, reason?}``.
+          - ``jti``: the JWT identifier to revoke (required, must
+            be a non-empty string).
+          - ``original_exp_unix``: the original JWT's exp claim
+            (required; used for auto-pruning the revocation entry
+            once the JWT would have expired anyway).
+          - ``reason``: optional operator-supplied audit note.
+
+        Idempotent: revoking an already-revoked jti is a no-op
+        (returns 200 with a flag indicating the entry was already
+        present). Same idempotence as the StateStore.add_revocation
+        method.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            raise BootloaderError("server not initialized")
+        if not cfg.capability_operator_token:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        operator_token = self.headers.get("X-Recto-Operator-Token", "").strip()
+        if not operator_token:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "operator_token_required",
+                "detail": "X-Recto-Operator-Token header required",
+            })
+            return
+        if not _constant_time_compare(operator_token, cfg.capability_operator_token):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "operator_token_invalid",
+            })
+            return
+        jti = body.get("jti", "")
+        if not jti or not isinstance(jti, str):
+            raise BootloaderError("jti (non-empty string) required in body")
+        if reserved_reset_jti(jti):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "revoke_jti_reserved",
+                "detail": f"a jti beginning {top_plane.REVOKED_RESET_PREFIX!r} is the top plane's; end a reset with "
+                          "its cancel card or `recto bootloader owner-reset --abort`"})
+            return
+        original_exp_unix = body.get("original_exp_unix")
+        if not isinstance(original_exp_unix, int):
+            raise BootloaderError(
+                "original_exp_unix (integer unix timestamp) required in body"
+            )
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise BootloaderError("reason must be a string when present")
+        # Construct the entry. revoked_at_unix = now.
+        already_revoked = cfg.state.is_revoked(jti)
+        entry = RevocationEntry(
+            jti=jti,
+            revoked_at_unix=int(time.time()),
+            original_exp_unix=original_exp_unix,
+            reason=reason,
+        )
+        cfg.state.add_revocation(entry)
+        self._send_json(HTTPStatus.OK, {
+            "revoked": True,
+            "jti": jti,
+            "already_revoked": already_revoked,
+        })
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/capability/revocations  (Phase 5 Wave C part 2)
+    # ------------------------------------------------------------------
+
+    def _handle_capability_revocations(self) -> None:
+        """Serve the current revocation list as canonical JSON.
+
+        Public endpoint -- the revocation list itself isn't sensitive
+        (knowing a jti is revoked doesn't grant any capability), and
+        the whole point is for verifiers (consumer-side servers,
+        other Recto instances, future external services) to fetch
+        on a short cadence and cache locally.
+
+        ETag is the SHA-256 of the canonical-JSON wire shape so
+        verifiers can do If-None-Match revalidation cheaply.
+        Cache-Control: public, max-age=30 -- balances revoke-to-
+        honor latency against fetch volume. Verifiers SHOULD treat
+        the revocation list as eventually-consistent: a revocation
+        committed now propagates to verifiers within ~30s + the
+        verifier's own poll cadence.
+
+        Endpoint is always available (no opt-out via empty list) --
+        even an empty revocation list is meaningful information for
+        verifiers (it says "no JWTs are currently revoked"). The
+        404 disabled-by-empty pattern only applies to write-side
+        endpoints.
+        """
+        cfg = self.config
+        if cfg.state is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "state_not_configured",
+            })
+            return
+        entries = cfg.state.list_revocations()
+        wire_entries = [
+            {
+                "jti": e.jti,
+                "revoked_at_unix": e.revoked_at_unix,
+                "original_exp_unix": e.original_exp_unix,
+                "reason": e.reason,
+            }
+            for e in entries
+        ]
+        body = {"revocations": wire_entries}
+        payload = json.dumps(body, sort_keys=True).encode("utf-8")
+        # ETag: SHA-256 of the canonical bytes. Stable + short.
+        import hashlib as _hashlib
+        etag_hash = _hashlib.sha256(payload).hexdigest()[:32]
+        etag = f'"{etag_hash}"'
+        if_none_match = self.headers.get("If-None-Match", "").strip()
+        if if_none_match == etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "public, max-age=30")
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=30")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ------------------------------------------------------------------
+    # GET /v0.4/capability/manifest  (Phase 5 Wave C part 1)
+    # ------------------------------------------------------------------
+
+    def _handle_capability_manifest(self) -> None:
+        """Serve the canonical capability action manifest.
+
+        Public endpoint -- manifests are public-by-design (they
+        describe what actions exist + their foundation counts; they
+        DON'T describe who has access to which actions, which is the
+        capability JWT's job). Verifiers fetch this once + cache via
+        standard HTTP cache semantics; agents that need to compute a
+        capability's foundation-count breakdown server-side fetch
+        too.
+
+        Returns 404 when no manifest is configured (deployments that
+        don't broker capability auth leave it unset).
+
+        ETag is the manifest's `version` string so verifiers can
+        revalidate via If-None-Match without re-downloading.
+        """
+        cfg = self.config
+        if cfg.capability_manifest is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "no_manifest_configured"})
+            return
+        manifest = cfg.capability_manifest
+        # Build the JSON wire shape (mirror of recto/capability/manifest_v1.json
+        # structure). Lazy-import to avoid a hard dep on recto.capability
+        # at module load time.
+        from recto.capability.types import ActionManifest as _ActionManifestT
+        if not isinstance(manifest, _ActionManifestT):
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "manifest_misconfigured"})
+            return
+        etag = f'"{manifest.version}"'
+        if_none_match = self.headers.get("If-None-Match", "").strip()
+        if if_none_match == etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            return
+        body: dict[str, Any] = {
+            "version": manifest.version,
+            "actions": {
+                key: {"count": defn.count, "description": defn.description}
+                for key, defn in manifest.actions.items()
+            },
+            "groups": {
+                key: {"actions": list(defn.actions)}
+                for key, defn in manifest.groups.items()
+            },
+        }
+        payload = json.dumps(body, sort_keys=True).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ------------------------------------------------------------------
+    # POST /v0.4/secrets/read  (Phase 5 Wave C part 1)
+    # ------------------------------------------------------------------
+
+    def _handle_secret_read(self, body: dict[str, Any]) -> None:
+        """Read a vault secret using a capability JWT for authorization.
+
+        Body shape: ``{capability_jws, service, secret_name}``. The
+        bootloader:
+
+        1. Verifies the JWS against ``cfg.capability_operator_pubkey``
+           (returns 401 on signature failure / expired exp / wrong aud).
+        2. Checks ``jti`` against ``cfg.capability_revocation_jtis``
+           (returns 401 if revoked).
+        3. Loads the manifest from ``cfg.capability_manifest`` and
+           evaluates ``secret:read`` against the JWT's scope (returns
+           403 if the action isn't permitted).
+        4. Checks ``clause.scope.services`` -- if non-empty, the
+           requested ``service`` must appear in the list (returns
+           403 otherwise).
+        5. Looks up ``(service, secret_name)`` in
+           ``cfg.capability_vault_secrets`` (returns 404 if not
+           present).
+        6. Returns ``200 + {value}``.
+
+        Endpoint is disabled (returns 404) when
+        ``cfg.capability_vault_secrets`` is empty.
+        """
+        cfg = self.config
+        if not cfg.capability_vault_secrets:
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "unknown_endpoint"})
+            return
+        if cfg.capability_operator_pubkey is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "operator_pubkey_not_configured",
+                             "detail": "Server-side capability_operator_pubkey "
+                                       "is required for /v0.4/secrets/read."})
+            return
+        if cfg.capability_manifest is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "manifest_not_configured",
+                             "detail": "Server-side capability_manifest is "
+                                       "required for /v0.4/secrets/read."})
+            return
+
+        jws = body.get("capability_jws", "")
+        service = body.get("service", "")
+        secret_name = body.get("secret_name", "")
+        if not jws or not isinstance(jws, str):
+            raise BootloaderError(
+                "capability_jws (string) required in body"
+            )
+        if not service or not isinstance(service, str):
+            raise BootloaderError("service (string) required in body")
+        if not secret_name or not isinstance(secret_name, str):
+            raise BootloaderError("secret_name (string) required in body")
+
+        # 1. Verify the JWS signature + standard time bounds.
+        from recto.capability.jwt import verify_jws as _verify_jws
+        try:
+            claims = _verify_jws(jws, expected_pubkey=cfg.capability_operator_pubkey)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "capability_jws_invalid",
+                "detail": str(exc),
+            })
+            return
+
+        # 2. Revocation check. Wave C part 2 moved the source-of-truth
+        # from the in-memory cfg.capability_revocation_jtis set to the
+        # StateStore's persistent revocation list (revocations.json
+        # under the state dir). Auto-purges expired entries on every
+        # call so revocations don't accumulate past their original JWT
+        # exp.
+        if cfg.state is not None and cfg.state.is_revoked(claims.jti):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "capability_revoked",
+                "jti": claims.jti,
+            })
+            return
+
+        # 3. Scope check: secret:read action permitted.
+        from recto.capability.manifest import evaluate_scope as _evaluate_scope
+        if not _evaluate_scope("secret:read", claims.cap, cfg.capability_manifest):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "scope_denied",
+                "detail": "capability does not include 'secret:read' action",
+                "jti": claims.jti,
+            })
+            return
+
+        # 4. Per-service scope narrowing. When clause.scope.services is
+        # non-empty, the requested service must be in the list.
+        if claims.cap.scope.services and service not in claims.cap.scope.services:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "scope_service_denied",
+                "detail": (
+                    f"capability scope.services {claims.cap.scope.services!r} "
+                    f"does not include requested service {service!r}"
+                ),
+                "jti": claims.jti,
+            })
+            return
+
+        # 5. Look up the secret.
+        value = cfg.capability_vault_secrets.get((service, secret_name))
+        if value is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {
+                "error": "secret_not_found",
+                "service": service,
+                "secret_name": secret_name,
+            })
+            return
+
+        # 6. Return value. Cache-Control no-store -- callers MUST NOT
+        # cache secret values; the capability JWT's lifetime is the
+        # only bound on usage.
+        out: dict[str, Any] = {
+            "value": value,
+            "service": service,
+            "secret_name": secret_name,
+            "jti": claims.jti,
+        }
+        payload = json.dumps(out, sort_keys=True).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ------------------------------------------------------------------
+    # Recto Connections Substrate (2026-06-13)
+    #
+    # Generic, consumer-agnostic vault-backed connection (API key)
+    # management. The consuming app (any application installed alongside
+    # Recto) depends on recto-core and reaches the vault through these HTTP
+    # endpoints because the secret VALUE lives in a dpapi-machine blob
+    # that a Linux Docker container cannot decrypt directly (the blob is
+    # Windows-machine-bound). Metadata (display name, category, has_secret
+    # flag, enabled, config, health_url) lives secret-free in a sidecar
+    # JSON; the secret value is ONLY ever returned by the agent-gated,
+    # service-scoped /secret read path with Cache-Control: no-store.
+    #
+    # Auth tiers:
+    #   - READS  (list metadata, fetch secret value): agent-token-gated
+    #     AND service-scoped via connections_agent_services. A consumer
+    #     reads only its own service's connections (Hard Rule #9 least
+    #     authority -- one consumer can't read another consumer's keys).
+    #   - WRITES (upsert/rotate/enable/delete): operator-token-gated via
+    #     capability_operator_token (v1; sister of /capability/revoke's
+    #     chicken-and-egg gate). v2 layers a phone connections:set
+    #     capability JWS on top.
+    # ------------------------------------------------------------------
+
+    def _connections_agent_service(self) -> str | None:
+        """Authenticate an agent-token READ; return the SERVICE the agent
+        may access, or None after sending the failure response.
+
+        Gate order mirrors every other agent-gated endpoint:
+        connections-disabled -> 404, missing headers -> 401, bad token ->
+        401, agent-not-mapped -> 403.
+        """
+        cfg = self.config
+        if not cfg.connections_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return None
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "agent_auth_required",
+                "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required",
+            })
+            return None
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "agent_auth_invalid"})
+            return None
+        service = cfg.connections_agent_services.get(agent_id)
+        if not service:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "agent_not_mapped",
+                "detail": f"agent '{agent_id}' is not mapped to a connections service",
+            })
+            return None
+        return service
+
+    def _connections_key_allowed(self, service: str, key: str) -> bool:
+        """Gate a secret VALUE read against the calling agent's key
+        allowlist. Returns True when the read may proceed.
+
+        Runs in one of two modes (config.connections_key_acl_enforce):
+          - ENFORCE (the default): sends 403 key_not_allowed and returns
+            False.
+          - AUDIT (an explicit opt-out): logs every would-be denial at
+            WARNING and returns True. Use it to discover the key set in use
+            before the gate can safely bite -- see the config docstring.
+
+        Default-deny: an agent absent from connections_agent_keys matches
+        no pattern, so in ENFORCE mode it reads nothing. The caller has
+        already authenticated the agent and resolved its service, so the
+        agent_id header is trusted here.
+        """
+        cfg = self.config
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        patterns = cfg.connections_agent_keys.get(agent_id) or []
+        logger = logging.getLogger("recto.bootloader.connections")
+        for pattern in patterns:
+            if _connection_key_matches(pattern, key):
+                # GATE 0b (2026-08-17). This line did not exist, and its
+                # absence was structural rather than cosmetic: an ADMITTED
+                # read produced NO EVIDENCE AT ALL, while an unadmitted one
+                # produced the WARNING below. So the audit trail could show
+                # what was MISSING from an allowlist and never what was
+                # UNUSED in one — and an allowlist that cannot show its own
+                # dead entries CAN ONLY EVER GROW. That is fatal to
+                # least-privilege, whose entire job is removal.
+                #
+                # It also made the rollout unverifiable: the plan was "add
+                # the measured key set, observe one window, then enforce" —
+                # but the moment a key is added its reads go SILENT, so the
+                # window reports nothing whether the set was right or wrong,
+                # and the only feedback left is breakage in production.
+                #
+                # INFO, not DEBUG: this has to survive a default logging
+                # configuration or it is not evidence.
+                logger.info(
+                    "connections key ACL: agent %r read secret %r in service %r "
+                    "(admitted by pattern %r)",
+                    agent_id, key, service, pattern,
+                )
+                return True
+        if not cfg.connections_key_acl_enforce:
+            logger.warning(
+                "connections key ACL (AUDIT, not enforcing): agent %r read "
+                "secret %r in service %r, which no allowlist pattern admits "
+                "(patterns=%r). Add it to connections_agent_keys before "
+                "enabling connections_key_acl_enforce.",
+                agent_id, key, service, patterns,
+            )
+            return True
+        logger.warning(
+            "connections key ACL DENIED: agent %r may not read secret %r in "
+            "service %r (patterns=%r).",
+            agent_id, key, service, patterns,
+        )
+        self._send_json(HTTPStatus.FORBIDDEN, {
+            "error": "key_not_allowed",
+            "detail": (
+                f"agent '{agent_id}' is not allowlisted to read key '{key}'"
+            ),
+        })
+        return False
+
+    def _connections_operator_ok(self) -> bool:
+        """Gate an operator WRITE on the pre-shared operator token. Sends
+        the response + returns False on failure; returns True when OK.
+
+        Disabled (404) when connections_path OR capability_operator_token
+        is unset -- an operator who hasn't wired a write token manages
+        connections directly on the Windows host instead.
+        """
+        cfg = self.config
+        if not cfg.connections_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return False
+        if not cfg.capability_operator_token:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return False
+        token = self.headers.get("X-Recto-Operator-Token", "").strip()
+        if not token:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "operator_token_required",
+                "detail": "X-Recto-Operator-Token header required",
+            })
+            return False
+        if not _constant_time_compare(token, cfg.capability_operator_token):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "operator_token_invalid"})
+            return False
+        return True
+
+    def _handle_connections_list(self, url: Any) -> None:
+        """GET /v0.4/connections -- secret-free metadata for the calling
+        agent's service. The runtime discovery path: a consumer lists
+        which connections it has + whether each carries a secret, without
+        ever fetching the value.
+        """
+        service = self._connections_agent_service()
+        if service is None:
+            return
+        from pathlib import Path as _Path
+        from recto.connections.manage import list_connections
+        rows = list_connections(_Path(self.config.connections_path), service=service)
+        self._send_json(HTTPStatus.OK, {
+            "service": service,
+            "connections": [m.to_dict() for m in rows],
+        })
+
+    def _handle_connections_secret(self, url: Any) -> None:
+        """GET /v0.4/connections/secret?key=<key> -- the secret VALUE for
+        the calling agent's service + key. The runtime read path consumers
+        call at call-time so a rotation takes effect with no redeploy.
+        Cache-Control: no-store (callers MUST NOT cache; re-read per call).
+
+        An UNREGISTERED key is 404 (2026-08-13). Before this, any key --
+        including against an empty store -- returned 200 with value:null,
+        so a consumer could not distinguish "registered, value unset
+        (rotation in flight)" from "this key does not exist here": a vault
+        read that lies. `required: False` at the vault fetch guards
+        ABSENCE OF A VALUE, not nonsense; existence is the metadata
+        store's question and is asked there. Registered-but-unset keeps
+        the honest 200 has_value:false.
+        """
+        service = self._connections_agent_service()
+        if service is None:
+            return
+        from urllib.parse import parse_qs
+        raw_key = (parse_qs(url.query).get("key", [""])[0]).strip()
+        if not raw_key:
+            raise BootloaderError("key query parameter required")
+        from recto.connections.manage import get_connection_secret
+        from recto.connections.types import normalize_connection_key
+        secret_kwargs: dict[str, Any] = {}
+        if self.config.connections_secret_source_factory is not None:
+            secret_kwargs["secret_source_factory"] = (
+                self.config.connections_secret_source_factory
+            )
+        try:
+            # Normalize so the echoed key is canonical (matches list output)
+            # AND so a bad key shape surfaces as a clean 400 rather than a
+            # vault lookup miss.
+            key = normalize_connection_key(raw_key)
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        # Per-key allowlist (2026-07-28). Checked AFTER normalization so a
+        # pattern can't be dodged by casing/whitespace, and BEFORE the
+        # vault touch so a denied key is never decrypted at all.
+        if not self._connections_key_allowed(service, key):
+            return
+        # Existence gate (2026-08-13): a key with no metadata row in this
+        # service's namespace is 404, never 200+null. Consulting metadata
+        # for EXISTENCE does not re-cache the VALUE -- the value read
+        # below still hits the vault live, so rotation semantics are
+        # untouched. An empty/missing sidecar therefore 404s every key,
+        # which is the loud failure VAULT #11 was missing.
+        from recto.connections.manage import get_connection_meta
+        from pathlib import Path as _Path
+        if get_connection_meta(
+            _Path(self.config.connections_path), service, key
+        ) is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {
+                "error": "unknown_connection",
+                "detail": (
+                    f"no connection '{key}' registered for service "
+                    f"'{service}'"
+                ),
+            })
+            return
+        try:
+            value = get_connection_secret(service, key, **secret_kwargs)
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {
+            "service": service,
+            "key": key,
+            "has_value": value is not None,
+            "value": value,
+        })
+
+    def _handle_connections_upsert(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/connections -- operator upsert/rotate. Body carries
+        the full connection; a non-empty `secret` writes/rotates the vault
+        value. The operator token is the root, so the body's `service` may
+        target any service. Returns the secret-free metadata.
+        """
+        if not self._connections_operator_ok():
+            return
+        service = (body.get("service") or "").strip()
+        key = (body.get("key") or "").strip()
+        if not service or not key:
+            raise BootloaderError("service and key are required")
+        config = body.get("config")
+        if config is not None and not isinstance(config, dict):
+            raise BootloaderError("config must be an object when present")
+        from pathlib import Path as _Path
+        from recto.connections.manage import set_connection
+        secret_kwargs: dict[str, Any] = {}
+        if self.config.connections_secret_source_factory is not None:
+            secret_kwargs["secret_source_factory"] = (
+                self.config.connections_secret_source_factory
+            )
+        try:
+            meta = set_connection(
+                _Path(self.config.connections_path),
+                service=service,
+                key=key,
+                display_name=body.get("display_name"),
+                category=body.get("category"),
+                secret=body.get("secret"),
+                config=config,
+                enabled=body.get("enabled"),
+                health_url=body.get("health_url"),
+                **secret_kwargs,
+            )
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {"connection": meta.to_dict()})
+
+    def _handle_connections_enable(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/connections/enable -- operator toggle a connection
+        in/out of the active fan-out. Body {service, key, enabled}.
+        """
+        if not self._connections_operator_ok():
+            return
+        service = (body.get("service") or "").strip()
+        key = (body.get("key") or "").strip()
+        enabled = body.get("enabled")
+        if not service or not key or not isinstance(enabled, bool):
+            raise BootloaderError("service, key, and boolean enabled are required")
+        from pathlib import Path as _Path
+        from recto.connections.manage import set_enabled
+        try:
+            meta = set_enabled(_Path(self.config.connections_path), service, key, enabled)
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {"connection": meta.to_dict()})
+
+    def _handle_connections_delete(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/connections/delete -- operator delete (drops the
+        metadata row AND the vault secret value). Body {service, key}.
+        """
+        if not self._connections_operator_ok():
+            return
+        service = (body.get("service") or "").strip()
+        key = (body.get("key") or "").strip()
+        if not service or not key:
+            raise BootloaderError("service and key are required")
+        from pathlib import Path as _Path
+        from recto.connections.manage import delete_connection
+        secret_kwargs: dict[str, Any] = {}
+        if self.config.connections_secret_source_factory is not None:
+            secret_kwargs["secret_source_factory"] = (
+                self.config.connections_secret_source_factory
+            )
+        try:
+            removed = delete_connection(
+                _Path(self.config.connections_path),
+                service=service,
+                key=key,
+                **secret_kwargs,
+            )
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {
+            "deleted": removed is not None,
+            "connection": removed.to_dict() if removed else None,
+        })
+
+    def _handle_connections_act(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/connections/act -- enable, disable, delete or set ONE
+        connection on the operator's phone-signed grant. Body
+        ``{jws, record}``; ``record`` is ``{bootloader_id, service, key,
+        verb, not_after}`` (``recto.connections.act_record``). A set's
+        record adds ``value_sha256`` and its body adds ``value``, stored
+        only when its SHA-256 is the signed one (``value_*`` refusals,
+        ``recto.connections.act_set``); a set may add a row. The value is
+        never logged: the audit line names it by its card fingerprint.
+
+        The grant is the only authority: no operator token is read here.
+        In order, each a named refusal: the JWS verifies against the
+        operator's key, names this bootloader and is inside its window
+        (``grant_signature_invalid``); its jti is not yet spent
+        (``grant_replayed``); then the jti is SPENT, so a grant that fails
+        any later check is dead too; then ``verify_act_grant`` (one
+        connections action, single use, the record's fingerprint and
+        purpose, the service in scope); then the row exists
+        (``connection_not_found``); then the act. Each act and refusal
+        is logged by name (verb, service, key, jti, outcome), never a value.
+
+        Disabled (404) when connections are not configured; 503 when no
+        operator key is configured to verify against.
+        """
+        cfg = self.config
+        if not cfg.connections_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        if cfg.capability_operator_pubkey is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "operator_pubkey_not_configured",
+                "detail": "a connection act verifies against capability_operator_pubkey",
+            })
+            return
+        jws = body.get("jws")
+        record_raw = body.get("record")
+        if not isinstance(jws, str) or not jws.strip():
+            raise BootloaderError("jws is required")
+        if not isinstance(record_raw, dict):
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "record_required",
+                "detail": "body.record {bootloader_id, service, key, verb, not_after} is required",
+            })
+            return
+
+        from pathlib import Path as _Path
+        from recto.capability.jwt import verify_jws as _verify_jws
+        from recto.connections.act_record import ActRecord, ActRefused, verify_act_grant
+        from recto.connections.act_set import apply_set, check_act_value
+        from recto.connections.manage import delete_connection, get_connection_meta, set_enabled
+        logger = logging.getLogger("recto.bootloader.connections")
+
+        def refuse(status: HTTPStatus, error: str, detail: str, record: Any = None, jti: str | None = None) -> None:
+            logger.warning(
+                "connections act REFUSED %s: verb=%r service=%r key=%r jti=%r",
+                error, getattr(record, "verb", None), getattr(record, "service", None),
+                getattr(record, "key", None), jti,
+            )
+            self._send_json(status, {"error": error, "detail": detail})
+
+        try:
+            record = ActRecord.from_dict(record_raw)
+        except ActRefused as e:
+            refuse(HTTPStatus.BAD_REQUEST, e.name, e.detail)
+            return
+        try:
+            claims = _verify_jws(
+                jws,
+                expected_pubkey=cfg.capability_operator_pubkey,
+                expected_aud=cfg.bootloader_id,
+            )
+        except ValueError as e:
+            refuse(HTTPStatus.FORBIDDEN, "grant_signature_invalid", str(e), record)
+            return
+        if reserved_reset_jti(claims.jti):
+            refuse(HTTPStatus.FORBIDDEN, "grant_jti_reserved",
+                   f"a jti beginning {top_plane.REVOKED_RESET_PREFIX!r} is the top plane's; a grant never carries one",
+                   record)
+            return
+        if cfg.state.is_revoked(claims.jti):
+            refuse(HTTPStatus.FORBIDDEN, "grant_replayed", "jti already spent or revoked", record, claims.jti)
+            return
+        now = int(time.time())
+        cfg.state.add_revocation(RevocationEntry(
+            jti=claims.jti,
+            revoked_at_unix=now,
+            original_exp_unix=int(claims.exp),
+            reason=f"spent: connections:{record.verb}",
+        ))
+        try:
+            verify_act_grant(claims, record, bootloader_id=cfg.bootloader_id, admit_set=True)
+            value = check_act_value(record, body.get("value"))
+        except ActRefused as e:
+            refuse(HTTPStatus.FORBIDDEN, e.name, e.detail, record, claims.jti)
+            return
+
+        path = _Path(cfg.connections_path)
+        if record.verb != "set" and get_connection_meta(path, record.service, record.key) is None:
+            refuse(HTTPStatus.NOT_FOUND, "connection_not_found", "no such connection", record, claims.jti)
+            return
+        secret_kwargs: dict[str, Any] = {}
+        if cfg.connections_secret_source_factory is not None:
+            secret_kwargs["secret_source_factory"] = cfg.connections_secret_source_factory
+        try:
+            if record.verb == "delete":
+                removed = delete_connection(path, service=record.service, key=record.key, **secret_kwargs)
+                answer: dict[str, Any] = {
+                    "deleted": removed is not None,
+                    "connection": removed.to_dict() if removed else None,
+                }
+            elif record.verb == "set":
+                answer = {"connection": apply_set(path, record, value, **secret_kwargs).to_dict()}
+            else:
+                meta = set_enabled(path, record.service, record.key, record.verb == "enable")
+                answer = {"connection": meta.to_dict()}
+        except ActRefused as e:
+            refuse(HTTPStatus.FORBIDDEN, e.name, e.detail, record, claims.jti)
+            return
+        except ValueError as exc:
+            refuse(HTTPStatus.BAD_REQUEST, "act_failed", str(exc), record, claims.jti)
+            return
+        logger.info(
+            "connections act DONE: verb=%r service=%r key=%r jti=%r%s",
+            record.verb, record.service, record.key, claims.jti,
+            f" value={record.value_fingerprint()}..." if record.verb == "set" else "",
+        )
+        answer.update({"verb": record.verb, "jti": claims.jti})
+        self._send_json(HTTPStatus.OK, answer)
+
+    # ------------------------------------------------------------------
+    # /v0.4/user-vault/* -- Recto User Vault Substrate (2026-07-25)
+    #
+    # Per-USER secret storage ("bring your own key") -- the user-tier
+    # sister of the connections substrate above. Same storage split
+    # (secret-free metadata sidecar + secret backend for values), same
+    # injectable secret-source seam, but a different auth posture:
+    #
+    #   ALL FOUR verbs (set / list / release / delete) are agent-token-
+    #   gated AND platform-scoped via user_vault_agent_platforms, and
+    #   every operation is further scoped by the X-Recto-Subject claim
+    #   the calling platform supplies. There is no operator tier here:
+    #   user-vault writes are the platform acting for its OWN user at
+    #   runtime (the user pasted a key into the platform's UI), so the
+    #   platform's agent token is the trust anchor and the subject
+    #   claim bounds each request to one user's namespace. One platform
+    #   can never touch another platform's users (agent map), and a
+    #   request can never span users (single claimed handle per call).
+    #
+    # Release-on-approval seam (Hard Rule #9): the release response
+    # carries a `status` field -- "released" | "unset" today. The
+    # phone-vault backend later adds "pending" / "denied" WITHOUT a
+    # contract change; consumers must treat any non-"released" status
+    # as value-absent and tolerate latency + denial.
+    # ------------------------------------------------------------------
+
+    def _user_vault_agent_platform(self) -> str | None:
+        """Authenticate the agent token; return the PLATFORM the agent
+        may operate on, or None after sending the failure response.
+
+        Gate order mirrors _connections_agent_service: substrate
+        disabled -> 404, missing headers -> 401, bad token -> 401,
+        agent-not-mapped -> 403.
+        """
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return None
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        agent_token = self.headers.get("X-Recto-Agent-Token", "").strip()
+        if not agent_id or not agent_token:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "agent_auth_required",
+                "detail": "X-Recto-Agent-Id and X-Recto-Agent-Token headers required",
+            })
+            return None
+        expected = cfg.capability_agent_tokens.get(agent_id)
+        if expected is None or not _constant_time_compare(expected, agent_token):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "agent_auth_invalid"})
+            return None
+        platform = cfg.user_vault_agent_platforms.get(agent_id)
+        if not platform:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "agent_not_mapped",
+                "detail": f"agent '{agent_id}' is not mapped to a user-vault platform",
+            })
+            return None
+        return platform
+
+    def _user_vault_subject(self) -> str | None:
+        """Read + validate the X-Recto-Subject scoping claim: the platform's
+        OPAQUE subject handle for one user (recto.subject_handle - 43
+        base64url characters; never the platform's user id, hard rule 15.o).
+        Returns the handle, or None after sending the failure response. The
+        header travels on every user-vault call -- a claim the AUTHENTICATED
+        platform supplies, scoping the request to exactly one user's
+        namespace. A value in any other shape is refused (hard rule 15.m)."""
+        raw = self.headers.get("X-Recto-Subject", "").strip()
+        if not raw:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "subject_required",
+                "detail": "X-Recto-Subject header required",
+            })
+            return None
+        from recto.subject_handle import normalize_subject
+        try:
+            return normalize_subject(raw)
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "subject_invalid",
+                "detail": "X-Recto-Subject must be an opaque handle of 43 base64url characters",
+            })
+            return None
+
+    def _user_vault_secret_kwargs(self) -> dict[str, Any]:
+        if self.config.user_vault_secret_source_factory is not None:
+            return {
+                "secret_source_factory": (
+                    self.config.user_vault_secret_source_factory
+                )
+            }
+        return {}
+
+    def _handle_user_vault_list(self, url: Any) -> None:
+        """GET /v0.4/user-vault -- secret-free metadata for the claimed
+        user within the calling platform. NEVER values; `has_secret` is
+        the only signal a value exists."""
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        from pathlib import Path as _Path
+        from recto.user_vault.manage import list_user_entries
+        rows = list_user_entries(
+            _Path(self.config.user_vault_path), platform, subject
+        )
+        self._send_json(HTTPStatus.OK, {
+            "platform": platform,
+            "subject": subject,
+            "entries": [m.to_dict() for m in rows],
+        })
+
+    def _handle_user_vault_release(self, url: Any) -> None:
+        """GET /v0.4/user-vault/release?key=<key> -- the secret VALUE for
+        the claimed user's entry, released to the platform's own call
+        path at call time (rotation takes effect with no redeploy).
+        Cache-Control: no-store (callers MUST NOT cache; re-read per call).
+
+        Response contract (pre-cut for phone release-on-approval):
+        status "released" carries the value; "unset" carries null; the
+        future phone-vault backend adds "pending"/"denied" with null.
+        """
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        from urllib.parse import parse_qs
+        raw_key = (parse_qs(url.query).get("key", [""])[0]).strip()
+        if not raw_key:
+            raise BootloaderError("key query parameter required")
+        from recto.user_vault.manage import release_user_secret
+        from recto.user_vault.types import normalize_user_vault_key
+        try:
+            key = normalize_user_vault_key(raw_key)
+            value = release_user_secret(
+                platform, subject, key, **self._user_vault_secret_kwargs()
+            )
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {
+            "platform": platform,
+            "subject": subject,
+            "key": key,
+            "status": "released" if value is not None else "unset",
+            "has_value": value is not None,
+            "value": value,
+        })
+
+    def _handle_user_vault_set(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/set -- create/rotate the claimed user's
+        entry. Body {key, display_name?, category?, secret?}. A non-empty
+        `secret` writes/rotates the value; None/empty updates metadata
+        only, preserving the value. Returns the secret-free metadata."""
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        key = (body.get("key") or "").strip()
+        if not key:
+            raise BootloaderError("key is required")
+        secret = body.get("secret")
+        if secret is not None and not isinstance(secret, str):
+            raise BootloaderError("secret must be a string when present")
+        from pathlib import Path as _Path
+        from recto.user_vault.manage import set_user_entry
+        try:
+            meta = set_user_entry(
+                _Path(self.config.user_vault_path),
+                platform=platform,
+                subject=subject,
+                key=key,
+                display_name=body.get("display_name"),
+                category=body.get("category"),
+                secret=secret,
+                **self._user_vault_secret_kwargs(),
+            )
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {"entry": meta.to_dict()})
+
+    def _handle_user_vault_delete(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/delete -- remove the claimed user's
+        entry (metadata AND value). Idempotent. Body {key}."""
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        key = (body.get("key") or "").strip()
+        if not key:
+            raise BootloaderError("key is required")
+        from pathlib import Path as _Path
+        from recto.user_vault.manage import delete_user_entry
+        try:
+            removed = delete_user_entry(
+                _Path(self.config.user_vault_path),
+                platform=platform,
+                subject=subject,
+                key=key,
+                **self._user_vault_secret_kwargs(),
+            )
+        except ValueError as exc:
+            raise BootloaderError(str(exc)) from exc
+        self._send_json(HTTPStatus.OK, {
+            "deleted": removed is not None,
+            "entry": removed.to_dict() if removed else None,
+        })
+
+    # ------------------------------------------------------------------
+    # /v0.4/user-vault/grant + /revoke -- THE GRANT (R-series step 2, 2026-10-17)
+    #
+    # The user's BOUND phone (hard rule 15.n) signs a standing grant: one agent (an opaque agent handle) may use one
+    # of the user's keys until a date. The PHONE submits it here - no agent token: the signature by the phone the
+    # (consumer, subject) is bound to is the whole authority, so the platform can neither forge a grant nor hold one
+    # back. A revoke is the same phone's signature naming the grant; it joins the revocation list at once.
+    # Admission is not release (hard rule 15.w): until step 4's switch, release does not read grants at all.
+    # ------------------------------------------------------------------
+
+    _UV_GRANT_JTI_PREFIX = "uvgrant:"
+
+    def _bound_phone_for(self, consumer: str, subject: str) -> Any:
+        """The phone (consumer, subject) is bound to, or None."""
+        return next((p for p in self.config.state.list_phones() if (consumer, subject) in p.member_bindings), None)
+
+    def _bound_verifier(self, phone: Any) -> Any:
+        algorithm = _registered_algorithm(phone, "user-vault-grant")
+        return lambda message, sig: verify_signature(
+            payload=message, signature_b64u=sig, public_key_b64u=phone.public_key_b64u, algorithm=algorithm)
+
+    def _handle_user_vault_grant(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant - body {record: GrantRecord, signature_b64u}. 200 {status: admitted,
+        grant_id, not_after}; refusals by name: 404 when the user vault is off, 400 grant_record_* /
+        grant_agent_handle_invalid, 403 grant_subject_unbound / grant_bootloader_mismatch / grant_expired /
+        grant_too_long / grant_signature_invalid / grant_revoked."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRecord, GrantRefused, verify_grant
+        try:
+            record = GrantRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a grant comes only from the subject's bound phone",
+            })
+            return
+        try:
+            grant_id = verify_grant(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                                    now=int(time.time()), verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        # A revoked grant never grants again (hard rule 15.u): the same signed record re-sent is refused.
+        if cfg.state.is_revoked(self._UV_GRANT_JTI_PREFIX + grant_id):
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_revoked", "detail": "this grant was revoked; the phone signs a new one"})
+            return
+        # A REPLACED grant is revoked in the same step (hard rule 15.u): the verb takes no token, so a superseded grant
+        # left merely dropped could be re-sent by anyone holding a copy and displace the newer one (an agent narrowed
+        # from 90 days to 7, the old 90 replayed back in). Superseded is as dead as revoked.
+        for old in cfg.state.list_user_vault_grants(record.consumer, record.subject):
+            r = old["record"]
+            if (r["agent_handle"], r["key"]) == (record.agent_handle, record.key) and old["grant_id"] != grant_id:
+                cfg.state.add_revocation(RevocationEntry(
+                    jti=self._UV_GRANT_JTI_PREFIX + old["grant_id"],
+                    revoked_at_unix=int(time.time()),
+                    original_exp_unix=int(r["not_after"]),
+                    reason="revoked: user-vault grant replaced by a newer one for the same slot",
+                ))
+        cfg.state.put_user_vault_grant({
+            "grant_id": grant_id,
+            "record": record.to_dict(),
+            "signature_b64u": body["signature_b64u"],
+            "signer_phone_ref": phone.phone_id,
+            "admitted_at_unix": int(time.time()),
+        })
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_grant(record.consumer, record.subject, record.agent_handle,
+                                                        record.key, grant_id, record.not_after)
+        self._send_json(HTTPStatus.OK, {"status": "admitted", "grant_id": grant_id, "not_after": record.not_after})
+
+    def _handle_user_vault_revoke(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/revoke - body {record: RevokeRecord, signature_b64u}. 200 {revoked: true, grant_id};
+        refusals by name: 404 when the user vault is off or the grant is unknown to this subject, 400 grant_record_*,
+        403 grant_subject_unbound / grant_bootloader_mismatch / grant_signature_invalid."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, RevokeRecord, verify_revoke
+        try:
+            record = RevokeRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a revoke comes only from the subject's bound phone",
+            })
+            return
+        try:
+            grant_id = verify_revoke(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                                     verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        grant = cfg.state.get_user_vault_grant(grant_id)
+        if grant is None or (grant["record"]["consumer"], grant["record"]["subject"]) != (record.consumer,
+                                                                                            record.subject):
+            self._send_json(HTTPStatus.NOT_FOUND, {
+                "error": "grant_unknown", "detail": "no grant of this subject carries that id"})
+            return
+        cfg.state.add_revocation(RevocationEntry(
+            jti=self._UV_GRANT_JTI_PREFIX + grant_id,
+            revoked_at_unix=int(time.time()),
+            original_exp_unix=int(grant["record"]["not_after"]),
+            reason="revoked: user-vault grant, by the bound phone",
+        ))
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_revoke({grant_id})
+        self._send_json(HTTPStatus.OK, {"revoked": True, "grant_id": grant_id})
+
+    # ------------------------------------------------------------------
+    # A REVOKE NEVER NEEDS THE PLATFORM (hard rule 15.aa, R-series step 3)
+    #
+    # The phone keeps no grants (hard rule 15.y), so it reads its subjects' live grants from here by its own
+    # signature, and revokes one - or every grant of one key ("stop all") - straight to this bootloader. A platform that
+    # never raises a revoke card cannot keep an agent's use alive.
+    # ------------------------------------------------------------------
+
+    _UV_REVOKE_KEY_JTI_PREFIX = "uvrevokekey:"
+
+    def _live_grants(self, consumer: str, subject: str) -> list[dict[str, Any]]:
+        now = int(time.time())
+        return [g for g in self.config.state.list_user_vault_grants(consumer, subject)
+                if int(g["record"]["not_after"]) > now
+                and not self.config.state.is_revoked(self._UV_GRANT_JTI_PREFIX + g["grant_id"])]
+
+    def _handle_user_vault_grants_list(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grants - body {request: GrantsListRequest, signature_b64u}. 200 {grants: [...]}, every
+        live grant of every (consumer, subject) bound to the asking phone: handles, key, scope, dates - nothing the
+        platform said in words (Recto never holds a display name)."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, GrantsListRequest, verify_grants_list
+        try:
+            req = GrantsListRequest.from_dict(body.get("request"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = cfg.state.get_phone(req.phone_id)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "grant_signature_invalid",
+                                                   "detail": "the asking phone is not registered"})
+            return
+        try:
+            verify_grants_list(req, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id,
+                               now=int(time.time()), verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        grants = []
+        for consumer, subject in phone.member_bindings:
+            for g in self._live_grants(consumer, subject):
+                r = g["record"]
+                grants.append({
+                    "grant_id": g["grant_id"], "consumer": consumer, "subject": subject,
+                    "agent_handle": r["agent_handle"], "key": r["key"], "scope": r["scope"],
+                    "not_after": r["not_after"], "admitted_at_unix": g.get("admitted_at_unix"),
+                })
+        grants.sort(key=lambda g: (g["consumer"], g["key"], g["agent_handle"]))
+        self._send_json(HTTPStatus.OK, {"grants": grants, "bootloader_id": cfg.bootloader_id})
+
+    def _handle_user_vault_revoke_key(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/revoke-key - body {record: RevokeKeyRecord, signature_b64u}. 200 {revoked: [ids]}:
+        every grant of (consumer, subject, key) live when it arrives goes on the revocation list. The act is marked used
+        until its not_after, so the same signature re-sent ends nothing granted since (403 grant_act_used)."""
+        cfg = self.config
+        if not cfg.user_vault_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        from recto.user_vault.grant_record import GrantRefused, RevokeKeyRecord, verify_revoke_key
+        try:
+            record = RevokeKeyRecord.from_dict(body.get("record"))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": e.name, "detail": e.detail})
+            return
+        phone = self._bound_phone_for(record.consumer, record.subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a stop-all comes only from the subject's bound phone",
+            })
+            return
+        now = int(time.time())
+        try:
+            act_id = verify_revoke_key(record, body.get("signature_b64u"), bootloader_id=cfg.bootloader_id, now=now,
+                                       verify=self._bound_verifier(phone))
+        except GrantRefused as e:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": e.name, "detail": e.detail})
+            return
+        if cfg.state.is_revoked(self._UV_REVOKE_KEY_JTI_PREFIX + act_id):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "grant_act_used",
+                                                   "detail": "this stop-all was already carried out"})
+            return
+        cfg.state.add_revocation(RevocationEntry(
+            jti=self._UV_REVOKE_KEY_JTI_PREFIX + act_id, revoked_at_unix=now,
+            original_exp_unix=record.not_after, reason="used: user-vault stop-all for one key",
+        ))
+        revoked = []
+        for g in self._live_grants(record.consumer, record.subject):
+            if g["record"]["key"] != record.key:
+                continue
+            cfg.state.add_revocation(RevocationEntry(
+                jti=self._UV_GRANT_JTI_PREFIX + g["grant_id"], revoked_at_unix=now,
+                original_exp_unix=int(g["record"]["not_after"]),
+                reason="revoked: user-vault grant, stop-all for its key by the bound phone",
+            ))
+            revoked.append(g["grant_id"])
+        if cfg.user_vault_grant_requests is not None:
+            cfg.user_vault_grant_requests.resolve_revoke(set(revoked))
+        self._send_json(HTTPStatus.OK, {"revoked": revoked})
+
+    # ------------------------------------------------------------------
+    # /v0.4/user-vault/grant-request -- THE PLATFORM RINGS THE PHONE (hard rule 15.z, R-series step 3)
+    #
+    # The one card a user-vault agent may raise - auth-only agents still raise no capability card (15.p). It rings
+    # only the subject's bound phone; its words (purpose, agent name) live in memory and nowhere else.
+    # ------------------------------------------------------------------
+
+    def _grant_request_to_wire(self, r: Any) -> dict[str, Any]:
+        uv: dict[str, Any] = {
+            "action": r.action, "bootloader_id": self.config.bootloader_id, "consumer": r.consumer,
+            "subject": r.subject, "agent_handle": r.agent_handle, "key": r.key, "scope": r.scope,
+            "not_after": r.not_after, "expires_at_unix": r.expires_at,
+        }
+        if r.grant_id is not None:
+            uv["grant_id"] = r.grant_id
+        if r.admitted_at is not None:
+            uv["admitted_at_unix"] = r.admitted_at
+        if r.purpose is not None:
+            uv["purpose"] = r.purpose
+        if r.agent_name is not None:
+            uv["agent_name"] = r.agent_name
+        context: dict[str, Any] = {
+            "child_pid": 0, "child_argv0": "", "requested_at_unix": r.requested_at,
+            "operation_description": f"user-vault {r.action}", "user_vault_grant": uv,
+        }
+        ac = self.config.principal_apps.get(r.agent_id)
+        if ac is not None:
+            ac_obj: dict[str, Any] = {"app_id": ac.app_id, "app_name": ac.app_name,
+                                      "app_description": ac.app_description}
+            for name in ("app_url", "app_icon_url", "app_version"):
+                if getattr(ac, name) is not None:
+                    ac_obj[name] = getattr(ac, name)
+            context["app_context"] = ac_obj
+        kind = "user_vault_grant" if r.action == "grant" else "user_vault_revoke"
+        return {"request_id": r.request_id, "kind": kind, "service": r.consumer, "secret": r.key,
+                "context": context}
+
+    def _handle_user_vault_grant_request(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant-request (agent headers + X-Recto-Subject) - body {action: grant|revoke,
+        agent_handle, key, scope, not_after, purpose?, agent_name?} or {action: revoke, grant_id, purpose?,
+        agent_name?}. 200 {request_id, expires_at_unix}. Refusals by name: 403 grant_request_consumer_unmapped /
+        grant_subject_unbound, 400 grant_request_invalid / grant_record_*, 404 grant_unknown, 409 grant_request_open,
+        429 grant_request_rate_limited."""
+        cfg = self.config
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        from recto.user_vault import grant_request as gr
+        from recto.user_vault.grant_record import GRANT_MAX_SECONDS, GrantRecord, GrantRefused
+        consumer = cfg.user_vault_platform_consumers.get(platform)
+        if not consumer:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_request_consumer_unmapped",
+                "detail": "this platform has no consumer mapped; the bootloader never guesses the binding",
+            })
+            return
+        phone = self._bound_phone_for(consumer, subject)
+        if phone is None:
+            self._send_json(HTTPStatus.FORBIDDEN, {
+                "error": "grant_subject_unbound",
+                "detail": "no phone is bound to this subject; a grant request rings only the subject's bound phone",
+            })
+            return
+        action = body.get("action", gr.ACTION_GRANT)
+        now = int(time.time())
+        try:
+            purpose = gr.clean_text(body.get("purpose"), "purpose", gr.PURPOSE_MAX)
+            agent_name = gr.clean_text(body.get("agent_name"), "agent_name", gr.AGENT_NAME_MAX)
+            if action == gr.ACTION_GRANT:
+                # The proposal is shaped as the grant it asks for (the phone adds the nonce, may shorten the date).
+                proposal = GrantRecord.from_dict({
+                    "bootloader_id": cfg.bootloader_id, "consumer": consumer, "subject": subject,
+                    "agent_handle": body.get("agent_handle"), "key": body.get("key"), "scope": body.get("scope"),
+                    "not_after": body.get("not_after"), "nonce": "proposal-" + uuid.uuid4().hex[:16],
+                })
+                if proposal.not_after <= now or proposal.not_after > now + GRANT_MAX_SECONDS:
+                    raise GrantRefused(gr.REQUEST_INVALID,
+                                       f"not_after must be ahead and within {GRANT_MAX_SECONDS // 86400} days")
+                fields = dict(agent_handle=proposal.agent_handle, key=proposal.key, scope=proposal.scope,
+                              not_after=proposal.not_after)
+            elif action == gr.ACTION_REVOKE:
+                grant_id = body.get("grant_id")
+                held = next((g for g in self._live_grants(consumer, subject) if g["grant_id"] == grant_id), None)
+                if held is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {
+                        "error": "grant_unknown", "detail": "no live grant of this subject carries that id"})
+                    return
+                r = held["record"]
+                fields = dict(agent_handle=r["agent_handle"], key=r["key"], scope=r["scope"],
+                              not_after=int(r["not_after"]), grant_id=grant_id,
+                              admitted_at=held.get("admitted_at_unix"))
+            else:
+                raise GrantRefused(gr.REQUEST_INVALID, "action must be grant or revoke")
+            req = cfg.user_vault_grant_requests.raise_request(
+                action=action, phone_id=phone.phone_id, agent_id=self.headers.get("X-Recto-Agent-Id", "").strip(),
+                consumer=consumer, subject=subject, purpose=purpose, agent_name=agent_name, **fields)
+        except GrantRefused as e:
+            status = {gr.REQUEST_OPEN: HTTPStatus.CONFLICT,
+                      gr.RATE_LIMITED: HTTPStatus.TOO_MANY_REQUESTS}.get(e.name, HTTPStatus.BAD_REQUEST)
+            self._send_json(status, {"error": e.name, "detail": e.detail})
+            return
+        self._send_json(HTTPStatus.OK, {"request_id": req.request_id, "expires_at_unix": req.expires_at})
+
+    def _handle_user_vault_grant_request_status(self, url: Any) -> None:
+        """GET /v0.4/user-vault/grant-request?request_id= (agent headers + X-Recto-Subject) - the platform reads the
+        outcome of its own request: open | admitted (grant_id, not_after) | denied | revoked | expired. Another
+        platform's or another subject's request answers 404 as if unknown."""
+        cfg = self.config
+        platform = self._user_vault_agent_platform()
+        if platform is None:
+            return
+        subject = self._user_vault_subject()
+        if subject is None:
+            return
+        rid = (parse_qs(url.query).get("request_id") or [""])[0]
+        r = cfg.user_vault_grant_requests.get(rid) if rid else None
+        if r is None or r.subject != subject or r.consumer != cfg.user_vault_platform_consumers.get(platform):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "grant_request_unknown"})
+            return
+        out: dict[str, Any] = {"request_id": r.request_id, "action": r.action, "status": r.status}
+        if r.status == "admitted":
+            # The phone may have shortened the date, which changes the grant id: key on agent and key, never the id.
+            out.update(grant_id=r.resolved_grant_id, not_after=r.resolved_not_after)
+        self._send_json(HTTPStatus.OK, out)
+
+    def _handle_user_vault_grant_request_deny(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/user-vault/grant-request/deny - body {request_id}. The phone's Deny (or the platform withdrawing
+        its own request): the request leaves the phone and its words are dropped. The id is the 128-bit name only the
+        phone's signed poll and the raising platform hold; a deny grants nothing, so it needs no signature."""
+        cfg = self.config
+        if not cfg.user_vault_path or cfg.user_vault_grant_requests is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+            return
+        rid = body.get("request_id")
+        ok = isinstance(rid, str) and cfg.user_vault_grant_requests.deny(rid)
+        self._send_json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND,
+                        {"denied": True} if ok else {"error": "grant_request_unknown"})
+
+    # ------------------------------------------------------------------
+    # THE TOP PLANE (hard rule 14.7) - recto.bootloader.top_plane carries the rules; these are the verbs.
+    # ------------------------------------------------------------------
+
+    def _top_plane_call(self, fn: Any) -> None:
+        try:
+            fn()
+        except top_plane.TopPlaneRefused as e:
+            self._send_json(HTTPStatus(e.status), {"error": e.name, "detail": e.detail})
+
+    def _sealed_chain_or_none(self) -> Any:
+        """The chain when the top plane is SEALED (passphrase + a device + the sealed id), else None - the rule binds
+        from the seal; before it rule 14.4's slot approval stands and the startup log says the plane is unsealed."""
+        try:
+            cs = top_plane.chain_state(self.config.state, self.config.expect_sealed_id)
+        except top_plane.TopPlaneRefused:
+            raise
+        if cs is None or cs.sealed_id is None or "passphrase" not in cs.members:
+            return None
+        return cs
+
+    def _handle_genesis_chain(self) -> None:
+        """GET /v0.4/genesis/chain - the public chain, so the HOST computes every act's digest itself."""
+        cfg = self.config
+        cs = top_plane.chain_state(cfg.state, cfg.expect_sealed_id)
+        records = cfg.state.read_genesis_chain() if cfg.state.supports_genesis_chain() else []
+        self._send_json(HTTPStatus.OK, {
+            "records": records,
+            "bootloader_id": cfg.bootloader_id,
+            "operator_pubkey_hex": cfg.capability_operator_pubkey.hex() if cfg.capability_operator_pubkey else None,
+            "identity_members_hex": [top_plane.unb64u(k).hex() for k in
+                                     (cfg.bootloader_identity_inputs or {}).get("member_pubkeys_b64u", [])],
+            "supports_genesis_chain": bool(cfg.state.supports_genesis_chain()),
+            "sealed_id": cs.sealed_id if cs else None,
+            "length": cs.length if cs else 0,
+            "tip": cs.tip_hash if cs else None,
+            "members": {k: {"pubkey_hex": m.pubkey.hex(), "algorithm": m.algorithm}
+                        for k, m in (cs.members.items() if cs else [])},
+        })
+
+    def _top_plane_record_for_card(self, request_id: str) -> dict[str, Any] | None:
+        cfg = self.config
+        if cfg.state is None:
+            return None
+        now = int(time.time())
+        return next((r for r in cfg.state.list_top_plane_records()
+                     if request_id in (r.get("cards") or {}) and r.get("state") in ("pending", "waiting")
+                     and (r.get("type") != "act" or int(r.get("expires_at_unix", 0)) > now)), None)
+
+    def _card_devices(self, record_id: str, text: str, message: bytes, phones: list[Any],
+                      ttl_seconds: int = top_plane.ACT_CARD_TTL_SECONDS) -> dict[str, str]:
+        """One card per phone. An ACT's cards live five minutes; a RESET's cancel cards live until its not_before -
+        the cancel window is the whole window, never the five minutes of an act card."""
+        cfg = self.config
+        cards: dict[str, str] = {}
+        for phone in phones:
+            card = PendingRequest.new(
+                kind="single_sign", service="recto", secret=f"top-plane:{record_id}", phone_id=phone.phone_id,
+                operation_description=text, payload_hash_b64u=top_plane.b64u(message), child_pid=0,
+                child_argv0="(bootloader)", ttl_seconds=int(ttl_seconds),
+            )
+            cfg.state.add_pending(card)
+            self._notify_push(card)
+            cards[card.request_id] = phone.phone_id
+        return cards
+
+    def _handle_top_plane_open(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/top-plane/open {draft, passphrase_signature_b64u} - the host opens an act it drafted on the
+        chain's tip and signed with the passphrase; every sealed device member is carded with the same 32 bytes."""
+        cfg = self.config
+        draft = top_plane.Draft.from_wire(body.get("draft"))
+        if draft.op not in ("seal-id", "rotate-operator", "add", "remove"):
+            raise top_plane.TopPlaneRefused("top_plane_op_refused", f"{draft.op!r} is not opened here", 400)
+        if draft.op == "add" and draft.kind not in top_plane.DEVICE_KINDS and draft.kind != "passphrase":
+            raise top_plane.TopPlaneRefused("top_plane_kind_refused",
+                                            "only an owner device or the passphrase is seated by a top-plane act", 400)
+        if draft.op == "remove" and draft.kind not in top_plane.DEVICE_KINDS:
+            raise top_plane.TopPlaneRefused("top_plane_kind_refused", "only an owner device is removed", 400)
+        cs = top_plane.require_sealed(cfg.state, for_seal=draft.op == "seal-id", expect_sealed_id=cfg.expect_sealed_id)
+        if draft.op == "remove":
+            # A removal names the member it removes by that member's own key and algorithm, so the chain and the
+            # registry drop the same device.
+            member = cs.members.get(draft.kind)
+            if member is None or bytes(member.pubkey) != draft.value or member.algorithm != draft.algorithm:
+                raise top_plane.TopPlaneRefused("top_plane_remove_mismatch",
+                                                f"the removal does not name the sealed {draft.kind}'s own key", 400)
+        if draft.op == "seal-id" and draft.value.decode("ascii", "replace") != cfg.bootloader_id:
+            raise top_plane.TopPlaneRefused(
+                "top_plane_seal_mismatch", f"the id to seal is not the id this bootloader serves ({cfg.bootloader_id})")
+        if draft.op == "seal-id" and (not cfg.derived_bootloader_id or cfg.bootloader_id != cfg.derived_bootloader_id):
+            # The sealed id is the id THIS start derived (operator key + identity members), never a configured label
+            # or a random uuid a bootloader with no sealed operator key falls back to.
+            raise top_plane.TopPlaneRefused(
+                "top_plane_seal_not_derived",
+                f"this bootloader serves {cfg.bootloader_id!r}, not the {BOOTLOADER_ID_PREFIX}id derived from its "
+                "operator key; seal the operator key first")
+        if draft.op == "seal-id":
+            try:
+                recorded = json.loads(draft.meta or "")["operator_pubkey"]
+            except (ValueError, KeyError, TypeError):
+                recorded = None
+            if not cfg.capability_operator_pubkey or recorded != cfg.capability_operator_pubkey.hex():
+                raise top_plane.TopPlaneRefused("top_plane_seal_operator_mismatch",
+                                                "the seal records an operator key that is not the one this bootloader "
+                                                "holds", 400)
+            # The seal also records the identity members its id was derived from, so the id stays a claim a phone
+            # recomputes after any roster move: they must recompute it here.
+            try:
+                members = [bytes.fromhex(h) for h in json.loads(draft.meta or "")["identity_members"]]
+            except (ValueError, KeyError, TypeError):
+                members = None
+            if members is None or derive_bootloader_id(cfg.capability_operator_pubkey, members) != cfg.bootloader_id:
+                raise top_plane.TopPlaneRefused("top_plane_seal_inputs_mismatch",
+                                                "the seal's recorded operator key and identity members do not "
+                                                "recompute the id it seals", 400)
+        if draft.op == "add" and draft.kind in top_plane.DEVICE_KINDS:
+            # A device member is a REGISTERED OWNER PHONE in that kind's slot, under the algorithm it signs with.
+            slot = next(s for s, k in top_plane.SLOT_KIND.items() if k == draft.kind)
+            owner = next((p for p in cfg.state.list_phones() if p.public_key_b64u == top_plane.b64u(draft.value)), None)
+            if owner is None or owner.slot != slot or _registered_algorithm(owner, owner.phone_id) != draft.algorithm:
+                raise top_plane.TopPlaneRefused("top_plane_device_unregistered",
+                                                f"the key is not a registered owner phone in the {slot} slot signing "
+                                                f"with {draft.algorithm}", 400)
+        try:
+            # Every opened act carries {nonce, not_after} INSIDE its digest: a stored (draft, signature) never
+            # re-opens an abandoned act once its window passed, and a digest opens once.
+            fresh = top_plane.act_freshness(draft)
+        except ValueError as exc:
+            raise top_plane.TopPlaneRefused("top_plane_draft_stale", str(exc), 400) from None
+        message = top_plane.draft_message(cs, draft)
+        if not top_plane.verify_passphrase(cs, message, body.get("passphrase_signature_b64u")):
+            raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                            "the passphrase's signature is not over this act's digest")
+        del fresh
+        phones = top_plane.device_member_phones(cfg.state, cs)
+        if draft.op == "remove":
+            # The device leg of a removal is ANOTHER sealed device - the revoking phone - never the phone removed.
+            phones = [p for p in phones if top_plane.b64u(draft.value) != p.public_key_b64u]
+        if not phones:
+            raise top_plane.TopPlaneRefused("top_plane_no_device_phone",
+                                            "no registered phone is a sealed device member - none can sign the act")
+        # A digest opens once: the check and the record are one act under the registry lock, so two posts of one
+        # (draft, signature) never both card the devices.
+        with cfg.state.registry_lock():
+            if any(r.get("type") == "act" and r.get("message_b64u") == top_plane.b64u(message)
+                   for r in cfg.state.list_top_plane_records()):
+                raise top_plane.TopPlaneRefused("top_plane_draft_used", "this act was already opened once", 409)
+            record_id = "act-" + secrets.token_hex(8)
+            cards = self._card_devices(record_id, top_plane.describe(draft), message, phones)
+            now = int(time.time())
+            cfg.state.put_top_plane_record({
+                "id": record_id, "type": "act", "state": "pending", "draft": draft.as_wire(),
+                "message_b64u": top_plane.b64u(message), "passphrase_sig": body["passphrase_signature_b64u"],
+                "cards": cards, "created_unix": now, "expires_at_unix": now + top_plane.ACT_CARD_TTL_SECONDS,
+            })
+        logging.getLogger("recto.bootloader.top_plane").info(
+            "top plane: act %s opened (%s %s, seq %s); %d device card(s)", record_id, draft.op, draft.kind,
+            draft.seq, len(cards))
+        self._send_json(HTTPStatus.OK, {"act_id": record_id, "cards": len(cards),
+                                        "expires_at_unix": now + top_plane.ACT_CARD_TTL_SECONDS})
+
+    def _handle_top_plane_act_status(self, url: Any) -> None:
+        rid = (parse_qs(url.query).get("id") or [""])[0]
+        rec = self.config.state.get_top_plane_record(rid) if rid else None
+        if rec is None or rec.get("type") != "act":
+            raise top_plane.TopPlaneRefused("top_plane_act_unknown", "no such act", 404)
+        self._send_json(HTTPStatus.OK, {"act_id": rid, "state": rec["state"], "draft": rec["draft"],
+                                        "detail": rec.get("detail")})
+
+    def _respond_top_plane_card(self, request_id: str, body: dict[str, Any]) -> None:
+        """A device's answer on a top-plane card. An ACT's card: approve = the device leg; the entry appends now. A
+        RESET's card: approve = CANCEL. Only a verified approve counts; a deny leaves the card to expire."""
+        cfg = self.config
+        if body.get("decision", "") != "approved":
+            self._send_json(HTTPStatus.CONFLICT, {"error": "top_plane_not_denied_unsigned",
+                                                  "detail": "leave the card; it expires on its own"})
+            return
+        with cfg.state.registry_lock():
+            rec = self._top_plane_record_for_card(request_id)
+            if rec is None:
+                raise PendingRequestNotFoundError(f"request_id {request_id!r} not found")
+            phone = cfg.state.get_phone(rec["cards"][request_id])
+            if phone is None:
+                raise UnknownPhoneError("the carded phone is not registered")
+            message = top_plane.unb64u(rec["message_b64u"])
+            sig = body.get("signature_b64u", "")
+            if not verify_signature(payload=message, signature_b64u=sig, public_key_b64u=phone.public_key_b64u,
+                                    algorithm=_registered_algorithm(phone, phone.phone_id)):
+                raise BootloaderError("approved-response signature invalid")
+            if rec["type"] == "reset" and phone.slot not in SLOTS:
+                raise UnknownPhoneError("only an owner phone cancels a reset")
+            # Whether an act is already on the chain is read BEFORE anything changes: an unreadable chain refuses by
+            # name here, the cards and the record as they were.
+            committed = rec["type"] == "act" and act_entry_on_chain(cfg.state, top_plane.Draft.from_wire(rec["draft"]))
+            for card_id in rec["cards"]:
+                cfg.state.take_pending(card_id)
+            rec = dict(rec)
+            log = logging.getLogger("recto.bootloader.top_plane")
+            if rec["type"] == "reset":
+                rec["state"] = "cancelled"
+                rec["cancelled_by"] = phone.phone_id
+                cfg.state.add_revocation(RevocationEntry(
+                    jti=top_plane.REVOKED_RESET_PREFIX + rec["intent"]["intent_id"],
+                    revoked_at_unix=int(time.time()),
+                    original_exp_unix=int(rec["intent"]["not_before"]) + 365 * 86400,
+                    reason="cancelled: owner reset, by an owner phone",
+                ))
+                cfg.state.put_top_plane_record(rec)
+                log.info("owner reset %s CANCELLED by owner phone %s", rec["id"], phone.phone_id)
+                self._send_json(HTTPStatus.OK, {"resolved": True, "cancelled": True})
+                return
+            draft = top_plane.Draft.from_wire(rec["draft"])
+            if draft.op == "seal-id" and not committed and draft.value.decode("ascii", "replace") != cfg.bootloader_id:
+                # The card was opened under another start: this process serves another id, so the seal would commit
+                # an id nothing serves.
+                rec["state"], rec["detail"] = "refused", "the id to seal is not the id this bootloader serves now"
+                cfg.state.put_top_plane_record(rec)
+                self._send_json(HTTPStatus.CONFLICT, {
+                    "error": "top_plane_seal_mismatch",
+                    "detail": f"this seal names an id this bootloader does not serve now ({cfg.bootloader_id}); open "
+                              "the seal again"})
+                return
+            if draft.op != "seal-id" and not committed:
+                # THE GATE ITSELF (hard rule 14.7): the act's two signatures meet verify_top_plane (the passphrase AND
+                # a sealed owner device) before the chain replay checks them again.
+                from recto.bootloader.genesis_authority import GenesisSetError, verify_top_plane
+                try:
+                    met = verify_top_plane(message, [top_plane.unb64u(rec["passphrase_sig"]), top_plane.unb64u(sig)],
+                                           cfg.state).met
+                except GenesisSetError as exc:
+                    met, rec["detail"] = False, str(exc)
+                if not met:
+                    rec["state"] = "refused"
+                    cfg.state.put_top_plane_record(rec)
+                    self._send_json(HTTPStatus.FORBIDDEN, {
+                        "error": "top_plane_gate_refused",
+                        "detail": "the passphrase and a sealed device did not both sign"})
+                    return
+            post = None
+            try:
+                if not committed:
+                    post = cfg.state.append_genesis_chain_entry(
+                        top_plane.record_of(draft, [rec["passphrase_sig"], sig]))
+            except ChainError as exc:
+                rec["state"], rec["detail"] = "refused", str(exc)
+                cfg.state.put_top_plane_record(rec)
+                self._send_json(HTTPStatus.CONFLICT, {"error": "top_plane_chain_refused", "detail": str(exc)})
+                return
+            try:
+                finish_act(cfg.state, cfg, rec, draft, approver_id=phone.phone_id, post_state=post)
+            except top_plane.TopPlaneRefused:
+                if committed:
+                    raise
+                log.error("top plane: act %s appended, then refused while finishing; it finishes at the next start",
+                          rec["id"])
+                self._send_json(HTTPStatus.ACCEPTED, {"resolved": True, "appended": True, "finished": False})
+                return
+            except Exception as exc:  # noqa: BLE001 - the entry is committed; the registry rolls forward
+                log.error("top plane: act %s is on the chain but its registry work did not finish (%s); it finishes "
+                          "at the next start", rec["id"], exc)
+                self._send_json(HTTPStatus.ACCEPTED, {"resolved": True, "appended": True, "finished": False})
+                return
+            log.info("top plane: act %s APPENDED (%s %s, seq %s) by device %s", rec["id"], draft.op, draft.kind,
+                     draft.seq, phone.phone_id)
+        self._send_json(HTTPStatus.OK, {"resolved": True, "appended": True})
+
+    def _handle_owner_enroll_pending(self) -> None:
+        """GET /v0.4/owner/enroll/pending - the sealed-mode slot entries waiting for the passphrase, with their
+        drafts, so the host recomputes each digest itself. Public keys and refs only."""
+        out = []
+        for rec in self.config.state.list_owner_enrolls():
+            tp = rec.get("top_plane")
+            if tp is None or rec.get("state") not in ("pending", "approved"):
+                continue
+            out.append({"request_id": rec["request_id"], "slot": rec["slot"], "incoming_ref": rec["incoming_ref"],
+                        "occupant_ref": rec.get("occupant_ref"), "state": rec["state"], "draft": tp["draft"],
+                        "passphrase_signed": bool(tp.get("passphrase_sig"))})
+        self._send_json(HTTPStatus.OK, {"pending": out})
+
+    def _handle_owner_enroll_passphrase(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/owner/enroll/passphrase {request_id, signature_b64u} - the passphrase leg of a slot entry."""
+        cfg = self.config
+        cs = top_plane.require_sealed(cfg.state, expect_sealed_id=cfg.expect_sealed_id)
+        with cfg.state.registry_lock():
+            rec = next((r for r in cfg.state.list_owner_enrolls()
+                        if r.get("request_id") == body.get("request_id") and r.get("top_plane")), None)
+            if rec is None or rec.get("state") not in ("pending", "approved"):
+                raise top_plane.TopPlaneRefused("owner_enroll_unknown", "no open slot entry with that id", 404)
+            if rec["top_plane"].get("passphrase_sig"):
+                raise top_plane.TopPlaneRefused("top_plane_draft_used", "this slot entry's passphrase leg is signed",
+                                                409)
+            draft = top_plane.Draft.from_wire(rec["top_plane"]["draft"])
+            try:
+                top_plane.act_freshness(draft)
+            except ValueError as exc:
+                raise top_plane.TopPlaneRefused("top_plane_draft_stale", str(exc), 400) from None
+            message = top_plane.draft_message(cs, draft)
+            if not top_plane.verify_passphrase(cs, message, body.get("signature_b64u")):
+                raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                                "the passphrase's signature is not over this slot entry's digest")
+            rec = dict(rec)
+            rec["top_plane"] = dict(rec["top_plane"], passphrase_sig=body["signature_b64u"])
+            cfg.state.put_owner_enroll(rec)
+        logging.getLogger("recto.bootloader.top_plane").info(
+            "top plane: the passphrase signed slot entry %s (slot=%s, %s)", rec["request_id"], rec["slot"],
+            rec["incoming_ref"])
+        self._send_json(HTTPStatus.OK, {"signed": True})
+
+    # --- the owner reset ----------------------------------------------------------------------------------------
+
+    def _handle_owner_reset_start(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/owner/reset/start {intent, passphrase_signature_b64u}. The passphrase STARTS it; every
+        registered owner phone - the ones named lost included - is carded and may cancel it."""
+        cfg = self.config
+        cs = top_plane.require_sealed(cfg.state, expect_sealed_id=cfg.expect_sealed_id)
+        intent = body.get("intent")
+        if not isinstance(intent, dict):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", "the intent is missing", 400)
+        now = int(time.time())
+        try:
+            slots, lost, not_before = list(intent["slots"]), list(intent["lost"]), int(intent["not_before"])
+            iid = str(intent["intent_id"])
+        except (KeyError, TypeError, ValueError):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", "the intent is malformed", 400) from None
+        if intent.get("bootloader_id") != cfg.bootloader_id:
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", "the intent names another bootloader")
+        if not slots or any(s not in SLOTS for s in slots):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", f"slots must be among {list(SLOTS)}", 400)
+        if not_before < now + int(cfg.owner_reset_window_seconds) - 60:
+            raise top_plane.TopPlaneRefused("owner_reset_window_short",
+                                            "the reset completes no sooner than the window after it starts")
+        digest = top_plane.reset_intent_digest(intent)
+        if not top_plane.verify_passphrase(cs, digest, body.get("passphrase_signature_b64u")):
+            raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                            "the passphrase's signature is not over this reset intent")
+        with cfg.state.registry_lock():
+            self._start_reset_locked(intent, iid, slots, lost, not_before, digest, body["passphrase_signature_b64u"],
+                                     now)
+
+    def _start_reset_locked(self, intent: dict[str, Any], iid: str, slots: list[str], lost: list[str],
+                            not_before: int, digest: bytes, psig: str, now: int) -> None:
+        """Caller holds the registry lock: the one-open-reset check and the write are one act."""
+        cfg = self.config
+        if cfg.state.is_revoked(top_plane.REVOKED_RESET_PREFIX + iid) or cfg.state.get_top_plane_record(iid):
+            raise top_plane.TopPlaneRefused("owner_reset_spent", "that intent was already used or cancelled", 409)
+        records = cfg.state.list_top_plane_records()
+        unfinished = next((r for r in records if r.get("type") == "reset" and r.get("state") == "registered"
+                           and reset_entry_on_chain(cfg.state, r)), None)
+        if unfinished is not None:
+            # A reset whose entry is on the chain is committed whatever its age: no new reset starts until it is
+            # finished, or two resets would seat two phones in one slot.
+            raise top_plane.TopPlaneRefused(
+                "owner_reset_committed",
+                f"owner reset {unfinished['id']} is committed but unfinished; on the host run "
+                f"`recto bootloader owner-reset --complete {unfinished['id']}` first", 409)
+        if any(self._reset_open(r) for r in records):
+            raise top_plane.TopPlaneRefused("owner_reset_open", "a reset is already open", 409)
+        owners = [p for p in cfg.state.list_phones() if p.slot in SLOTS]
+        # The phones named lost are registered owner phones IN the reset's slots - for every-owner-lost, exactly
+        # the phones those slots hold - and completion removes exactly those.
+        held = sorted(p.phone_id for p in owners if p.slot in slots)
+        if not lost or any(ref not in held for ref in lost) or (len(slots) == 2 and sorted(lost) != held):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid",
+                                            f"the phones named lost must be the owner phones the slot(s) hold: {held}",
+                                            400)
+        when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(not_before))
+        text = (f"AN OWNER RESET WAS STARTED ON THE HOST: slot(s) {', '.join(slots)}, phones named lost: "
+                f"{', '.join(lost) or 'none'}. It completes no sooner than {when}. "
+                "APPROVE = CANCEL IT. Cancel unless you started it yourself.")
+        cards = self._card_devices(iid, text, digest, owners, ttl_seconds=max(60, not_before - now))
+        cfg.state.put_top_plane_record({
+            "id": iid, "type": "reset", "state": "waiting", "intent": dict(intent), "card_text": text,
+            "message_b64u": top_plane.b64u(digest), "passphrase_sig": psig,
+            "cards": cards, "created_unix": now, "code_hash": None, "challenge": None, "code_attempts": 0,
+        })
+        logging.getLogger("recto.bootloader.top_plane").info(
+            "owner reset %s STARTED: slots=%s lost=%s not_before=%s; %d owner phone(s) carded with the cancel",
+            iid, slots, lost, not_before, len(cards))
+        self._send_json(HTTPStatus.OK, {"intent_id": iid, "not_before": not_before, "cards": len(cards)})
+
+    def _reset_open(self, rec: dict[str, Any]) -> bool:
+        """The one open-reset predicate (top_plane.reset_is_open) with this store's revocation list."""
+        return reset_open_in(self.config.state, rec)
+
+    def _open_reset(self, body: dict[str, Any], *, states: tuple[str, ...]) -> dict[str, Any]:
+        cfg = self.config
+        rec = cfg.state.get_top_plane_record(str(body.get("intent_id") or ""))
+        if rec is None or rec.get("type") != "reset":
+            raise top_plane.TopPlaneRefused("owner_reset_unknown", "no such reset", 404)
+        if rec["state"] == "cancelled" or cfg.state.is_revoked(
+                top_plane.REVOKED_RESET_PREFIX + rec["intent"]["intent_id"]):
+            raise top_plane.TopPlaneRefused("owner_reset_cancelled", "this reset was aborted on the host"
+                                            if rec["state"] == "aborted" else
+                                            "this reset was cancelled by an owner phone")
+        if rec["state"] not in states:
+            raise top_plane.TopPlaneRefused("owner_reset_state", f"this reset is {rec['state']}", 409)
+        if int(time.time()) < int(rec["intent"]["not_before"]):
+            raise top_plane.TopPlaneRefused("owner_reset_early",
+                                            f"the window has not passed; not before {rec['intent']['not_before']}")
+        if top_plane.reset_expired(rec):
+            raise top_plane.TopPlaneRefused("owner_reset_expired",
+                                            "the reset passed its grace (not armed after the window, or not completed "
+                                            "after its code); abort it or start a new one (the full window again)")
+        return rec
+
+    def _code_mac(self, code: str) -> str:
+        return self._mac("code", code)
+
+    def _mac(self, use: str, value: str) -> str:
+        """An HMAC under the per-process key create_server makes once (a live code or challenge never outlives the
+        process that issued it)."""
+        key = self.config.owner_reset_code_key
+        if not key:
+            raise top_plane.TopPlaneRefused("owner_reset_unavailable", "the reset's code key is not set up", 503)
+        return hmac.new(key, f"{use}|{value}".encode("ascii"), hashlib.sha256).hexdigest()
+
+    def _spend_leg_nonce(self, rec_id: str, field_name: str, nonce: str) -> dict[str, Any] | None:
+        """Caller holds the registry lock. A verified host leg's nonce is spent FIRST, before any state check, so a leg
+        refused for its state (early, a live code, a closed reset) can never be replayed later. Returns the record as
+        re-read, or None when there is no such record."""
+        cfg = self.config
+        rec = cfg.state.get_top_plane_record(rec_id)
+        if rec is None or rec.get("type") != "reset":
+            return None
+        if nonce in (rec.get(field_name) or []):
+            raise top_plane.TopPlaneRefused("owner_reset_leg_used", "that signed leg was already used", 409)
+        rec = dict(rec)
+        rec[field_name] = list(rec.get(field_name) or []) + [nonce]
+        try:
+            cfg.state.put_top_plane_record(rec)
+        except top_plane.TopPlaneRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the leg is refused and the record is as it was
+            raise top_plane.TopPlaneRefused("owner_reset_store_fault",
+                                            f"the reset record could not be written ({type(exc).__name__}); nothing "
+                                            "changed - sign the leg again", 503) from None
+        return rec
+
+    def _handle_owner_reset_arm(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/owner/reset/arm {arm: {intent_id, slot, nonce, not_after}, passphrase_signature_b64u} - after
+        the window, a PASSPHRASE act (the host signs the arm; the intent id alone is in every owner card and arms
+        nothing). The one-time code is returned only in this response, and a live code is never replaced."""
+        cfg = self.config
+        cs = top_plane.require_sealed(cfg.state, expect_sealed_id=cfg.expect_sealed_id)
+        arm = body.get("arm")
+        if not isinstance(arm, dict) or not arm.get("intent_id") or not arm.get("slot") or not arm.get("nonce"):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", "the arm names the intent, the slot and a nonce",
+                                            400)
+        if not top_plane.verify_passphrase(cs, top_plane.reset_arm_digest(arm), body.get("passphrase_signature_b64u")):
+            raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                            "the passphrase's signature is not over this arm")
+        with cfg.state.registry_lock():
+            spent = self._spend_leg_nonce(str(arm["intent_id"]), "arm_nonces", str(arm["nonce"]))
+            try:
+                top_plane.leg_freshness(arm)
+            except ValueError as exc:
+                raise top_plane.TopPlaneRefused("owner_reset_leg_stale", str(exc), 400) from None
+            if spent is not None and spent.get("state") == "registered" and _committed_or_unknown(cfg.state, spent):
+                raise top_plane.TopPlaneRefused(
+                    "owner_reset_state",
+                    f"the {spent.get('slot')} slot of this reset is committed but unfinished; on the host run "
+                    f"`recto bootloader owner-reset --complete {spent['id']}` first", 409)
+            rec = dict(self._open_reset({"intent_id": arm["intent_id"]}, states=("waiting", "armed")))
+            slot = str(arm["slot"])
+            if slot not in rec["intent"]["slots"] or slot in (rec.get("completed_slots") or []):
+                raise top_plane.TopPlaneRefused("owner_reset_invalid",
+                                                "that slot is not in the reset, or the reset already seated it", 400)
+            now = int(time.time())
+            if rec["state"] == "armed" and int(rec.get("code_expires_at", 0)) > now:
+                raise top_plane.TopPlaneRefused(
+                    "owner_reset_armed", "a code is live for this reset; it expires before another is armed", 409)
+            code = "".join(secrets.choice("0123456789") for _ in range(6))
+            for card_id in rec.get("cards") or {}:
+                cfg.state.take_pending(card_id)
+            rec.update(state="armed", slot=slot, code_hash=self._code_mac(code), code_expires_at=now + 600,
+                       challenge=None, challenge_mac=None, challenge_expires_at=0, fresh=None, code_attempts=0)
+            cfg.state.put_top_plane_record(rec)
+        logging.getLogger("recto.bootloader.top_plane").info("owner reset %s ARMED for slot=%s", rec["id"], slot)
+        self._send_json(HTTPStatus.OK, {"intent_id": rec["id"], "slot": slot, "code": code,
+                                        "expires_at_unix": rec["code_expires_at"]})
+
+    _RESET_CODE_ATTEMPTS = 5
+
+    def _armed_reset_for_code(self, code: str) -> dict[str, Any] | None:
+        """The armed reset this code opens, or None. A code that opens nothing at all is counted by
+        _count_reset_code_failure; past the limit a live reset code is burned and the host arms again."""
+        cfg = self.config
+        if cfg.state is None or not code or not code.isascii():
+            return None
+        mac = self._code_mac(code)
+        now = int(time.time())
+        try:
+            records = cfg.state.list_top_plane_records()
+        except top_plane.TopPlaneRefused as exc:
+            logging.getLogger("recto.bootloader.top_plane").error("%s: no reset code is redeemed until it reads",
+                                                                  exc.detail)
+            return None
+        live = [r for r in records
+                if r.get("type") == "reset" and r.get("state") == "armed" and r.get("code_hash")
+                and int(r.get("code_expires_at", 0)) > now]
+        for rec in live:
+            if hmac.compare_digest(rec["code_hash"], mac):
+                return rec
+        return None
+
+    def _count_reset_code_failure(self) -> None:
+        """A code that opened NOTHING (no reset, no owner or member code) counts against each live armed reset. The
+        records are re-read and written under the registry lock, so a count never writes back a stale copy over an
+        abort or a re-arm."""
+        cfg = self.config
+        if not cfg.state.supports_genesis_chain():
+            return
+        with cfg.state.registry_lock():
+            now = int(time.time())
+            try:
+                records = cfg.state.list_top_plane_records()
+            except top_plane.TopPlaneRefused:
+                return  # named where it is read for a reset; a wrong ordinary code still counts at the limiter
+            live = [r for r in records
+                    if r.get("type") == "reset" and r.get("state") == "armed" and r.get("code_hash")
+                    and int(r.get("code_expires_at", 0)) > now and self._reset_open(r)]
+            for rec in live:
+                rec = dict(rec)
+                rec["code_attempts"] = int(rec.get("code_attempts", 0)) + 1
+                if rec["code_attempts"] >= self._RESET_CODE_ATTEMPTS:
+                    rec.update(code_hash=None, code_expires_at=0)
+                    logging.getLogger("recto.bootloader.top_plane").warning(
+                        "owner reset %s: its arm code was BURNED after %d wrong codes; the host arms again",
+                        rec["id"], rec["code_attempts"])
+                cfg.state.put_top_plane_record(rec)
+
+    def _reset_for_challenge(self, challenge: str) -> dict[str, Any] | None:
+        if not challenge.isascii():
+            return None
+        now = int(time.time())
+        for rec in self.config.state.list_top_plane_records():
+            if (rec.get("type") == "reset" and rec.get("state") == "armed" and rec.get("challenge_mac")
+                    and hmac.compare_digest(rec["challenge_mac"], self._mac("challenge", challenge))
+                    and int(rec.get("challenge_expires_at", 0)) > now):
+                return rec
+        return None
+
+    def _handle_owner_reset_complete(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/owner/reset/complete {intent_id, passphrase_signature_b64u} - the passphrase over the reset
+        entry's digest (the host computed it from GET /v0.4/owner/reset); the fresh device's registration proof is
+        the entry's device leg; the entry appends, the fresh device is seated, then the lost phones in the slot go.
+        A reset whose entry is already on the chain (a fault after the append) is ROLLED FORWARD here with no second
+        append: the chain already holds both legs, so finishing the registry needs no new signature."""
+        cfg = self.config
+        log = logging.getLogger("recto.bootloader.top_plane")
+        with cfg.state.registry_lock():
+            stored = cfg.state.get_top_plane_record(str(body.get("intent_id") or ""))
+            cs = top_plane.require_sealed(cfg.state, expect_sealed_id=cfg.expect_sealed_id)
+            if stored is not None and stored.get("state") == "registered" and reset_entry_on_chain(cfg.state, stored):
+                rec, committed = dict(stored), True
+            else:
+                rec, committed = dict(self._open_reset(body, states=("registered",))), False
+            fresh = rec["fresh"]
+            draft = top_plane.Draft(op="reset", kind=top_plane.SLOT_KIND[rec["slot"]],
+                                    value=top_plane.unb64u(fresh["public_key_b64u"]), algorithm=fresh["algorithm"],
+                                    seq=cs.length, prev=cs.tip_hash, meta=top_plane.reset_meta(rec, rec["slot"]))
+            if not committed:
+                message = top_plane.draft_message(cs, draft)
+                psig = body.get("passphrase_signature_b64u")
+                if not top_plane.verify_passphrase(cs, message, psig):
+                    raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                                    "the passphrase's signature is not over this reset entry")
+                try:
+                    post = cfg.state.append_genesis_chain_entry(top_plane.record_of(draft, [psig, fresh["proof_b64u"]]))
+                except ChainError as exc:
+                    raise top_plane.TopPlaneRefused("top_plane_chain_refused", str(exc), 409) from None
+            else:
+                post = None
+            try:
+                reg = finish_reset_seat(cfg.state, rec, post_state=post)
+            except top_plane.TopPlaneRefused:
+                if not committed:
+                    # This call appended: the entry IS on the chain, so the answer is the committed shape.
+                    log.error("owner reset %s: appended, then refused while finishing; it finishes on a repeat "
+                              "--complete or at the next start", rec["id"])
+                    self._send_json(HTTPStatus.ACCEPTED, {
+                        "committed": True, "completed": False, "slot": rec["slot"],
+                        "detail": "the reset's entry is on the chain; the registry finishes on a repeat --complete "
+                                  "or at the next start"})
+                    return
+                raise
+            except Exception as exc:  # noqa: BLE001 - the entry is committed; the registry rolls forward
+                log.error("owner reset %s: its entry is on the chain but the registry did not finish (%s); it "
+                          "finishes on a repeat --complete or at the next start", rec["id"], exc)
+                self._send_json(HTTPStatus.ACCEPTED, {
+                    "committed": True, "completed": False, "slot": rec["slot"],
+                    "detail": "the reset's entry is on the chain; the registry finishes on a repeat --complete or at "
+                              "the next start"})
+                return
+        log.info("owner reset %s COMPLETED: slot=%s seated %s on the chain%s", rec["id"], rec["completed_slot"],
+                 reg.phone_id, " (rolled forward)" if committed else f" (seq {draft.seq})")
+        self._send_json(HTTPStatus.OK, {"completed": True, "slot": rec["completed_slot"], "phone_ref": reg.phone_id})
+
+    def _handle_owner_reset_abort(self, body: dict[str, Any]) -> None:
+        """POST /v0.4/owner/reset/abort {abort: {intent_id, nonce, not_after}, passphrase_signature_b64u} - the host
+        ends an open reset in any state (waiting, armed, registered) with the passphrase: its cards are withdrawn and
+        the intent goes on the revocation list, so it never completes and a new reset may start. A reset whose entry
+        is already on the chain is not aborted: it is committed, and the registry rolls forward instead."""
+        cfg = self.config
+        cs = top_plane.require_sealed(cfg.state, expect_sealed_id=cfg.expect_sealed_id)
+        abort = body.get("abort")
+        if not isinstance(abort, dict) or not abort.get("intent_id") or not abort.get("nonce"):
+            raise top_plane.TopPlaneRefused("owner_reset_invalid", "the abort names the intent and a nonce", 400)
+        if not top_plane.verify_passphrase(cs, top_plane.reset_abort_digest(abort),
+                                           body.get("passphrase_signature_b64u")):
+            raise top_plane.TopPlaneRefused("top_plane_passphrase_invalid",
+                                            "the passphrase's signature is not over this abort")
+        with cfg.state.registry_lock():
+            _read_chain_or_refuse(cfg.state)  # an unreadable chain refuses before the leg is spent
+            rec = self._spend_leg_nonce(str(abort["intent_id"]), "abort_nonces", str(abort["nonce"]))
+            try:
+                top_plane.leg_freshness(abort)
+            except ValueError as exc:
+                raise top_plane.TopPlaneRefused("owner_reset_leg_stale", str(exc), 400) from None
+            if rec is None or rec.get("state") not in ("waiting", "armed", "registered"):
+                raise top_plane.TopPlaneRefused("owner_reset_unknown", "no open reset with that id", 404)
+            try:
+                committed = rec["state"] == "registered" and reset_entry_on_chain(cfg.state, rec)
+            except top_plane.TopPlaneRefused as exc:
+                raise _leg_spent(exc) from None
+            if committed:
+                try:
+                    finish_reset_seat(cfg.state, rec)
+                except top_plane.TopPlaneRefused as exc:
+                    raise _leg_spent(exc) from None
+                except Exception as exc:  # noqa: BLE001 - the entry is committed; the registry rolls forward
+                    logging.getLogger("recto.bootloader.top_plane").error(
+                        "owner reset %s: its entry is on the chain; the abort's finish did not complete (%s)",
+                        rec["id"], exc)
+                    self._send_json(HTTPStatus.ACCEPTED, {
+                        "committed": True, "completed": False, "slot": rec["slot"],
+                        "detail": "the reset's entry is on the chain, so it is not aborted; the registry finishes "
+                                  "on a repeat --complete or at the next start"})
+                    return
+                raise top_plane.TopPlaneRefused("owner_reset_committed",
+                                                "this reset's entry is already on the chain; it was finished, not "
+                                                "aborted", 409)
+            for card_id in rec.get("cards") or {}:
+                cfg.state.take_pending(card_id)
+            cfg.state.add_revocation(RevocationEntry(
+                jti=top_plane.REVOKED_RESET_PREFIX + rec["intent"]["intent_id"], revoked_at_unix=int(time.time()),
+                original_exp_unix=int(rec["intent"]["not_before"]) + 365 * 86400,
+                reason="aborted: owner reset, by the passphrase on the host",
+            ))
+            rec.update(state="aborted", code_hash=None, challenge=None, challenge_mac=None, fresh=None)
+            cfg.state.put_top_plane_record(rec)
+        logging.getLogger("recto.bootloader.top_plane").info("owner reset %s ABORTED on the host", rec["id"])
+        self._send_json(HTTPStatus.OK, {"aborted": True, "intent_id": rec["id"]})
+
+    def _handle_owner_reset_status(self, url: Any) -> None:
+        """GET /v0.4/owner/reset?intent_id= - the reset as the host needs it to compute the entry's digest."""
+        rid = (parse_qs(url.query).get("intent_id") or [""])[0]
+        rec = self.config.state.get_top_plane_record(rid) if rid else None
+        if rec is None or rec.get("type") != "reset":
+            raise top_plane.TopPlaneRefused("owner_reset_unknown", "no such reset", 404)
+        # The registration challenge is released only after the fresh device spent it (state registered): while
+        # armed it is the code holder's alone, never an open GET's.
+        # One opaque state ('open') while waiting or armed, so an unauthenticated caller learns nothing about when a
+        # code is live (no timing oracle for the burn); the challenge only once the fresh device has spent it.
+        shown = "open" if rec["state"] in ("waiting", "armed") else rec["state"]
+        out = {"intent": rec["intent"], "state": shown, "slot": rec.get("slot") if shown != "open" else None,
+               "challenge": rec.get("challenge") if rec["state"] == "registered" else None}
+        if rec.get("fresh"):
+            out["fresh"] = {"public_key_b64u": rec["fresh"]["public_key_b64u"],
+                            "algorithm": rec["fresh"]["algorithm"]}
+        out["committed"] = rec["state"] == "registered" and reset_entry_on_chain(self.config.state, rec)
+        self._send_json(HTTPStatus.OK, out)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise BootloaderError(f"invalid JSON body: {exc}") from exc
+        if not isinstance(data, dict):
+            raise BootloaderError("body must be a JSON object")
+        return data
+
+    def _send_json(self, status: HTTPStatus, body: dict[str, Any]) -> None:
+        payload = json.dumps(body, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Override default stderr logging to use Recto's logging
+        # convention. The bootloader runs as a service; default
+        # http.server logging would flood AppStdout.
+        # For v0.4.0 we silently drop access logs; v0.4.1+ adds a
+        # configurable access log path.
+        return
+
+
+def reset_open_in(state: Any, rec: dict[str, Any], now: int | None = None) -> bool:
+    """A reset record that is open in this store: an open state, not expired, its intent not revoked."""
+    if rec.get("type") != "reset":
+        return False
+    iid = (rec.get("intent") or {}).get("intent_id", "")
+    return top_plane.reset_is_open(rec, revoked=state.is_revoked(top_plane.REVOKED_RESET_PREFIX + iid), now=now)
+
+
+def reserved_reset_jti(jti: Any) -> bool:
+    """A jti the top plane keeps for a reset's revocation. Only the top plane writes one (its cancel and its abort):
+    every route that spends or revokes a jti its caller supplies refuses this prefix before anything is spent, and
+    a capability request never cards one."""
+    return str(jti).startswith(top_plane.REVOKED_RESET_PREFIX)
+
+
+def _leg_spent(exc: Any) -> Any:
+    """A refusal after an abort spent its leg: the same name and status, saying the leg is spent."""
+    return top_plane.TopPlaneRefused(exc.name, f"{exc.detail.split(';')[0]}; this abort's leg is spent - sign a new "
+                                               "abort, or run --complete for a committed reset", exc.status)
+
+
+def _committed_or_unknown(state: Any, rec: dict[str, Any]) -> bool:
+    """For an advisory pointer only: whether a reset's entry is on the chain, False when the chain is unreadable."""
+    try:
+        return reset_entry_on_chain(state, rec)
+    except top_plane.TopPlaneRefused:
+        return False
+
+
+def _read_chain_or_refuse(state: Any) -> list[dict[str, Any]]:
+    """The stored chain's records, or a NAMED refusal: an unreadable chain is never read as 'not committed'."""
+    try:
+        return state.read_genesis_chain()
+    except Exception as exc:  # noqa: BLE001 - every read failure is the same refusal
+        raise top_plane.TopPlaneRefused("genesis_chain_unreadable",
+                                        f"the genesis chain could not be read ({type(exc).__name__}); nothing was "
+                                        "changed - try again once it reads", 503) from None
+
+
+def _current_chain(state: Any) -> Any:
+    """The chain's current state for a roll-forward's effects, or a named refusal before any effect."""
+    try:
+        return state.genesis_chain_state()
+    except Exception as exc:  # noqa: BLE001
+        raise top_plane.TopPlaneRefused("genesis_chain_unreadable",
+                                        f"the genesis chain could not be read ({type(exc).__name__}); nothing was "
+                                        "changed - try again once it reads", 503) from None
+
+
+def _is_current_member(cs: Any, public_key_b64u: str | None) -> bool:
+    return cs is not None and any(top_plane.b64u(m.pubkey) == public_key_b64u for m in cs.members.values())
+
+
+def reset_entry_on_chain(state: Any, rec: dict[str, Any]) -> bool:
+    """The chain's evidence that a 'registered' reset's entry was appended: the stored chain holds a reset entry for
+    THIS intent and slot, seating this fresh key under this challenge. The slot's current member is never the
+    evidence - another act can seat or remove it."""
+    fresh = rec.get("fresh") or {}
+    if not fresh or not rec.get("challenge"):
+        return False
+    want = top_plane.unb64u(fresh["public_key_b64u"]).hex()
+    records = _read_chain_or_refuse(state)
+    for r in records:
+        if r.get("op") != "reset" or r.get("pubkey") != want:
+            continue
+        try:
+            meta = json.loads(r.get("meta") or "")
+        except ValueError:
+            continue
+        if (isinstance(meta, dict) and meta.get("intent_id") == rec["intent"]["intent_id"]
+                and meta.get("slot") == rec.get("slot") and meta.get("challenge") == rec.get("challenge")):
+            return True
+    return False
+
+
+def finish_reset_seat(state: Any, rec: dict[str, Any], post_state: Any = None) -> Any:
+    """The registry side of a reset whose entry is on the chain, in the order that never leaves the slot empty: the
+    fresh device is registered FIRST, then the phones named lost in the slot are revoked, then the record moves on.
+    Each step is idempotent, so a repeat after a fault finishes the work. `rec` is updated in place."""
+    fresh, slot = rec["fresh"], rec["slot"]
+    log = logging.getLogger("recto.bootloader.top_plane")
+    cs = post_state if post_state is not None else _current_chain(state)
+    member = cs.members.get(top_plane.SLOT_KIND[slot]) if cs is not None else None
+    reg = None
+    if member is not None and top_plane.b64u(member.pubkey) == fresh["public_key_b64u"]:
+        reg = state.register_phone(PhoneRegistration.new(
+            device_label=fresh["device_label"], public_key_b64u=fresh["public_key_b64u"],
+            supported_algorithms=(fresh["algorithm"],), push_token=fresh.get("push_token"),
+            push_platform=fresh.get("push_platform"), poll_public_key_b64u=fresh["poll_public_key_b64u"], slot=slot,
+        ))
+    else:
+        # A later entry superseded this seat (the member was removed or replaced): the record finishes, the fresh
+        # key is not registered.
+        log.warning("owner reset %s: the chain's current %s is another key; the fresh key is not registered",
+                    rec["id"], top_plane.SLOT_KIND[slot])
+    fresh_ref = reg.phone_id if reg is not None else None
+    for p in [p for p in state.list_phones()
+              if p.slot == slot and p.phone_id in rec["intent"]["lost"] and p.phone_id != fresh_ref]:
+        if _is_current_member(cs, p.public_key_b64u):
+            log.warning("owner reset %s: phone %s is a current member again; it is not revoked", rec["id"], p.phone_id)
+            continue
+        if state.revoke_phone(p.phone_id):
+            void_owner_enrolls_for(state, p.phone_id)
+    done = list(rec.get("completed_slots") or [])
+    if slot not in done:
+        done.append(slot)
+    remaining = [s for s in rec["intent"]["slots"] if s not in done]
+    rec.update(state="completed" if not remaining else "waiting", completed_slot=slot, completed_slots=done,
+               fresh=None, challenge=None, challenge_mac=None, code_hash=None, code_expires_at=0)
+    state.put_top_plane_record(rec)
+    return reg or types.SimpleNamespace(phone_id=None)
+
+
+def act_entry_on_chain(state: Any, draft: Any) -> bool:
+    """Whether an opened act's entry sits on the stored chain at its seq (a fault after the append)."""
+    records = _read_chain_or_refuse(state)
+    if not (0 <= draft.seq < len(records)):
+        return False
+    r = records[draft.seq]
+    return (r.get("op") == draft.op and r.get("kind") == draft.kind and r.get("pubkey") == draft.value.hex()
+            and r.get("prev") == draft.prev and r.get("meta") == draft.meta)
+
+
+def finish_act(state: Any, cfg: Any, rec: dict[str, Any], draft: Any, approver_id: str | None = None,
+               post_state: Any = None) -> None:
+    """The registry side of an act whose entry is on the chain; idempotent, so a repeat after a fault finishes the
+    work. `rec` is updated in place and written as 'appended'."""
+    log = logging.getLogger("recto.bootloader.top_plane")
+    cs = post_state if post_state is not None else _current_chain(state)
+    if draft.op == "rotate-operator" and (cs is None or bytes(cs.current_operator_pubkey or b"") != draft.value):
+        log.warning("top plane: act %s rotated to a key the chain does not hold now; the running and vault keys stay",
+                    rec["id"])
+    elif draft.op == "rotate-operator":
+        # The running process follows the chain FIRST, so a failed vault write never leaves the old key verifying
+        # here; the vault write follows, and a failure there refuses the next start by name.
+        cfg.capability_operator_pubkey = bytes(draft.value)
+        try:
+            state.put_operator_pubkey(draft.value)
+        except Exception as exc:  # noqa: BLE001 - said, and the next start refuses until it is re-sealed
+            log.error("top plane: the rotated operator key did not reach vault_root.json (%s); re-seal it "
+                      "with `recto vault bootstrap <the chain's key> --force` before the next start", exc)
+    if draft.op == "seal-id":
+        # An owner-slot approval given BEFORE the seal never seats a phone after it - every open enroll without a
+        # top-plane draft dies with the seal.
+        for old in state.list_owner_enrolls():
+            if old.get("top_plane") is None and old.get("state") in ("pending", "approved"):
+                for card_id in old.get("cards") or {}:
+                    state.take_pending(card_id)
+                state.delete_owner_enroll(old["request_id"])
+    if draft.op == "remove":
+        gone = next((p for p in state.list_phones() if p.public_key_b64u == top_plane.b64u(draft.value)), None)
+        if gone is not None and _is_current_member(cs, gone.public_key_b64u):
+            log.warning("top plane: act %s removed a key that is a current member again; phone %s is not revoked",
+                        rec["id"], gone.phone_id)
+        elif gone is not None and gone.phone_id != approver_id:
+            if state.revoke_phone(gone.phone_id):
+                void_owner_enrolls_for(state, gone.phone_id)
+    rec["state"] = "appended"
+    state.put_top_plane_record(rec)
+
+
+def _seal_time_identity_inputs(state: Any, sealed_id: str) -> dict[str, Any] | None:
+    """The identity inputs a sealed id was derived from, as the seal-id entry records them: the operator key and the
+    identity members the id was derived with. Returned only when they recompute the sealed id under the v1
+    derivation; None otherwise, and the start then refuses by name."""
+    log = logging.getLogger("recto.bootloader.identity")
+    records = state.read_genesis_chain()
+    seal_at = next((i for i, r in enumerate(records) if r.get("op") == "seal-id"), None)
+    if seal_at is None:
+        return None
+    try:
+        meta = json.loads(records[seal_at].get("meta") or "")
+        operator = bytes.fromhex(meta["operator_pubkey"])
+        members = [bytes.fromhex(h) for h in meta["identity_members"]]
+    except Exception as exc:  # noqa: BLE001 - said by name; the chain itself already replayed
+        log.error("GATE 5d: the seal's identity inputs do not parse (%s); the start refuses", exc)
+        return None
+    if derive_bootloader_id(operator, members) != sealed_id:
+        log.error("GATE 5d: the seal-time inputs do not recompute the sealed id %r; the start refuses",
+                  sealed_id)
+        return None
+
+    def _ident_b64u(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    return {"derivation": BOOTLOADER_ID_DERIVATION_V1, "operator_pubkey_b64u": _ident_b64u(operator),
+            "member_pubkeys_b64u": [_ident_b64u(k) for k in members]}
+
+
+def _clear_dead_reset_codes(state: Any) -> None:
+    """AT START: an armed reset's code and challenge were MACed under the last process's key, so they open nothing
+    now; clearing them lets the host arm again without waiting out a code no one can redeem."""
+    if not state.supports_genesis_chain():
+        return
+    try:
+        records = state.list_top_plane_records()
+    except Exception as exc:  # noqa: BLE001 - said loudly; the top plane refuses by name until it is readable
+        logging.getLogger("recto.bootloader.top_plane").error(
+            "top plane: top_plane.json is unreadable at start (%s); the top plane refuses until it is restored", exc)
+        return
+    for rec in records:
+        if rec.get("type") == "reset" and rec.get("state") == "armed" and (rec.get("code_hash")
+                                                                          or rec.get("challenge_mac")):
+            rec = dict(rec)
+            rec.update(code_hash=None, code_expires_at=0, challenge_mac=None, challenge_expires_at=0)
+            state.put_top_plane_record(rec)
+
+
+def _roll_forward_committed(state: Any, cfg: Any) -> None:
+    """AT START: every act or reset whose entry reached the chain but whose registry work did not finish (a fault
+    between the two) is finished now, from the record and the chain's evidence - never by rebuilding the registry
+    from the chain, which holds no poll keys, push tokens or labels."""
+    log = logging.getLogger("recto.bootloader.top_plane")
+    if not state.supports_genesis_chain():
+        return
+    try:
+        records = state.list_top_plane_records()
+        state.genesis_chain_state()
+    except Exception as exc:  # noqa: BLE001 - said loudly; the top plane refuses by name until it is readable
+        log.error("top plane: the records or the chain are unreadable at start (%s); nothing was rolled forward", exc)
+        return
+    for rec in records:
+        rec = dict(rec)
+        try:
+            if rec.get("type") == "reset" and rec.get("state") == "registered" and reset_entry_on_chain(state, rec):
+                reg = finish_reset_seat(state, rec)
+                log.warning("owner reset %s: its entry was on the chain and the registry had not finished; rolled "
+                            "forward at start (slot=%s, %s)", rec["id"], rec["completed_slot"], reg.phone_id)
+            elif rec.get("type") == "act" and rec.get("state") != "appended":
+                draft = top_plane.Draft.from_wire(rec["draft"])
+                if act_entry_on_chain(state, draft):
+                    finish_act(state, cfg, rec, draft)
+                    log.warning("top plane: act %s was on the chain and its registry work had not finished; rolled "
+                                "forward at start (%s %s)", rec["id"], draft.op, draft.kind)
+        except Exception as exc:  # noqa: BLE001 - one record never stops the start; said by name
+            log.error("top plane: record %s could not be rolled forward at start (%s)", rec.get("id"), exc)
+
+
+def _recard_open_resets(state: Any, cfg: Any) -> list[Any]:
+    """THE CANCEL WINDOW SURVIVES A RESTART (hard rule 14.7). Pending cards are not reloaded at startup, so every reset
+    still in its window is carded again - to every owner phone registered NOW, until its not_before. A phone that held
+    a card before the restart gets it back UNDER ITS RECORDED ID, so the card it already shows still cancels; a phone
+    registered since gets a new one. A reset past its window is left as it is: the host arms, completes or aborts it.
+    Returns the cards, which are pushed once the push dispatcher is set."""
+    try:
+        records = state.list_top_plane_records()
+    except Exception as exc:  # noqa: BLE001 - said loudly; the top plane refuses by name until it is readable
+        logging.getLogger("recto.bootloader.top_plane").error(
+            "top plane: the reset records are unreadable at start (%s); no open reset was re-carded", exc)
+        return []
+    now = int(time.time())
+    log = logging.getLogger("recto.bootloader.top_plane")
+    out: list[Any] = []
+    for rec in records:
+        if rec.get("state") != "waiting" or not reset_open_in(state, rec, now):
+            continue
+        not_before = int(rec["intent"]["not_before"])
+        if not_before <= now:
+            continue
+        recorded = {phone_id: card_id for card_id, phone_id in (rec.get("cards") or {}).items()}
+        cards: dict[str, str] = {}
+        for phone in [p for p in state.list_phones() if p.slot in SLOTS]:
+            card = PendingRequest.new(
+                kind="single_sign", service="recto", secret=f"top-plane:{rec['id']}", phone_id=phone.phone_id,
+                operation_description=rec.get("card_text") or "AN OWNER RESET IS OPEN. APPROVE = CANCEL IT.",
+                payload_hash_b64u=rec["message_b64u"], child_pid=0, child_argv0="(bootloader)",
+                ttl_seconds=max(60, not_before - now),
+            )
+            if phone.phone_id in recorded:
+                card = replace(card, request_id=recorded[phone.phone_id])
+            state.add_pending(card)
+            cards[card.request_id] = phone.phone_id
+            out.append(card)
+        rec = dict(rec)
+        rec["cards"] = cards
+        state.put_top_plane_record(rec)
+        log.info("owner reset %s: re-carded %d owner phone(s) after a restart (window until %s)", rec["id"],
+                 len(cards), not_before)
+    return out
+
+
+def _push_recarded(state: Any, dispatcher: Any, cards: list[Any]) -> None:
+    """The re-carded cancel cards are pushed once the dispatcher exists (best effort, as every push)."""
+    if dispatcher is None:
+        return
+    for card in cards:
+        try:
+            phone = state.get_phone(card.phone_id)
+            if phone is not None:
+                dispatcher.notify(phone, card.request_id)
+        except Exception:  # noqa: BLE001 - push is a hint; the poll still finds the card
+            pass
+
+
+class _LockedHTTPServer(ThreadingHTTPServer):
+    """The bootloader's HTTP server: releases the store lock when it closes."""
+
+    store_lock: Any = None
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            if self.store_lock is not None:
+                self.store_lock.release()
+                self.store_lock = None
+
+
+def create_server(
+    *,
+    bind_host: str,
+    bind_port: int,
+    state: StateStoreBase,
+    bootloader_id: str | None = None,
+    challenges: ChallengeStore | None = None,
+    notify_resolved_fn: Any = None,
+    ssl_context: Any = None,
+    capability_agent_tokens: dict[str, str] | None = None,
+    capability_agent_requestable: dict[str, list[str]] | None = None,
+    capability_agent_audiences: dict[str, list[str]] | None = None,
+    capability_agent_auth_only: Any = None,
+    capability_operator_pubkey: bytes | None = None,
+    capability_result_ttl_seconds: int = 600,
+    capability_manifest: object | None = None,
+    capability_manifest_path: str | None = None,
+    capability_vault_secrets: dict[tuple[str, str], str] | None = None,
+    capability_revocation_jtis: set[str] | None = None,
+    capability_operator_token: str | None = None,
+    principal_apps: dict[str, AppContext] | None = None,
+    devices_pair_consumer_webhook_tokens: dict[str, str] | None = None,
+    devices_pair_consumer_relay_urls: dict[str, str] | None = None,
+    devices_pair_consumer_timeout_seconds: float = 15.0,
+    devices_pair_signing_key: bytes | None = None,
+    connections_path: str | None = None,
+    connections_agent_services: dict[str, str] | None = None,
+    connections_agent_keys: dict[str, list[str]] | None = None,
+    # MUST stay in lockstep with BootloaderConfig.connections_key_acl_enforce.
+    # These are two statements of one value: create_server unconditionally
+    # assigns this onto the config below, so the dataclass default never
+    # applies and a disagreement here silently wins. Flipping only the
+    # dataclass on 2026-08-09 left the enforcing default INERT until this
+    # line was found -- the same duplicated-value defect the tree has now
+    # been bitten by three times in one day.
+    connections_key_acl_enforce: bool = True,
+    connections_secret_source_factory: Any = None,
+    user_vault_path: str | None = None,
+    user_vault_agent_platforms: dict[str, str] | None = None,
+    user_vault_secret_source_factory: Any = None,
+    user_vault_platform_consumers: dict[str, str] | None = None,
+    owner_reset_window_seconds: int = 72 * 3600,
+    expect_sealed_id: str | None = None,
+    push_dispatcher: Any = None,
+    public_urls: tuple[str, ...] | list[str] | None = None,
+    clusters_registry_path: str | None = None,
+    clusters_projection_path: str | None = None,
+    clusters_spawn_token: str | None = None,
+    clusters_lease_ttl_seconds: int = 180,
+    signed_poll_mode: str = "advisory",
+    owner_code_minters: "set[str] | frozenset[str] | list[str] | None" = None,
+) -> ThreadingHTTPServer:
+    """Construct (but do not start) a bootloader HTTPServer.
+
+    Caller is responsible for `server.serve_forever()` and shutdown.
+    The handler class is mutated with the runtime config; if you need
+    multiple bootloaders in the same process (rare), copy
+    BootloaderHandler and pass that copy to a fresh ThreadingHTTPServer.
+
+    `ssl_context` is an `ssl.SSLContext` already loaded with the cert
+    chain. None means HTTP (NOT recommended; useful only for tests).
+
+    `capability_agent_tokens` is a map of agent_id -> bearer token
+    that gates the Phase 5 Wave B `/v0.4/capability/request` and
+    `/v0.4/capability/result/<id>` endpoints. When None or empty,
+    those endpoints return 404 — bootloaders that don't issue
+    capabilities to external agents leave it unset.
+
+    `capability_agent_requestable` is an optional per-agent policy on
+    what may be ASKED: agent_id -> list of requestable action keys.
+    An agent with an entry is deny-by-default — a capability request
+    that names an action outside the list (allow_actions plus the
+    members of its groups; deny_actions is never subtracted first, so
+    a deny cannot cancel its own allow into a pass) is refused 403
+    before it is ever queued (no card reaches the operator). Agents
+    without an entry are unrestricted at this layer. Requires
+    `capability_manifest` to be loaded if policed agents send
+    group-bearing claims (groups are refused unexpanded, fail-closed).
+
+    `capability_agent_audiences` is the audience twin of that policy:
+    agent_id -> list of audience strings the agent may name in `aud`.
+    An agent with an entry is deny-by-default — a request whose `aud`
+    is empty, is not an array of strings, or names an audience outside
+    the list is refused 403 before it is queued. Agents without an entry
+    are unrestricted at this layer. The values are the deployment's own
+    configuration; the substrate names no audience and compares exactly.
+
+    `capability_operator_pubkey` is the operator's expected secp256k1
+    pubkey (uncompressed 64-byte X || Y, no 0x04 prefix). When set,
+    the bootloader cross-checks every approved capability JWS by
+    recovering the signature and confirming it matches this key
+    before storing the assembled JWS for agent fetch. Production
+    deployments MUST set this; dev / test deployments may leave it
+    None and rely on the Ed25519 paired-phone envelope alone.
+
+    `capability_result_ttl_seconds` is how long resolved capability
+    results sit in the bootloader's in-memory store waiting for the
+    agent to fetch them. Default 600s (10 min); raise for bursty
+    fan-outs that may delay polling.
+
+    `capability_manifest` is a pre-loaded
+    ``recto.capability.types.ActionManifest`` instance the bootloader
+    will serve at ``GET /v0.4/capability/manifest`` and use for
+    scope-evaluation in ``POST /v0.4/secrets/read``. Mutually
+    exclusive with `capability_manifest_path`; if both are passed,
+    `capability_manifest` wins.
+
+    `capability_manifest_path` is a path to a manifest JSON file that
+    `create_server` loads at startup via
+    ``recto.capability.manifest.load_manifest``. Convenience for
+    deployments that ship a manifest file rather than constructing
+    the dataclass programmatically.
+
+    `capability_vault_secrets` is a pre-populated map of
+    ``(service, secret_name) -> value`` exposing secrets via the
+    capability-gated ``POST /v0.4/secrets/read`` endpoint. Empty /
+    None means the endpoint returns 404 -- bootloaders that don't
+    expose vault secrets via HTTP have zero attack surface. v1
+    keeps the secret-resolution chain in the launcher's existing
+    flow; v2 will wire the bootloader directly to
+    ``recto.secrets.SecretSource`` implementations.
+
+    `capability_revocation_jtis` (test-convenience kwarg) is the
+    set of revoked JWT jti values the bootloader will pre-seed into
+    the StateStore at startup. Wave C part 2 moved the source-of-
+    truth from an in-memory set to the StateStore's persistent
+    revocation list (revocations.json); this kwarg now seeds the
+    StateStore with synthetic RevocationEntry rows so tests that
+    pre-populate revocations don't have to write JSON files
+    themselves. Production deployments add revocations via
+    `POST /v0.4/capability/revoke` instead, which survives
+    bootloader restart.
+
+    `capability_operator_token` is the pre-shared bearer token the
+    `POST /v0.4/capability/revoke` endpoint requires (operators
+    pass it via `X-Recto-Operator-Token` header). When None /
+    empty, the revoke endpoint returns 404 -- bootloaders that
+    don't expose revocation via HTTP can run revocation entirely
+    operator-side via direct StateStore writes (or via Wave D's
+    phone-mediated flow when that ships).
+
+    `principal_apps` (Wave C part 3) is the operator-administered
+    registry of `AppContext` entries keyed by principal-id. The
+    bootloader injects the matching AppContext into every
+    PendingRequest at queue time so the phone can show the app's
+    icon + name + description at the top of the approval card. Look-
+    up order: cap_agent_id (capability_request) -> service-name
+    (other phone-rendered kinds). None / empty disables app-context
+    injection entirely; PendingRequests carry app_context=None and
+    the phone shows an "Unknown app" warning banner.
+    """
+    # THE STORE LOCK (hard rule 14.4, amended): a serving process holds an exclusive lock on its file-backend state dir
+    # for its lifetime, so the host CLI's owner-reset never edits a registry this process would overwrite from memory.
+    try:
+        store_lock = acquire_server_store_lock(state.state_dir) if isinstance(state, StateStore) else None
+    except StoreLockUnavailable as exc:
+        raise BootloaderError(f"cannot take the store lock: {exc.strerror or exc}") from exc
+    if isinstance(state, StateStore) and store_lock is None:
+        raise BootloaderError(
+            f"another process holds {state.state_dir} (a second bootloader, or the host's `recto bootloader "
+            "owner-reset`) - two servers never share one file-backend store, and owner-reset runs only while the "
+            "bootloader is stopped"
+        )
+    try:
+        server = _LockedHTTPServer((bind_host, bind_port), BootloaderHandler)
+    except BaseException:
+        if store_lock is not None:
+            store_lock.release()
+        raise
+    server.store_lock = store_lock
+    if ssl_context is not None:
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+    BootloaderHandler.config = BootloaderConfig()
+    BootloaderHandler.config.bootloader_id = (
+        bootloader_id if bootloader_id is not None else str(uuid.uuid4())
+    )
+    BootloaderHandler.config.state = state
+    BootloaderHandler.config.challenges = (
+        challenges if challenges is not None else ChallengeStore(state=state)
+    )
+    if notify_resolved_fn is not None:
+        BootloaderHandler.config.notify_resolved_fn = notify_resolved_fn  # type: ignore[attr-defined]
+    BootloaderHandler.config.capability_agent_tokens = (
+        dict(capability_agent_tokens) if capability_agent_tokens else {}
+    )
+    BootloaderHandler.config.capability_agent_requestable = (
+        {k: list(v) for k, v in capability_agent_requestable.items()}
+        if capability_agent_requestable
+        else {}
+    )
+    BootloaderHandler.config.capability_agent_auth_only = frozenset(capability_agent_auth_only or ())
+    BootloaderHandler.config.capability_agent_audiences = (
+        {k: list(v) for k, v in capability_agent_audiences.items()}
+        if capability_agent_audiences
+        else {}
+    )
+    # GATE 5a -- OPERATOR IMMUTABILITY: DISAGREEMENT IS FATAL (2026-08-18).
+    #
+    # THIS BLOCK USED TO SAY: "Explicit kwarg still wins -- backward compat for
+    # deployments that pass the pubkey directly." The persisted value was a
+    # FALLBACK. That precedence is exactly backwards for a trust root.
+    #
+    # THE TAKEOVER IT ALLOWED, and it needed no stolen device:
+    # `capability_operator_pubkey` is constructor config, re-read on EVERY
+    # start. A launcher passing a different key silently replaced the operator
+    # -- no signature, no chain entry, no trace, no restart barrier. WHOEVER
+    # CONTROLLED THE DEPLOY CONTROLLED THE OPERATOR. The sealed vault_root.json
+    # sat right there and was consulted only when nothing else was offered.
+    #
+    # "Backward compat for deployments that pass the pubkey directly" is the
+    # reason the old comment gave. It is A CONVENIENCE THAT OUTLIVED ITS
+    # PURPOSE, and that is the whole class: an exception granted for a real
+    # reason, never given an expiry, still standing long after the reason
+    # died. Nothing failed, so nothing surfaced it.
+    #
+    # THE RULE (brief S OPERATOR IMMUTABILITY, operator 2026-08-17):
+    # "On disagreement between config and sealed state the bootloader REFUSES
+    #  TO START. Disagreement is fatal, never an update."
+    #
+    # Four cases; only the last changes behaviour:
+    #   sealed, no kwarg      -> sealed wins          (unchanged)
+    #   no sealed, kwarg      -> kwarg, LOUD WARNING  (first boot, pre-seal)
+    #   sealed + kwarg AGREE  -> fine                 (unchanged)
+    #   sealed + kwarg DIFFER -> REFUSE TO START      <-- the takeover path
+    #
+    # Membership changes ride a signature from the current set, chained to
+    # genesis. That is the ONLY mutation path. Not a kwarg. Not a restart.
+    _sealed_operator_pubkey = state.get_operator_pubkey()
+    if capability_operator_pubkey is None:
+        capability_operator_pubkey = _sealed_operator_pubkey
+    elif _sealed_operator_pubkey is None:
+        # Legitimate first boot: the vault has not been bootstrapped yet.
+        # Permitted, but never quietly -- an unsealed trust root is a window,
+        # and a window nobody is told about stays open.
+        logging.getLogger("recto.bootloader.operator").warning(
+            "operator pubkey supplied by CONFIG with NO SEALED VALUE in the "
+            "state dir. This is only correct on a bootloader that has never "
+            "been bootstrapped. Run `recto vault bootstrap <hex>` to seal it; "
+            "until then the trust root can be replaced by anyone who can "
+            "change how this process is launched."
+        )
+    elif _sealed_operator_pubkey != capability_operator_pubkey:
+        server.server_close()   # a refused start leaves no socket and no store lock behind
+        raise BootloaderError(
+            "REFUSING TO START: the operator pubkey in config disagrees with "
+            "the value sealed in this bootloader's vault_root.json. "
+            f"sealed={_sealed_operator_pubkey.hex()[:16]}... "
+            f"config={capability_operator_pubkey.hex()[:16]}... "
+            "The sealed value is the trust root and config cannot replace it. "
+            "Changing the operator is not a restart -- it is an act signed by "
+            "the current set and chained to genesis. If the sealed value is "
+            "genuinely wrong, that is a vault operation performed deliberately "
+            "with the machine key, never a launcher argument."
+        )
+    BootloaderHandler.config.capability_operator_pubkey = capability_operator_pubkey
+    BootloaderHandler.config.capability_result_ttl_seconds = capability_result_ttl_seconds
+
+    # GATE 5b -- FLIP. THE DERIVED ID IS NOW THE IDENTITY. (2026-08-19)
+    #
+    # `bootloader_id` IS THE JWT AUDIENCE (`verify_jwt(..., audience=...)`).
+    # Until now it was handed in by config, or failing that A FRESH RANDOM UUID
+    # PER PROCESS -- so an unconfigured bootloader silently invalidated every
+    # token it had ever issued on each restart. Neither form was derived from
+    # anything, which made the id A NAME THE PHONE WAS TOLD rather than a claim
+    # the phone could check. A look-alike deployment at any hostname could
+    # assert any id and be believed.
+    #
+    # DERIVED, THE ID BECOMES EVIDENCE: recomputed from the operator key set,
+    # so a mismatch is ARITHMETIC rather than the operator noticing a hostname
+    # looks off. (This is also why the hostname question dissolved -- the app
+    # carries no compiled-in host at all; the right target was never "which
+    # name" but that the phone should not trust a name.)
+    #
+    # === CONFIG IS NOT CONSULTED WHEN SEALED, AND THAT IS STRONGER THAN
+    # === REFUSING TO START.
+    #
+    # GATE 5a refuses when config and the sealed operator pubkey DISAGREE,
+    # because there both values were candidates for the same slot and picking
+    # either would have left a launcher able to probe. **Here there is only ONE
+    # candidate.** The id is a function of the sealed key; a config
+    # `bootloader_id` is not a competing value, it is a value with nowhere to
+    # go. Ignoring it is not a fail-open -- it makes the setting INERT, which
+    # is a stronger property than refusing on disagreement.
+    #
+    # It is also what lets this ship WITHOUT a coordinated compose change:
+    # a deployment may still set RECTO_BOOTLOADER_ID to whatever it always
+    # set, and that value simply stops mattering. **A disagreeing config is
+    # reported at
+    # WARNING, because it means something in the estate believes a false thing
+    # about this bootloader's identity** -- inert is not the same as harmless.
+    #
+    # UNSEALED IS UNCHANGED: no sealed pubkey -> config, else random UUID.
+    # GATE 5a already owns the alarm for an unsealed trust root; this block
+    # does not raise a second one for the same fact.
+    _configured_id = BootloaderHandler.config.bootloader_id
+    _id_log = logging.getLogger("recto.bootloader.identity")
+    try:
+        _phone_count = len(state.list_phones())
+    except Exception:
+        _phone_count = -1
+    # Reset the snapshot FIRST: config is a class attribute, so without this
+    # an unsealed create_server in the same process would inherit the inputs
+    # of a previously created sealed one -- an id-less server describing a
+    # dead id.
+    BootloaderHandler.config.bootloader_identity_inputs = None
+    BootloaderHandler.config.derived_bootloader_id = None
+    # GATE 5b, the SET half: sealed genesis members of the identity kinds join the derivation (a chain whose first
+    # device entered under the passphrase alone derives with that device). The derivation runs ONCE: GATE 5d below
+    # seals its result into the genesis chain, and from then on the sealed id is served and nothing re-derives it - a
+    # roster change never renames the bootloader (hard rule 14.7).
+    try:
+        _members_full = state.list_genesis_members_full()
+    except Exception:
+        _members_full = {}
+    _identity_member_pubkeys, _excluded_kinds = collect_identity_member_pubkeys(
+        _members_full
+    )
+    if _excluded_kinds:
+        _id_log.info(
+            "GATE 5b: sealed member kind(s) NOT part of the identity "
+            "derivation (quorum-only, by the IDENTITY_MEMBER_KINDS "
+            "allowlist): %s",
+            ", ".join(_excluded_kinds),
+        )
+    try:
+        _derived_id = derive_bootloader_id(
+            capability_operator_pubkey, _identity_member_pubkeys
+        )
+    except ValueError:
+        _id_log.info(
+            "GATE 5b: bootloader_id=%r NOT DERIVED -- no sealed operator "
+            "pubkey (see GATE 5a). registered_phones=%d",
+            _configured_id, _phone_count,
+        )
+    else:
+        BootloaderHandler.config.bootloader_id = _derived_id
+        BootloaderHandler.config.derived_bootloader_id = _derived_id
+        # The inputs that produced the id, snapshotted with it -- emitted to
+        # phones at registration so the id is a recomputable claim.
+        def _ident_b64u(b: bytes) -> str:
+            return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+        BootloaderHandler.config.bootloader_identity_inputs = {
+            "derivation": BOOTLOADER_ID_DERIVATION_V1,
+            "operator_pubkey_b64u": _ident_b64u(capability_operator_pubkey),
+            "member_pubkeys_b64u": [
+                _ident_b64u(k) for k in _identity_member_pubkeys
+            ],
+        }
+        if _configured_id and _configured_id != _derived_id:
+            _id_log.warning(
+                "GATE 5b: config supplied bootloader_id=%r, which is NOT this "
+                "bootloader's identity and has been IGNORED. The identity is "
+                "DERIVED from the sealed operator key set: %r. Anything still "
+                "using the configured name believes something false about this "
+                "bootloader. Tokens minted for the old audience will no longer "
+                "verify -- affected registered phones: %d (they must re-pair).",
+                _configured_id, _derived_id, _phone_count,
+            )
+        else:
+            _id_log.info(
+                "GATE 5b: bootloader_id=%r DERIVED from operator=%s. "
+                "registered_phones=%d",
+                _derived_id,
+                capability_operator_pubkey.hex()[:16] + "...",
+                _phone_count,
+            )
+    # GATE 5d -- THE SEALED ID (hard rule 14.7). Once the genesis chain carries a `seal-id` entry, the
+    # id is the chain's and is never re-derived: roster changes and operator-key rotation are recorded in the chain
+    # and never rename the bootloader. A configured id in the derived form that differs from the sealed one refuses
+    # the start, as GATE 5a refuses a mismatched operator key; a legacy label (not the rb1- form) stays inert, as
+    # above. The chain's latest rotated operator key must be the one this bootloader holds.
+    if state.supports_genesis_chain():
+        from recto.bootloader.genesis_chain import ChainError as _ChainError
+        try:
+            state.settle_seal_mark()
+            _cs = state.genesis_chain_state()
+        except _ChainError as exc:
+            raise RuntimeError(
+                f"GATE 5d: the genesis chain does not replay ({exc}); refusing to start - a bootloader that cannot "
+                "read its own chain cannot know its sealed id. Restore genesis_members.json."
+            ) from exc
+        if expect_sealed_id and (_cs is None or _cs.sealed_id != expect_sealed_id):
+            raise RuntimeError(
+                f"GATE 5d: RECTO_EXPECT_SEALED_ID is {expect_sealed_id!r} but the genesis chain is "
+                f"{'not sealed' if _cs is None or _cs.sealed_id is None else 'sealed with ' + repr(_cs.sealed_id)}; "
+                "refusing to start - the chain was cut back, replaced or never sealed."
+            )
+        if _cs is not None and _cs.sealed_id is not None and not expect_sealed_id:
+            _id_log.warning("GATE 5d: the chain is SEALED (%r) but RECTO_EXPECT_SEALED_ID is not set; set it in the "
+                            "launcher so a cut-back chain refuses the start", _cs.sealed_id)
+        if _cs is not None and _cs.sealed_id is not None:
+            _sealed = _cs.sealed_id
+            if (_configured_id and str(_configured_id).startswith(BOOTLOADER_ID_PREFIX)
+                    and _configured_id != _sealed):
+                raise RuntimeError(
+                    f"GATE 5d: the configured bootloader_id {_configured_id!r} differs from the id SEALED in the "
+                    f"genesis chain ({_sealed!r}); refusing to start."
+                )
+            if BootloaderHandler.config.bootloader_id != _sealed:
+                _id_log.info("GATE 5d: the derivation now reads %r; the SEALED id %r stands (the roster moved)",
+                             BootloaderHandler.config.bootloader_id, _sealed)
+            # A sealed id is served with the inputs the seal-id entry records - its operator key and the identity
+            # members the id was derived with - so a phone recomputes it after any roster move or rotation. Inputs
+            # that do not recompute the id refuse the start: no phone could pair with what it would serve.
+            _inputs = _seal_time_identity_inputs(state, _sealed)
+            if _inputs is None:
+                raise RuntimeError(
+                    "GATE 5d: the seal-id entry's recorded operator key and identity members do not parse or do "
+                    f"not recompute the sealed id {_sealed!r}; refusing to start - no phone can verify the id this "
+                    "bootloader serves."
+                )
+            BootloaderHandler.config.bootloader_identity_inputs = _inputs
+            BootloaderHandler.config.bootloader_id = _sealed
+            _id_log.info("GATE 5d: bootloader_id=%r is SEALED in the genesis chain (seq %d)", _sealed, _cs.length - 1)
+            _chain_key = _cs.current_operator_pubkey
+            if _chain_key is not None and bytes(_chain_key) != bytes(capability_operator_pubkey or b""):
+                raise RuntimeError(
+                    "GATE 5d: the operator key this bootloader holds is not the one the genesis chain holds (the "
+                    "seal's, or the latest rotation's); refusing to start. vault_root.json must hold the chain's "
+                    "operator key. If a rotation was interrupted between its chain entry and the vault write, re-seal "
+                    f"the chain's key on the host: `recto vault bootstrap {bytes(_chain_key).hex()} --force`."
+                )
+        elif _cs is not None:
+            _id_log.warning("GATE 5d: the top plane is NOT SEALED (no seal-id entry in the genesis chain); rule 14.4's "
+                            "slot approval stands until `recto vault seal-id`")
+    else:
+        if expect_sealed_id:
+            raise RuntimeError(
+                f"GATE 5d: RECTO_EXPECT_SEALED_ID is {expect_sealed_id!r} but this state backend has no genesis chain; "
+                "refusing to start."
+            )
+        _id_log.warning("GATE 5d: this state backend has no genesis chain, so the top plane is unavailable (hard rule "
+                        "14.7) and rule 14.4's slot approval stands")
+
+    # WHY registered_phones IS REPORTED BUT NOT CONSUMED BY THE DERIVATION: an
+    # id computed over "every phone registered right now" would rotate -- and
+    # invalidate every outstanding JWT -- on EVERY enrolment. The genesis set
+    # must be FIXED AT GENESIS and sealed, never recomputed from live
+    # registrations. Today the derivation takes the operator key alone; the
+    # count is logged because it is exactly the number of devices a flip costs.
+
+    # Manifest: in-memory wins over path; if both unset, leave None
+    # (manifest endpoint returns 404 + secret-read endpoint returns
+    # 503 when called).
+    if capability_manifest is not None:
+        BootloaderHandler.config.capability_manifest = capability_manifest
+    elif capability_manifest_path is not None:
+        from recto.capability.manifest import load_manifest as _load_manifest
+        BootloaderHandler.config.capability_manifest = _load_manifest(capability_manifest_path)
+    else:
+        BootloaderHandler.config.capability_manifest = None
+
+    BootloaderHandler.config.capability_vault_secrets = (
+        dict(capability_vault_secrets) if capability_vault_secrets else {}
+    )
+    # Wave C part 2: capability_revocation_jtis is now a TEST-CONVENIENCE
+    # SEED rather than the source-of-truth. When provided, populate the
+    # StateStore's persistent revocation list with synthetic
+    # RevocationEntry rows so tests that pre-stage revocations don't
+    # have to write JSON files themselves. Production paths use
+    # POST /v0.4/capability/revoke which goes through the same
+    # StateStore.add_revocation method and survives bootloader restart.
+    BootloaderHandler.config.capability_revocation_jtis = (
+        set(capability_revocation_jtis) if capability_revocation_jtis else set()
+    )
+    if capability_revocation_jtis:
+        # Seed with a generous original_exp_unix (now + 1 year) so the
+        # synthetic test entries don't auto-prune mid-test. Real entries
+        # carry the actual JWT exp.
+        seed_exp = int(time.time()) + 365 * 86400
+        seed_now = int(time.time())
+        for jti in capability_revocation_jtis:
+            state.add_revocation(RevocationEntry(
+                jti=jti,
+                revoked_at_unix=seed_now,
+                original_exp_unix=seed_exp,
+                reason="test-convenience seed via create_server",
+            ))
+    BootloaderHandler.config.capability_operator_token = capability_operator_token
+    BootloaderHandler.config.principal_apps = (
+        dict(principal_apps) if principal_apps else {}
+    )
+    # Phase H end-user device pairing relay (2026-05-19). Empty dict
+    # leaves the new /v0.4/devices/pair endpoint disabled (returns 404).
+    BootloaderHandler.config.devices_pair_consumer_webhook_tokens = (
+        dict(devices_pair_consumer_webhook_tokens)
+        if devices_pair_consumer_webhook_tokens
+        else {}
+    )
+    BootloaderHandler.config.devices_pair_consumer_relay_urls = (
+        dict(devices_pair_consumer_relay_urls)
+        if devices_pair_consumer_relay_urls
+        else {}
+    )
+    BootloaderHandler.config.devices_pair_consumer_timeout_seconds = (
+        devices_pair_consumer_timeout_seconds
+    )
+    # The pairing-result signing key: refused at startup if the signer
+    # cannot run, so a misconfigured bootloader never relays unsigned.
+    if devices_pair_signing_key is not None:
+        try:
+            if len(devices_pair_signing_key) != 32:
+                raise ValueError(
+                    f"devices_pair_signing_key must be 32 bytes, got {len(devices_pair_signing_key)}"
+                )
+            from recto.capability.signing import public_key_hex, require_signing
+
+            require_signing()
+            _pair_pubkey_hex = public_key_hex(devices_pair_signing_key)
+        except BaseException:
+            server.server_close()   # a refused start leaves no socket and no store lock behind
+            raise
+        BootloaderHandler.config.devices_pair_signing_key = bytes(devices_pair_signing_key)
+        BootloaderHandler.config.devices_pair_signing_pubkey_hex = _pair_pubkey_hex
+    else:
+        BootloaderHandler.config.devices_pair_signing_key = None
+        BootloaderHandler.config.devices_pair_signing_pubkey_hex = None
+    # Recto Connections Substrate (2026-06-13). Empty/None connections_path
+    # leaves all /v0.4/connections/* endpoints disabled (404). The agent->
+    # service read map and the operator write token (capability_operator_token,
+    # already wired above) together gate the read/write split.
+    BootloaderHandler.config.connections_path = connections_path
+    BootloaderHandler.config.connections_agent_services = (
+        dict(connections_agent_services) if connections_agent_services else {}
+    )
+    BootloaderHandler.config.connections_agent_keys = (
+        {k: list(v) for k, v in connections_agent_keys.items()}
+        if connections_agent_keys
+        else {}
+    )
+    BootloaderHandler.config.connections_key_acl_enforce = bool(
+        connections_key_acl_enforce
+    )
+    BootloaderHandler.config.connections_secret_source_factory = (
+        connections_secret_source_factory
+    )
+    # Cluster registry. None registry path leaves every
+    # /v0.5/clusters/* endpoint disabled (404) -- the agent-facing
+    # deployment never sets it; the registry-writer deployment sets it
+    # (plus the write token) and configures nothing agent-facing.
+    if clusters_registry_path:
+        BootloaderHandler.config.clusters_registry = ClusterRegistry(
+            clusters_registry_path,
+            projection_path=clusters_projection_path,
+            default_lease_ttl_seconds=clusters_lease_ttl_seconds,
+        )
+    else:
+        BootloaderHandler.config.clusters_registry = None
+    BootloaderHandler.config.clusters_spawn_token = clusters_spawn_token
+    # Startup posture for the per-key ACL, logged once so a deployment's
+    # actual stance is visible in the boot log rather than inferred from
+    # config. FOUR shapes worth naming: audit-only (gate present, not
+    # biting), enforcing-with-EMPTY-allowlist (nothing is readable at all),
+    # enforcing-with-wildcard (a named agent opted out), and the quiet good
+    # case (enforcing, populated, no wildcards) which says nothing.
+    if connections_path:
+        _acl_log = logging.getLogger("recto.bootloader.connections")
+        _wildcarded = sorted(
+            agent_id
+            for agent_id, patterns in
+            BootloaderHandler.config.connections_agent_keys.items()
+            if any((p or "").strip() == "*" for p in patterns)
+        )
+        if not BootloaderHandler.config.connections_key_acl_enforce:
+            _acl_log.warning(
+                "connections per-key ACL is in AUDIT mode: secret reads "
+                "outside an agent's allowlist are LOGGED BUT ALLOWED. Set "
+                "connections_key_acl_enforce=True once the logs show the "
+                "live key set."
+            )
+        elif not BootloaderHandler.config.connections_agent_keys:
+            # The fresh-install shape, and the whole reason the enforcing
+            # default is safe to ship: default-deny plus an empty allowlist
+            # means EVERY secret read is refused. That is correct, and on its
+            # own it is indistinguishable from a broken bootloader -- so it
+            # says its own name at startup rather than being diagnosed later
+            # from a pile of 403s.
+            _acl_log.warning(
+                "connections per-key ACL is ENFORCING and connections_agent_keys "
+                "is EMPTY: every secret read will be refused with 403 "
+                "key_not_allowed. This is fail-closed, not a fault. Populate "
+                "connections_agent_keys, or set connections_key_acl_enforce=False "
+                "to run AUDIT mode and discover the live key set from the logs."
+            )
+        elif _wildcarded:
+            _acl_log.warning(
+                "connections per-key ACL is enforcing, but these agents "
+                "carry the '*' allow-all escape hatch and can read every "
+                "secret in their service: %s",
+                ", ".join(_wildcarded),
+            )
+    # Recto User Vault Substrate (2026-07-25). Empty/None user_vault_path
+    # leaves all /v0.4/user-vault/* endpoints disabled (404). All four
+    # verbs are agent-gated + platform-scoped via the agent->platform map,
+    # then user-scoped by the per-request X-Recto-Subject claim.
+    BootloaderHandler.config.user_vault_path = user_vault_path
+    BootloaderHandler.config.user_vault_agent_platforms = (
+        dict(user_vault_agent_platforms) if user_vault_agent_platforms else {}
+    )
+    BootloaderHandler.config.user_vault_secret_source_factory = (
+        user_vault_secret_source_factory
+    )
+    BootloaderHandler.config.owner_reset_window_seconds = int(owner_reset_window_seconds)
+    BootloaderHandler.config.expect_sealed_id = expect_sealed_id or None
+    # One reset-code key per process, made here once: a code or challenge issued before a restart opens nothing
+    # after it, so each armed reset's dead code is cleared and the host may arm again at once.
+    BootloaderHandler.config.owner_reset_code_key = secrets.token_bytes(32)
+    _clear_dead_reset_codes(state)
+    _roll_forward_committed(state, BootloaderHandler.config)
+    _recarded = _recard_open_resets(state, BootloaderHandler.config)
+    BootloaderHandler.config.user_vault_platform_consumers = (
+        dict(user_vault_platform_consumers) if user_vault_platform_consumers else {}
+    )
+    if user_vault_path:
+        from recto.user_vault.grant_request import GrantRequestBook
+        BootloaderHandler.config.user_vault_grant_requests = GrantRequestBook()
+    else:
+        BootloaderHandler.config.user_vault_grant_requests = None
+    # Silent-push wake dispatcher (wave C). None = poll-only. Build via
+    # recto.bootloader.push.PushDispatcher([ApnsPushSender(...),
+    # FcmPushSender(...)]); provider credentials (APNs .p8 key, FCM
+    # service-account JSON) resolve through a SecretSource, never
+    # inline config.
+    BootloaderHandler.config.push_dispatcher = push_dispatcher
+    _push_recarded(state, push_dispatcher, _recarded)
+    # Multi-URL failover list emitted at registration (primary first).
+    # Empty/None keeps the registration response byte-identical to v1.
+    BootloaderHandler.config.public_urls = (
+        tuple(public_urls) if public_urls else ()
+    )
+    # Signed-poll enforcement mode (2026-08-13, phone_id split).
+    # Validated here so a typo'd config fails at startup, loudly, not
+    # at first poll: an enforcement mode that silently falls back to a
+    # default is a boundary nobody chose.
+    if signed_poll_mode not in SIGNED_POLL_MODES:
+        server.server_close()
+        raise ValueError(
+            f"signed_poll_mode must be one of {SIGNED_POLL_MODES}; "
+            f"got {signed_poll_mode!r}"
+        )
+    BootloaderHandler.config.signed_poll_mode = signed_poll_mode
+    # THE OWNER SLOTS: who mints owner codes, the wrong-code limiter, and the genesis marker - an absent marker (a
+    # store from before it) is decided ONCE: open only on a store with no phone and no session at all.
+    BootloaderHandler.config.owner_code_minters = frozenset(owner_code_minters or ())
+    BootloaderHandler.config.code_limiter = CodeAttemptLimiter()
+    if isinstance(BootloaderHandler.config.challenges, ChallengeStore):
+        # The store actually served - a caller's, or the one built above - so every code minted here is stamped.
+        BootloaderHandler.config.challenges.code_minted = BootloaderHandler.config.code_limiter.stamp
+    _slots_log = logging.getLogger("recto.bootloader.slots")
+    try:
+        with state.registry_lock():
+            genesis = state.get_owner_genesis()
+            if genesis is None:
+                empty = not state.list_phones() and not state.has_any_session()
+                state.set_owner_genesis("open" if empty else "closed")
+            elif genesis == "open" and any(p.slot in SLOTS for p in state.list_phones()):
+                # An open marker beside an owner phone means a genesis close did not land: close it now.
+                state.set_owner_genesis("closed")
+                _slots_log.warning("owner genesis was open beside an owner phone - closed")
+            decided = state.get_owner_genesis()   # read here, under the guard: nothing below touches the store
+    except RegistryLockUnavailable as exc:
+        server.server_close()
+        raise BootloaderError(f"cannot decide the owner genesis marker at startup: {exc}") from exc
+    except BaseException:
+        server.server_close()   # a refused start leaves no socket and no store lock behind
+        raise
+    _slots_log.info("owner genesis: %s; owner-code minters: %s", decided,
+                    sorted(BootloaderHandler.config.owner_code_minters) or "none")
+    if decided == "open":
+        _slots_log.warning("owner genesis is OPEN: the next owner pairing code alone enrolls the first owner phone - "
+                           "pair it now, over the operator's own route")
+    _poll_log = logging.getLogger("recto.bootloader.signed_polls")
+    if signed_poll_mode == "advisory":
+        _poll_log.info(
+            "signed_poll_mode=advisory: possession-of-phone_id reads are "
+            "ALLOWED (not the phone list or owner-slot cards, which need a "
+            "verified signature in every mode) and each poll's verdict (signed-valid / "
+            "signed-invalid / unsigned) is logged. Flip to 'required' "
+            "once the evidence window shows every live phone signing."
+        )
+    elif signed_poll_mode == "off":
+        _poll_log.info(
+            "signed_poll_mode=off: poll signatures are not checked, except on the phone list and owner-slot "
+            "cards, which need a verified signature in every mode."
+        )
+    return server
