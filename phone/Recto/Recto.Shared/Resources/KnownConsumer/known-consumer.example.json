@@ -1,0 +1,8 @@
+{
+  "_doc": "THE KNOWN CONSUMER (v1: one). Copy this file to known-consumer.json beside it (git-ignored) on the machine that builds the store binary; the csproj embeds known-consumer.json when it exists and the build then offers 'Add a service' for this consumer. Without it the app carries no consumer and says so. base_url is the consumer's https origin; aud is the audience the pairing JWS names (the consumer verifies it); app_id is its brand folder id (/_content/<app_name>.Shared/brand/<app_id>-logo-1024.png); app_name and app_description render on the card.",
+  "base_url": "https://consumer.example",
+  "aud": "example",
+  "app_id": "example",
+  "app_name": "Example",
+  "app_description": "An example consumer"
+}

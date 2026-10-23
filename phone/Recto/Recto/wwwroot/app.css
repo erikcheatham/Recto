@@ -1,0 +1,24 @@
+/* Status-bar safe-area spacer is now handled inside the topbar
+   itself via padding-top (see Recto.Shared/Layout/MainLayout.razor.css's
+   .rec-topbar rule). The spacer element in index.html is kept around
+   as a no-op for backward compat — it would otherwise cause a vertical
+   layout shift if removed and a future Razor edit re-introduced it.
+
+   Why the in-topbar approach beats a separate spacer (banked 2026-05-20
+   after the Pixel-clipping fix): a separate sticky spacer above a
+   sticky topbar requires careful top-value coordination — when the
+   topbar sticky-pins at top:0, it overlaps the spacer at higher
+   z-index, hiding the spacer's safe-area role exactly when it
+   matters (during scroll). Folding the padding into the topbar means
+   the brand + gear always sit BELOW the inset regardless of scroll
+   state, with no two-element stacking choreography.
+
+   Previous WebKit-only @supports gate has been dropped; safe-area
+   handling now works on iOS WebKit AND Android Chromium WebView. */
+.status-bar-safe-area {
+    display: none;
+}
+
+.flex-column, .navbar-brand {
+    padding-left: env(safe-area-inset-left);
+}

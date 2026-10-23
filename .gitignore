@@ -210,5 +210,5 @@ examples/run_bootloader_*.py
 # THE KNOWN CONSUMER (2026-09-21): the build machine's manifest - which consumer this
 # store binary offers under "Add a service". Deployment config, never the substrate's;
 # the example beside it is the shape and is tracked.
-phone/RectoMAUIBlazor/Recto/Recto.Shared/Resources/KnownConsumer/known-consumer.json
+phone/Recto/Recto.Shared/Resources/KnownConsumer/known-consumer.json
 

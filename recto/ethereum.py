@@ -49,7 +49,7 @@ Public surface
 These are the consumer/verifier helpers. The phone-side equivalents
 (BIP39 mnemonic gen/import, BIP32/BIP44 derivation, secp256k1 sign
 with v-recovery) live in C# under
-``phone/RectoMAUIBlazor/.../Services/IEthSignService.cs`` and its MAUI
+``phone/.../Services/IEthSignService.cs`` and its MAUI
 implementations.
 
 Optional extra

@@ -6,7 +6,7 @@ Python sister of Recto.Shared.Services.PairDeepLinkEmitter (C#).
 
 Cross-language byte parity: the canonical demo URL pinned here MUST
 match the canonical URL pinned in
-phone/RectoMAUIBlazor/Recto/Recto.Shared.Tests/Services/PairDeepLinkEmitterTests.cs
+phone/Recto/Recto.Shared.Tests/Services/PairDeepLinkEmitterTests.cs
 (see ``CanonicalDemoUrl`` constant there). Any drift triggers test failure
 on both sides simultaneously.
 

@@ -1,7 +1,7 @@
 """Tests for GET /v0.4/manage/phones?phone_id=<self>.
 
 Endpoint contract (per
-``phone/RectoMAUIBlazor/Recto/Recto.Shared/Protocol/V04/RegisteredPhonesResponse.cs``):
+``phone/Recto/Recto.Shared/Protocol/V04/RegisteredPhonesResponse.cs``):
 the MAUI client passes its own phone_id and gets back every other paired
 phone, projected as ``{phone_id, device_label, algorithm, paired_at}``.
 The "Registered phones" pane in the app then uses the list to show what

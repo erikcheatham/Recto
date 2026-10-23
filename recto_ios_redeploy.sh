@@ -73,7 +73,7 @@ CANDIDATES=(
 )
 RECTO_DIR=""
 for d in "${CANDIDATES[@]}"; do
-  if [ -d "$d/.git" ] && [ -d "$d/phone/RectoMAUIBlazor/Recto/Recto" ]; then
+  if [ -d "$d/.git" ] && [ -d "$d/phone/Recto/Recto" ]; then
     RECTO_DIR="$d"
     break
   fi
@@ -81,7 +81,7 @@ done
 
 if [ -z "$RECTO_DIR" ]; then
   abort "iOS redeploy: cannot find Recto checkout" \
-    "Looked at: ${CANDIDATES[*]} — none had .git + phone/RectoMAUIBlazor/Recto/Recto/. Set RECTO_DIR=<abs path> and re-run."
+    "Looked at: ${CANDIDATES[*]} — none had .git + phone/Recto/Recto/. Set RECTO_DIR=<abs path> and re-run."
 fi
 
 # allow override
@@ -150,7 +150,7 @@ say "tip: $TIP_SHA -- $TIP_SUBJECT"
 # ---------- Phase 2: dotnet publish -----------------------------------------
 
 hdr "Phase 2 — dotnet publish (net10.0-ios, $CONFIG, ios-arm64)"
-PROJ_DIR="$RECTO_DIR/phone/RectoMAUIBlazor/Recto/Recto"
+PROJ_DIR="$RECTO_DIR/phone/Recto/Recto"
 cd "$PROJ_DIR" || abort "iOS redeploy: project cd failed" "Could not cd into $PROJ_DIR"
 
 START=$(date +%s)

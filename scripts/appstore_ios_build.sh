@@ -41,12 +41,12 @@ set -e
 # Resolve script's own directory + project paths.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_DIR="$REPO_ROOT/phone/RectoMAUIBlazor/Recto/Recto"
+PROJECT_DIR="$REPO_ROOT/phone/Recto/Recto"
 PROJECT_CSPROJ="$PROJECT_DIR/Recto.csproj"
 
 if [[ ! -f "$PROJECT_CSPROJ" ]]; then
     echo "ERROR: Recto.csproj not found at $PROJECT_CSPROJ" >&2
-    echo "       Expected repo layout: <repo>/phone/RectoMAUIBlazor/Recto/Recto/Recto.csproj" >&2
+    echo "       Expected repo layout: <repo>/phone/Recto/Recto/Recto.csproj" >&2
     exit 1
 fi
 
