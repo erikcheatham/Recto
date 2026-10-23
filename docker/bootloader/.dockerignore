@@ -60,8 +60,6 @@ venv/
 # Standalone dev/demo scripts that aren't the canonical launcher.
 demo.service.yml
 fake_phone.py
-recto_ios_redeploy.sh
-run_bootloader.py
 
 # Git metadata — not needed inside the image. The image's
 # provenance comes from the LABEL directives in the Dockerfile +

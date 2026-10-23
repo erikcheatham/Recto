@@ -2,10 +2,9 @@
 # appstore_ios_build.sh — Recto Phone iOS App Store build.
 #
 # Produces a Distribution-signed .ipa ready for Transporter upload to
-# App Store Connect. Sister of recto_ios_redeploy.sh (which produces a
-# Development-signed .app for sideload to the test iPhone) — same
-# project, different cert + profile + entitlements (production push
-# gateway vs sandbox).
+# App Store Connect. The development sideload (a Development-signed .app
+# for the test iPhone) builds the same project with a different cert +
+# profile + entitlements (production push gateway vs sandbox).
 #
 # Why this script exists:
 #   PowerShell → SSH → zsh → MSBuild quoting is hell when the codesign
