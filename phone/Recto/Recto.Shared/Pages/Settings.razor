@@ -10,7 +10,6 @@
 @inject IEnclaveKeyService EnclaveKeys
 @inject ITotpService Totp
 @inject IPinningService Pinning
-@inject IUserPreferencesService Prefs
 @inject IEthSignService EthSigner
 @inject IUnpairService Unpair
 @inject IScreenCaptureGuard ScreenGuard
@@ -26,67 +25,6 @@
             &larr; Back
         </button>
         <h1 class="h4 mb-0">Settings</h1>
-    </div>
-
-    @if (_savedFlash)
-    {
-        <div class="alert alert-success py-2" role="alert">
-            Settings saved.
-        </div>
-    }
-
-    <div class="card mb-3">
-        <div class="card-header py-2">Polling</div>
-        <div class="card-body">
-            <p class="text-muted small mb-2">
-                How often the phone checks the bootloader for pending
-                requests when no push notification has arrived. Sub-second
-                wakeup happens via push when configured; this poll is the
-                fallback for phones without push or for transient push
-                outages.
-            </p>
-            <label class="form-label">Interval</label>
-            <select class="form-select" @bind="_settings.PollingIntervalSeconds"
-                    @bind:after="OnSettingChanged">
-                <option value="2">2 seconds (most responsive, more battery)</option>
-                <option value="3">3 seconds (default)</option>
-                <option value="5">5 seconds (balanced)</option>
-                <option value="10">10 seconds (battery-friendly)</option>
-                <option value="0">Disabled (push only)</option>
-            </select>
-        </div>
-    </div>
-
-    <div class="card mb-3">
-        <div class="card-header py-2">Audit history</div>
-        <div class="card-body">
-            <p class="text-muted small mb-2">
-                Maximum number of past approvals/denials shown in the
-                phone-side history view. Stored on the bootloader; the phone
-                fetches on demand. Larger values mean longer scrollback;
-                bootloader caps at 500 events per phone regardless.
-            </p>
-            <label class="form-label">Display limit</label>
-            <select class="form-select" @bind="_settings.AuditHistoryLimit"
-                    @bind:after="OnSettingChanged">
-                <option value="20">Last 20 events</option>
-                <option value="50">Last 50 events (default)</option>
-                <option value="200">Last 200 events</option>
-            </select>
-        </div>
-    </div>
-
-    <div class="card mb-3">
-        <div class="card-header py-2">Theme</div>
-        <div class="card-body">
-            <label class="form-label">Appearance</label>
-            <select class="form-select" @bind="_settings.ThemePreference"
-                    @bind:after="OnSettingChanged">
-                <option value="system">Match system (default)</option>
-                <option value="light">Always light</option>
-                <option value="dark">Always dark</option>
-            </select>
-        </div>
     </div>
 
     @* ── Recovery phrase (Build 12, 2026-07-11) — backup + restore ──────
@@ -377,8 +315,6 @@
     private IReadOnlyList<RecentErrors.Entry> _recentErrors = RecentErrors.Snapshot();
     private void ClearRecentErrors() { RecentErrors.Clear(); _recentErrors = RecentErrors.Snapshot(); }
 
-    private UserPreferences _settings = new();
-    private bool _savedFlash = false;
     private bool _confirmingUnpair = false;
     private bool _unpairing = false;
     private string? _unpairError;
@@ -630,8 +566,6 @@
 
     protected override async Task OnInitializedAsync()
     {
-        _settings = await Prefs.LoadAsync(CancellationToken.None);
-
         // Per-bootloader unpair card (Build 14): surface only when paired.
         try
         {
@@ -688,16 +622,6 @@
             _confirmingBootUnpair = false;
             StateHasChanged();
         }
-    }
-
-    private async Task OnSettingChanged()
-    {
-        await Prefs.SaveAsync(_settings, CancellationToken.None);
-        _savedFlash = true;
-        StateHasChanged();
-        await Task.Delay(1500);
-        _savedFlash = false;
-        StateHasChanged();
     }
 
     private async Task UnpairAllAsync()

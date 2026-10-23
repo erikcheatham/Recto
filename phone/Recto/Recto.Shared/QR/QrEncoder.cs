@@ -28,8 +28,6 @@ namespace Recto.Shared.QR;
 /// byte-for-byte).
 /// </para>
 /// <para>
-/// Protocol-layer DECODE (canonical-JSON text → validated
-/// <see cref="QRPayloadV1"/>) ships in <see cref="QrDecoder"/>.
 /// Image-pixel SCANNING (camera image → text) remains a
 /// consumer-edge concern — Recto Phone uses MAUI CommunityToolkit's
 /// CameraView + ZXing.Net.Maui or equivalent; the substrate stays

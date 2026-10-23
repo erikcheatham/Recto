@@ -93,15 +93,6 @@ public interface IBootloaderClient
         string bootloaderUrl, PushTokenUpdateRequest request, CancellationToken ct);
 
     /// <summary>
-    /// v0.5+ audit log: returns the most-recent <paramref name="limit"/>
-    /// events the bootloader has recorded for this phone, newest-first.
-    /// Surfaced phone-side as a History view so the operator can verify
-    /// what they've authorized recently.
-    /// </summary>
-    Task<Result<AuditLogResponse>> GetAuditLogAsync(
-        string bootloaderUrl, string phoneId, int limit, CancellationToken ct);
-
-    /// <summary>
     /// Phase H end-user device pairing (2026-05-19). POSTs to the
     /// bootloader's <c>/v0.4/devices/pair</c> relay endpoint with the
     /// signed JWS the phone produced in the "Pair a service" flow.

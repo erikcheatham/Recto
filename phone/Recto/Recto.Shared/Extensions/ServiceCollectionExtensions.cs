@@ -81,13 +81,6 @@ public static class ServiceCollectionExtensions
             return handler;
         });
 
-        // Decorator pipeline (validation + logging) wires in once concrete handlers exist:
-        //   services.Decorate(typeof(ICommandHandler<,>), typeof(ValidationDecorator.CommandHandler<,>));
-        //   services.Decorate(typeof(ICommandHandler<>), typeof(ValidationDecorator.CommandBaseHandler<>));
-        //   services.Decorate(typeof(ICommandHandler<,>), typeof(LoggingDecorator.CommandHandler<,>));
-        //   services.Decorate(typeof(ICommandHandler<>), typeof(LoggingDecorator.CommandBaseHandler<>));
-        //   services.Decorate(typeof(IQueryHandler<,>), typeof(LoggingDecorator.QueryHandler<,>));
-
         return services;
     }
 }

@@ -179,7 +179,7 @@ without a biometric.
 
 ## Install
 
-Python 3.10+.
+Python 3.12+.
 
 ```bash
 git clone https://github.com/erikcheatham/Recto.git
@@ -223,12 +223,15 @@ and your app both need the same value; hand it over through a channel you trust.
 The operator declares your agent identity when creating the server:
 
 ```python
-from recto.bootloader import create_server
-from recto.bootloader.state import AppContext
+from pathlib import Path
+
+from recto.bootloader.server import create_server
+from recto.bootloader.state import AppContext, StateStore
 
 server = create_server(
-    port=8765,
-    state_dir="~/.recto/bootloader",
+    bind_host="127.0.0.1",
+    bind_port=8765,
+    state=StateStore(Path("~/.recto/bootloader").expanduser()),
     capability_agent_tokens={"your-app-agent": "<the 64-hex token>"},
     principal_apps={
         "your-app-agent": AppContext(

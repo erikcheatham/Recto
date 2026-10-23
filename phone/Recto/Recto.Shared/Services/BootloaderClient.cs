@@ -261,24 +261,6 @@ public sealed class BootloaderClient : IBootloaderClient
         return SendSignedReadAsync<PushTokenUpdateResponse>(HttpMethod.Post, url, request, request.PhoneId, "/v0.4/manage/push_token", ct);
     }
 
-    public Task<Result<AuditLogResponse>> GetAuditLogAsync(
-        string bootloaderUrl, string phoneId, int limit, CancellationToken ct)
-    {
-        if (string.IsNullOrWhiteSpace(bootloaderUrl))
-        {
-            return Task.FromResult(Result.Failure<AuditLogResponse>(
-                Error.Validation([new ValidationErrors("bootloaderUrl", "Bootloader URL is required.")])));
-        }
-        if (string.IsNullOrWhiteSpace(phoneId))
-        {
-            return Task.FromResult(Result.Failure<AuditLogResponse>(
-                Error.Validation([new ValidationErrors("phoneId", "Phone ID is required.")])));
-        }
-
-        var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/manage/audit?phone_id={Uri.EscapeDataString(phoneId)}&limit={limit}";
-        return SendAsync<AuditLogResponse>(HttpMethod.Get, url, body: null, ct);
-    }
-
     public Task<Result<DevicesPairResponse>> PairDeviceAsync(
         string bootloaderUrl, DevicesPairRequest request, CancellationToken ct)
     {

@@ -4,11 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recto-core"
-# PACKAGING.md → "PyPI package name: recto-core". The historical name
-# "recto" in this file's prior versions was a placeholder; canonical
-# distribution name at v1.0 is recto-core (the Substrate tier).
-# The Python import name remains `recto` (per repo layout); PyPI users
-# install via `pip install recto-core` and import as `import recto`.
+# Installed as `pip install recto-core`; imported as `import recto`.
 version = "1.0.0"
 description = "Phone-enclave-rooted capability authorization substrate for autonomous agents. Cross-platform service supervision, vault-backed secrets, capability JWS verification."
 readme = "README.md"
@@ -41,32 +37,26 @@ dev = [
     "ruff>=0.3",
     "types-PyYAML>=6.0",
 ]
-aws = ["boto3>=1.34"]
-vault = ["hvac>=2.0"]
 azure = [
     "azure-identity>=1.17",         # DefaultAzureCredential (Managed Identity chain)
     "azure-keyvault-secrets>=4.8",  # SecretClient
 ]  # `pip install recto[azure]` enables the azure-keyvault SecretSource
-   # (recto.secrets.azure_keyvault.AzureKeyVaultSource) -- the production
-   # cloud vault for load-balanced deployments where dpapi-machine's
-   # Windows-machine-bound blobs can't roam. One shared Key Vault +
-   # Managed Identity; see docs/production-scale-brief.md.
-keychain = []  # macOS uses /usr/bin/security CLI (stdlib only)
-secret-service = ["secretstorage>=3.3"]
+   # (recto.secrets.azure_keyvault.AzureKeyVaultSource) -- the cloud vault
+   # for load-balanced deployments where dpapi-machine's
+   # Windows-machine-bound blobs can't roam: one shared Key Vault +
+   # Managed Identity.
 postgres = [
     "psycopg[binary,pool]>=3.1",  # PostgresStateStore -- shared-state backend
-]
+]  # `pip install recto[postgres]` enables the multi-instance state backend
+   # (recto.bootloader.state_postgres.PostgresStateStore): N bootloader
+   # instances behind a load balancer sharing one Postgres database. The
+   # file-backed StateStore stays the zero-setup default.
 push = [
     "httpx[http2]>=0.27",  # APNs is HTTP/2-only; FCM rides the same client
 ]  # `pip install recto[push]` enables the bootloader's silent-push wake
    # senders (recto.bootloader.push): APNs + FCM send-side so queued
    # requests wake the target phone instead of relying on tight polling.
-   # JWT minting for provider auth uses pyjwt[crypto] from recto[v0_4].  # `pip install recto[postgres]` enables the production multi-instance
-   # state backend (recto.bootloader.state_postgres.PostgresStateStore):
-   # N bootloader instances behind a load balancer sharing one Postgres
-   # database. The file-backed StateStore stays the zero-setup default;
-   # this extra is opt-in production config. See
-   # docs/production-scale-brief.md for the deployment shape.
+   # JWT minting for provider auth uses pyjwt[crypto] from recto[v0_4].
 otel = [
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
@@ -139,30 +129,16 @@ qr = [
     "qrcode>=7.4",  # BSD-licensed, mainline Python QR encoder
     "Pillow>=10.0", # HPND-licensed, required by qrcode for PNG output
 ]
-   # `pip install recto[qr]` enables the QR-as-visual-transport
-   # substrate primitive (recto.qr module: encode signed JWS payloads
-   # or structured QRPayloadV1 envelopes as QR PNG/SVG images;
-   # multi-witness contract operations for chain-of-trust artifacts
-   # that grow as witnesses sign). Phase 1 of the artifact-as-
-   # canonical-record pivot (Hard Rule #13, docs/hard-rules.md).
-   # v1 ships ENCODE-only (PNG + SVG output via qrcode + Pillow);
-   # decode (QR image -> JWS string) is deferred to v2 because Recto
-   # Phone has its own native QR scanner via MAUI Blazor and Python
-   # decode would require pyzbar/zxing-cpp (native deps). Canonical
-   # consumers: Recto Phone v1.1 TLS pin disclosure (Phase 4 polish
-   # via the recto/qr/ substrate); consumer citation receipts; THRU
-   # transaction receipts; Creator's Corner v2 agent leases;
-   # chat-tier civic-office model promotion certificates; Hard Rule
-   # #24 manumission ceremony multi-witness contracts. SVG output
-   # available via qrcode's built-in SVG factory (no Pillow dep for
-   # that path). See recto/qr/SPEC.md for the wire-format spec.
+   # `pip install recto[qr]` enables the QR transport (recto.qr: signed
+   # JWS payloads and QRPayloadV1 envelopes as PNG or SVG, and
+   # multi-witness contracts; hard rule 13). Encode only. The wire format
+   # is recto/qr/SPEC.md.
 
 [project.urls]
 Homepage = "https://github.com/erikcheatham/Recto"
 Repository = "https://github.com/erikcheatham/Recto"
 Issues = "https://github.com/erikcheatham/Recto/issues"
 Documentation = "https://github.com/erikcheatham/Recto/blob/main/README.md"
-Changelog = "https://github.com/erikcheatham/Recto/blob/main/CHANGELOG.md"
 
 [project.scripts]
 recto = "recto.cli:main"
@@ -199,9 +175,6 @@ addopts = "-ra --strict-markers"
 
 [tool.coverage.run]
 source = ["recto"]
-# `_launcher_part2.py` was a transitional stub from v0.1; exclude in
-# case it ever resurfaces in a stale checkout.
-omit = ["recto/_launcher_part2.py"]
 
 [tool.coverage.report]
 # The Win32 ctypes blocks in joblimit.py + secrets/credman.py and the

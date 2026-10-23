@@ -129,9 +129,6 @@ public static class MauiProgram
         // entry (recto.phone.eth.mnemonic.{alias}). Cross-platform
         // singleton; secp256k1 + Keccak-256 reuse EthSigningOps directly.
         builder.Services.AddSingleton<ITronSignService, MauiTronSignService>();
-        // v0.4.1 user preferences (polling interval, history limit, theme).
-        // MAUI Preferences-backed (not SecureStorage; not secret).
-        builder.Services.AddSingleton<IUserPreferencesService, MauiUserPreferencesService>();
 
         // Task #22 Phase 1 (banked 2026-05-31): recto://pair?... URL-
         // scheme deep-link state holder. Platform-specific URL handlers
