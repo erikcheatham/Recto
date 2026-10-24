@@ -456,13 +456,11 @@ class TestRespondLiveServerTron:
             },
         )
         assert status >= 400
-        ev = info["captured"][0]
-        assert ev["ok"] is False
-        assert "signature verification failed" in (ev["reason"] or "")
-        # Forged-envelope path must NOT leak a tron_signature_rsv to
-        # the resolver; only verified-and-approved tron_sign reaches
-        # the rsv-extraction stage.
-        assert ev["tron_signature_rsv"] is None
+        # A forged envelope is not an answer: it neither reaches the resolver
+        # (so no tron_signature_rsv leaks) nor takes the card, which the real
+        # phone can still answer.
+        assert info["captured"] == []
+        assert info["state"].peek_pending(req.request_id) is not None
 
     def test_non_tron_single_sign_regression(self, live_server):
         # Plain single_sign request (no tron_*) must still work and

@@ -1667,6 +1667,10 @@ class ProfileCreateResult:
     reason: str | None
     resolved_at_unix: int
     expires_at_unix: int
+    # The agent that submitted the request: the only one that may read the
+    # result. Defaulted only so an older stored result still loads; the
+    # server refuses a result without one.
+    agent_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -1715,6 +1719,7 @@ class ProfileAddDeviceResult:
     reason: str | None
     resolved_at_unix: int
     expires_at_unix: int
+    agent_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -1764,6 +1769,7 @@ class ProfileRevokeDeviceResult:
     reason: str | None
     resolved_at_unix: int
     expires_at_unix: int
+    agent_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -2005,6 +2011,19 @@ class StateStoreBase(ABC):
     def is_revoked(self, jti: str) -> bool: ...
     @abstractmethod
     def list_revocations(self) -> list[RevocationEntry]: ...
+
+    def consume_single_use_capability(self, entry: RevocationEntry) -> bool:
+        """Spend a ``max_uses=1`` capability once: True the first time, False after.
+
+        The spent jti rides the revocation list, so it lasts until the token's own
+        exp. The check and the insert run under the registry lock, which is one
+        critical section on the file backend and across Postgres instances.
+        """
+        with self.registry_lock():
+            if self.is_revoked(entry.jti):
+                return False
+            self.add_revocation(entry)
+            return True
 
     # THE USER-VAULT GRANTS (2026-10-17, R-series step 2). A grant is a dict: grant_id, record (the signed
     # GrantRecord fields), signature_b64u, signer_phone_ref, admitted_at_unix. One live grant per (consumer, subject,

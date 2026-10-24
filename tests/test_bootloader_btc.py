@@ -459,7 +459,9 @@ class TestBtcEndToEnd:
         )
         assert status == 400
         assert "approved-response signature invalid" in resp["detail"]
-        assert ctx["captured"][0]["ok"] is False
+        # Not an answer from the phone: nothing resolved, the card still queued.
+        assert ctx["captured"] == []
+        assert ctx["state"].peek_pending(req.request_id) is not None
 
     def test_existing_eth_path_unaffected(self, live_server: dict[str, Any]):
         """Regression: btc_sign wiring shouldn't have broken eth_sign."""

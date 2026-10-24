@@ -985,6 +985,29 @@ def test_profile_create_result_ownership_pin(profile_server):
         )
         assert status == 200
         assert body["status"] == "pending"
+
+        # The pin holds after resolution too: the second agent gets the same
+        # 404 and cannot take the submitter's result.
+        status, _ = _http_post(
+            f"{profile_server['base_url']}/v0.4/respond/{request_id}",
+            {"decision": "denied", "reason": "operator declined"},
+        )
+        assert status == 200
+        status, body = _http_get(
+            f"{profile_server['base_url']}/v0.4/profile/result/{request_id}",
+            headers={
+                "X-Recto-Agent-Id": "second-agent",
+                "X-Recto-Agent-Token": "second-token-" + "y" * 16,
+            },
+        )
+        assert status == 404
+        assert body["error"] == "request_not_found"
+        status, body = _http_get(
+            f"{profile_server['base_url']}/v0.4/profile/result/{request_id}",
+            headers=_agent_headers(),
+        )
+        assert status == 200
+        assert body["status"] == "denied"
     finally:
         BootloaderHandler.config.capability_agent_tokens.pop("second-agent", None)
 

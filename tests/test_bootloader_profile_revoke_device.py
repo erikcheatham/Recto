@@ -63,6 +63,8 @@ from recto.profile.manage import (
 
 AGENT_ID = "test-revdev-agent"
 AGENT_TOKEN = "test-revdev-token-" + "x" * 16
+SECOND_AGENT_ID = "test-revdev-second-agent"
+SECOND_AGENT_TOKEN = "test-revdev-second-token-" + "y" * 16
 
 
 def _b64u_encode(b: bytes) -> str:
@@ -222,7 +224,7 @@ def revdev_server(tmp_path: Path, operator_keypair):
         challenges=ChallengeStore(),
         ssl_context=None,
         capability_operator_pubkey=pub_bytes,
-        capability_agent_tokens={AGENT_ID: AGENT_TOKEN},
+        capability_agent_tokens={AGENT_ID: AGENT_TOKEN, SECOND_AGENT_ID: SECOND_AGENT_TOKEN},
     )
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
@@ -573,6 +575,14 @@ def test_full_denial_does_not_modify_device_ids(revdev_server):
         {"decision": "denied", "reason": "operator declined"},
     )
     assert code == 200
+
+    # Another agent with valid auth can neither read nor take the result.
+    code, body = _http_get(
+        f"{ctx['base_url']}/v0.4/profile/revoke-device-result/{request_id}",
+        headers=_agent_headers(agent_id=SECOND_AGENT_ID, agent_token=SECOND_AGENT_TOKEN),
+    )
+    assert code == 404
+    assert body["error"] == "request_not_found"
 
     code, body = _http_get(
         f"{ctx['base_url']}/v0.4/profile/revoke-device-result/{request_id}",

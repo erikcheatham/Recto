@@ -30,7 +30,7 @@ import hashlib
 import json
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
@@ -459,6 +459,60 @@ class TestSecretReadEndpoint:
         )
         assert status == 401
         assert body["error"] == "capability_jws_invalid"
+
+    def test_audience_without_the_vault_returns_401(self, gate_server):
+        ctx = gate_server
+        jws = _mint_jws(replace(_starter_claims(), aud=["consumer-app"]), ctx["priv_int"])
+        status, body = _http_post_json(
+            f"{ctx['base_url']}/v0.4/secrets/read",
+            {"capability_jws": jws, "service": "consumer-app", "secret_name": "STRIPE_KEY"},
+        )
+        assert status == 401
+        assert body["error"] == "capability_jws_invalid"
+        assert "aud" in body["detail"].lower()
+
+    def test_a_single_use_capability_reads_once(self, gate_server):
+        ctx = gate_server
+        jws = _mint_jws(replace(_starter_claims(), max_uses=1), ctx["priv_int"])
+        read = {"capability_jws": jws, "service": "consumer-app", "secret_name": "STRIPE_KEY"}
+        first_status, first_body = _http_post_json(f"{ctx['base_url']}/v0.4/secrets/read", read)
+        second_status, second_body = _http_post_json(f"{ctx['base_url']}/v0.4/secrets/read", read)
+        assert first_status == 200
+        assert first_body["value"] == "sk_test_consumer_stripe"
+        assert second_status == 401
+        assert second_body["error"] == "capability_revoked"
+
+    def test_a_refused_read_does_not_spend_a_single_use_capability(self, gate_server):
+        ctx = gate_server
+        jws = _mint_jws(replace(_starter_claims(), max_uses=1), ctx["priv_int"])
+        status, _ = _http_post_json(
+            f"{ctx['base_url']}/v0.4/secrets/read",
+            {"capability_jws": jws, "service": "consumer-app", "secret_name": "NO_SUCH_SECRET"},
+        )
+        assert status == 404
+        status, body = _http_post_json(
+            f"{ctx['base_url']}/v0.4/secrets/read",
+            {"capability_jws": jws, "service": "consumer-app", "secret_name": "STRIPE_KEY"},
+        )
+        assert status == 200
+        assert body["value"] == "sk_test_consumer_stripe"
+
+    def test_max_uses_above_one_returns_401(self, gate_server):
+        ctx = gate_server
+        jws = _mint_jws(replace(_starter_claims(), max_uses=5), ctx["priv_int"])
+        status, body = _http_post_json(
+            f"{ctx['base_url']}/v0.4/secrets/read",
+            {"capability_jws": jws, "service": "consumer-app", "secret_name": "STRIPE_KEY"},
+        )
+        assert status == 401
+        assert body["error"] == "capability_jws_invalid"
+
+    def test_a_reusable_capability_reads_again(self, gate_server):
+        ctx = gate_server
+        jws = _mint_jws(_starter_claims(), ctx["priv_int"])
+        read = {"capability_jws": jws, "service": "consumer-app", "secret_name": "STRIPE_KEY"}
+        assert _http_post_json(f"{ctx['base_url']}/v0.4/secrets/read", read)[0] == 200
+        assert _http_post_json(f"{ctx['base_url']}/v0.4/secrets/read", read)[0] == 200
 
     def test_revoked_jti_returns_401(self, gate_server, tmp_path,
                                       operator_keypair, template_manifest):

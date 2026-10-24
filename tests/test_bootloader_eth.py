@@ -549,7 +549,9 @@ class TestEthEndToEnd:
         )
         assert status == 400
         assert "approved-response signature invalid" in resp["detail"]
-        assert ctx["captured"][0]["ok"] is False
+        # Not an answer from the phone: nothing resolved, the card still queued.
+        assert ctx["captured"] == []
+        assert ctx["state"].peek_pending(req.request_id) is not None
 
     def test_non_eth_request_still_resolves_without_rsv(
         self, live_server: dict[str, Any]

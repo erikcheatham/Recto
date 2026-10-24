@@ -69,6 +69,8 @@ from recto.profile.manage import (
 
 AGENT_ID = "test-adddev-agent"
 AGENT_TOKEN = "test-adddev-token-" + "x" * 16
+SECOND_AGENT_ID = "test-adddev-second-agent"
+SECOND_AGENT_TOKEN = "test-adddev-second-token-" + "y" * 16
 
 
 def _b64u_encode(b: bytes) -> str:
@@ -211,7 +213,7 @@ def adddev_server(tmp_path: Path, operator_keypair):  # noqa: F811
         challenges=ChallengeStore(),
         ssl_context=None,
         capability_operator_pubkey=pub_bytes,
-        capability_agent_tokens={AGENT_ID: AGENT_TOKEN},
+        capability_agent_tokens={AGENT_ID: AGENT_TOKEN, SECOND_AGENT_ID: SECOND_AGENT_TOKEN},
     )
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
@@ -543,6 +545,14 @@ def test_full_denial_does_not_modify_device_ids(adddev_server):
         {"decision": "denied", "reason": "operator declined"},
     )
     assert code == 200
+
+    # Another agent with valid auth can neither read nor take the result.
+    code, body = _http_get(
+        f"{ctx['base_url']}/v0.4/profile/add-device-result/{request_id}",
+        headers=_agent_headers(agent_id=SECOND_AGENT_ID, agent_token=SECOND_AGENT_TOKEN),
+    )
+    assert code == 404
+    assert body["error"] == "request_not_found"
 
     # GET shows denied
     code, body = _http_get(

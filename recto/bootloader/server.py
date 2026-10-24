@@ -119,6 +119,19 @@ POLL_SIG_HEADER = "X-Recto-Phone-Sig"
 POLL_SIG_TS_HEADER = "X-Recto-Phone-Ts"
 POLL_SIG_FRESHNESS_SECONDS = 120
 
+# The most a JSON request body may declare. A larger body is refused with
+# 413 before it is read, and the connection closes so its unread bytes can
+# never be taken for a next request.
+MAX_JSON_BODY_BYTES = 1024 * 1024
+
+# Seconds a connection may sit idle on a read or a write before it closes.
+REQUEST_SOCKET_TIMEOUT_SECONDS = 30
+
+
+class RequestBodyTooLargeError(Exception):
+    """A request declared a body over MAX_JSON_BODY_BYTES."""
+
+
 # The poll-key delegation (2026-09-21, hard rule 14.2). The
 # identity key is per-use biometric-gated on both shipped platforms, so
 # it cannot sign a poll tick. At registration the phone MAY carry a
@@ -920,6 +933,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     # Override the default banner to not leak Python version.
     server_version = "RectoBootloader/0.4"
     sys_version = ""
+    # StreamRequestHandler applies this to the connection: a client that
+    # stops sending (or reading) closes after it, never holding a thread.
+    timeout = REQUEST_SOCKET_TIMEOUT_SECONDS
 
     config: BootloaderConfig = BootloaderConfig()
 
@@ -1215,6 +1231,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 self._handle_clusters_reap()
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
+        except RequestBodyTooLargeError:
+            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                "error": "request_body_too_large",
+                "detail": f"a JSON body may be at most {MAX_JSON_BODY_BYTES} bytes",
+            })
         except RegistryLockUnavailable as e:
             print(f"[bootloader] registry lock unavailable on {url.path}: {e}", flush=True)
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "registry_busy", "detail": str(e)})
@@ -2862,13 +2883,22 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.GONE, {"error": "top_plane_card_expired",
                                               "detail": "this act or reset is closed; start it again"})
             return
-        req = cfg.state.take_pending(request_id)
+        # The card is read, not taken: only an answer that holds up takes it, so a
+        # malformed decision or an approval that does not verify leaves the card
+        # for the phone to answer.
+        req = cfg.state.peek_pending(request_id)
         if req is None:
             raise PendingRequestNotFoundError(
                 f"request_id {request_id!r} not found"
             )
         decision = body.get("decision", "")
+        if decision not in ("approved", "denied"):
+            raise BootloaderError(f"unknown decision {decision!r}")
         if decision == "denied":
+            if cfg.state.take_pending(request_id) is None:
+                raise PendingRequestNotFoundError(
+                    f"request_id {request_id!r} not found"
+                )
             # Operator declined; surface to whoever is awaiting the
             # response. The waiting mechanism (an in-process Future or
             # similar) is the launcher's responsibility; the bootloader
@@ -2916,8 +2946,6 @@ class BootloaderHandler(BaseHTTPRequestHandler):
                 )
             self._send_json(HTTPStatus.OK, {"resolved": True})
             return
-        if decision != "approved":
-            raise BootloaderError(f"unknown decision {decision!r}")
         sig = body.get("signature_b64u", "")
         phone = cfg.state.get_phone(req.phone_id)
         if phone is None:
@@ -2943,11 +2971,13 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             algorithm=phone_algo,
         )
         if not ok:
-            self._notify_resolved(req, ok=False, signature_b64u=None,
-                                  eth_signature_rsv=None,
-                                  btc_signature_base64=None,
-                                  reason="signature verification failed")
+            # Not an answer from the paired phone: nothing is resolved and the
+            # card stays on the queue.
             raise BootloaderError("approved-response signature invalid")
+        if cfg.state.take_pending(request_id) is None:
+            raise PendingRequestNotFoundError(
+                f"request_id {request_id!r} not found"
+            )
         # Extract the Ethereum signature when the kind is eth_sign. Per
         # the protocol RFC the bootloader does NOT validate the secp256k1
         # signature itself — that's the consumer's responsibility (smart
@@ -6332,7 +6362,13 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND,
                             {"error": "request_not_found"})
             return
-        # Result found — single-use semantics: take the result so
+        # Result found — enforce agent ownership before disclosing. A result
+        # with no recorded owner is nobody's to read.
+        if result.agent_id != agent_id:
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
+        # Single-use semantics: take the result so
         # subsequent fetches return 404. Caller is responsible for
         # caching the profile_id locally if it needs to re-use it.
         # Note: the profile itself is persisted in master_identity.json
@@ -6420,6 +6456,10 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND,
                             {"error": "request_not_found"})
             return
+        if result.agent_id != agent_id:
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
         cfg.state.take_profile_add_device_result(request_id)
         out: dict[str, Any] = {"status": result.status}
         if result.profile_id is not None:
@@ -6496,6 +6536,10 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND,
                             {"error": "request_not_found"})
             return
+        if result.agent_id != agent_id:
+            self._send_json(HTTPStatus.NOT_FOUND,
+                            {"error": "request_not_found"})
+            return
         cfg.state.take_profile_revoke_device_result(request_id)
         out: dict[str, Any] = {"status": result.status}
         if result.profile_id is not None:
@@ -6535,6 +6579,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             reason=reason,
             resolved_at_unix=now,
             expires_at_unix=now + ttl,
+            agent_id=req.cap_agent_id,
         )
         cfg.state.put_profile_create_result(result)
 
@@ -6571,6 +6616,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             reason=reason,
             resolved_at_unix=now,
             expires_at_unix=now + ttl,
+            agent_id=req.cap_agent_id,
         )
         cfg.state.put_profile_add_device_result(result)
 
@@ -6606,6 +6652,7 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             reason=reason,
             resolved_at_unix=now,
             expires_at_unix=now + ttl,
+            agent_id=req.cap_agent_id,
         )
         cfg.state.put_profile_revoke_device_result(result)
 
@@ -6829,9 +6876,11 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         bootloader:
 
         1. Verifies the JWS against ``cfg.capability_operator_pubkey``
-           (returns 401 on signature failure / expired exp / wrong aud).
-        2. Checks ``jti`` against ``cfg.capability_revocation_jtis``
-           (returns 401 if revoked).
+           with audience ``recto:vault`` (returns 401 on signature failure,
+           expired exp, an audience without ``recto:vault``, or a
+           ``max_uses`` other than 1 or absent).
+        2. Checks ``jti`` against the state store's revocation list
+           (returns 401 if revoked or already spent).
         3. Loads the manifest from ``cfg.capability_manifest`` and
            evaluates ``secret:read`` against the JWT's scope (returns
            403 if the action isn't permitted).
@@ -6841,7 +6890,9 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         5. Looks up ``(service, secret_name)`` in
            ``cfg.capability_vault_secrets`` (returns 404 if not
            present).
-        6. Returns ``200 + {value}``.
+        6. Spends a ``max_uses=1`` capability (a second read with it is
+           401); an absent ``max_uses`` stays reusable until exp.
+        7. Returns ``200 + {value}``.
 
         Endpoint is disabled (returns 404) when
         ``cfg.capability_vault_secrets`` is empty.
@@ -6879,11 +6930,21 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         # 1. Verify the JWS signature + standard time bounds.
         from recto.capability.jwt import verify_jws as _verify_jws
         try:
-            claims = _verify_jws(jws, expected_pubkey=cfg.capability_operator_pubkey)
+            claims = _verify_jws(
+                jws,
+                expected_pubkey=cfg.capability_operator_pubkey,
+                expected_aud="recto:vault",
+            )
         except ValueError as exc:
             self._send_json(HTTPStatus.UNAUTHORIZED, {
                 "error": "capability_jws_invalid",
                 "detail": str(exc),
+            })
+            return
+        if claims.max_uses not in (None, 1):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {
+                "error": "capability_jws_invalid",
+                "detail": "claims: max_uses must be 1 or absent",
             })
             return
 
@@ -6933,9 +6994,29 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 6. Return value. Cache-Control no-store -- callers MUST NOT
-        # cache secret values; the capability JWT's lifetime is the
-        # only bound on usage.
+        # 6. Spend a single-use capability, last: a read refused above never
+        # spends it. The spend is atomic in the state store.
+        if claims.max_uses == 1:
+            if cfg.state is None:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "error": "state_store_not_configured",
+                })
+                return
+            spent = cfg.state.consume_single_use_capability(RevocationEntry(
+                jti=claims.jti,
+                revoked_at_unix=int(time.time()),
+                original_exp_unix=claims.exp,
+                reason="single-use capability spent",
+            ))
+            if not spent:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {
+                    "error": "capability_revoked",
+                    "jti": claims.jti,
+                })
+                return
+
+        # 7. Return value. Cache-Control no-store -- callers MUST NOT
+        # cache secret values; a reusable capability is bounded by its exp.
         out: dict[str, Any] = {
             "value": value,
             "service": service,
@@ -8665,7 +8746,15 @@ class BootloaderHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _read_json_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise BootloaderError("Content-Length must be an integer") from exc
+        if length > MAX_JSON_BODY_BYTES:
+            # Refused before any byte is read; closing the connection keeps the
+            # unread body from being parsed as a next request.
+            self.close_connection = True
+            raise RequestBodyTooLargeError
         if length <= 0:
             return {}
         raw = self.rfile.read(length)

@@ -125,7 +125,7 @@ def _starter_claims(*, exp_offset_seconds: int = 86400, jti: str | None = None) 
     return CapabilityClaims(
         iss="phone:operator:enclave",
         sub="agent:darwin@staging",
-        aud=["consumer-app"],
+        aud=["consumer-app", "recto:vault"],
         iat=now,
         nbf=now,
         exp=now + exp_offset_seconds,
