@@ -2345,6 +2345,14 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             # server error.
             return False
 
+    def _send_denial_unsigned(self) -> None:
+        """401 for a denial without a fresh poll-key signature: _required when none was sent, _invalid when one was."""
+        sent = any((self.headers.get(h) or "").strip() for h in (POLL_SIG_HEADER, POLL_SIG_TS_HEADER))
+        self._send_json(HTTPStatus.UNAUTHORIZED, {
+            "error": "response_signature_invalid" if sent else "response_signature_required",
+            "detail": "a denial needs a fresh signature by the carded phone's poll key over the request path",
+        })
+
     # ------------------------------------------------------------------
     # POST /v0.4/manage/push_token
     # ------------------------------------------------------------------
@@ -2894,7 +2902,17 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         decision = body.get("decision", "")
         if decision not in ("approved", "denied"):
             raise BootloaderError(f"unknown decision {decision!r}")
+        phone = cfg.state.get_phone(req.phone_id)
+        if phone is None:
+            raise UnknownPhoneError(f"phone {req.phone_id!r} no longer registered")
         if decision == "denied":
+            # A denial carries no identity-key signature, so the carded phone's
+            # delegated poll key signs its path (rule 14.2), in every poll mode:
+            # the mode governs reads, never who may resolve a card. A denial
+            # without a fresh one leaves the card.
+            if not self._poll_signature_valid(phone, f"/v0.4/respond/{request_id}"):
+                self._send_denial_unsigned()
+                return
             if cfg.state.take_pending(request_id) is None:
                 raise PendingRequestNotFoundError(
                     f"request_id {request_id!r} not found"
@@ -2947,9 +2965,6 @@ class BootloaderHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"resolved": True})
             return
         sig = body.get("signature_b64u", "")
-        phone = cfg.state.get_phone(req.phone_id)
-        if phone is None:
-            raise UnknownPhoneError(f"phone {req.phone_id!r} no longer registered")
         # Verify the phone's signature over the payload hash.
         # The phone signs the BLAKE2b-256 hash, not the raw payload,
         # so we verify against the hash bytes.
@@ -8056,15 +8071,41 @@ class BootloaderHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.OK, out)
 
     def _handle_user_vault_grant_request_deny(self, body: dict[str, Any]) -> None:
-        """POST /v0.4/user-vault/grant-request/deny - body {request_id}. The phone's Deny (or the platform withdrawing
-        its own request): the request leaves the phone and its words are dropped. The id is the 128-bit name only the
-        phone's signed poll and the raising platform hold; a deny grants nothing, so it needs no signature."""
+        """POST /v0.4/user-vault/grant-request/deny - body {request_id}. The bound phone's Deny, its delegated poll key
+        signing this path (rule 14.2); or the raising platform withdrawing its own request, by its agent token with the
+        same subject and consumer. The request leaves the phone and its words are dropped. The id alone resolves
+        nothing: no credential is a 401, and another platform's or subject's request reads as unknown (404)."""
         cfg = self.config
         if not cfg.user_vault_path or cfg.user_vault_grant_requests is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"})
             return
+        phone_signed = any((self.headers.get(h) or "").strip() for h in (POLL_SIG_HEADER, POLL_SIG_TS_HEADER))
+        agent_id = self.headers.get("X-Recto-Agent-Id", "").strip()
+        if not phone_signed and not (agent_id or self.headers.get("X-Recto-Agent-Token", "").strip()):
+            self._send_denial_unsigned()
+            return
         rid = body.get("request_id")
-        ok = isinstance(rid, str) and cfg.user_vault_grant_requests.deny(rid)
+        req = cfg.user_vault_grant_requests.get(rid) if isinstance(rid, str) else None
+        if req is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "grant_request_unknown"})
+            return
+        if phone_signed:
+            phone = cfg.state.get_phone(req.phone_id)
+            if phone is None or not self._poll_signature_valid(phone, "/v0.4/user-vault/grant-request/deny"):
+                self._send_denial_unsigned()
+                return
+        else:
+            platform = self._user_vault_agent_platform()
+            if platform is None:
+                return
+            subject = self._user_vault_subject()
+            if subject is None:
+                return
+            if (req.agent_id != agent_id or req.subject != subject
+                    or req.consumer != cfg.user_vault_platform_consumers.get(platform)):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "grant_request_unknown"})
+                return
+        ok = cfg.user_vault_grant_requests.deny(rid)
         self._send_json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND,
                         {"denied": True} if ok else {"error": "grant_request_unknown"})
 

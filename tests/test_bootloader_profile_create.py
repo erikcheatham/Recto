@@ -64,6 +64,7 @@ from recto.profile.manage import (
     _next_profile_index,
 )
 from recto.profile.store import load_master_identity, master_identity_path
+from tests.test_bootloader_signed_polls import _denial_headers, _make_keypair
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +215,12 @@ def profile_server(tmp_path: Path, operator_keypair):
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
+    poll_priv, poll_pub_b64u = _make_keypair()
     phone = PhoneRegistration.new(
         public_key_b64u=_b64u_encode(ed_pub_bytes),
         supported_algorithms=("ed25519",),
         device_label="test-phone",
+        poll_public_key_b64u=poll_pub_b64u,
     )
     state.register_phone(phone)
 
@@ -244,6 +247,7 @@ def profile_server(tmp_path: Path, operator_keypair):
             "pub_bytes": pub_bytes,
             "phone_id": phone.phone_id,
             "ed_priv": ed_priv,
+            "poll_priv": poll_priv,
             "ed_pub_bytes": ed_pub_bytes,
             "master_identity": mi,
         }
@@ -915,13 +919,15 @@ def test_profile_create_denied_by_operator(profile_server):
     assert status == 201
     request_id = body["request_id"]
 
-    # Operator denies via respond — no signatures needed for denied path.
+    # Operator denies via respond: the poll key signs the denial's path.
+    path = f"/v0.4/respond/{request_id}"
     status, body = _http_post(
-        f"{profile_server['base_url']}/v0.4/respond/{request_id}",
+        f"{profile_server['base_url']}{path}",
         {
             "decision": "denied",
             "reason": "Operator rejected the proposed kind",
         },
+        headers=_denial_headers(profile_server["poll_priv"], profile_server["phone_id"], path),
     )
     assert status == 200
     assert body["resolved"] is True
@@ -988,9 +994,11 @@ def test_profile_create_result_ownership_pin(profile_server):
 
         # The pin holds after resolution too: the second agent gets the same
         # 404 and cannot take the submitter's result.
+        path = f"/v0.4/respond/{request_id}"
         status, _ = _http_post(
-            f"{profile_server['base_url']}/v0.4/respond/{request_id}",
+            f"{profile_server['base_url']}{path}",
             {"decision": "denied", "reason": "operator declined"},
+            headers=_denial_headers(profile_server["poll_priv"], profile_server["phone_id"], path),
         )
         assert status == 200
         status, body = _http_get(

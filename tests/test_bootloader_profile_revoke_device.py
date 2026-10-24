@@ -54,6 +54,7 @@ from recto.profile.manage import (
     get_profile_by_id,
     mark_profile_revoked,
 )
+from tests.test_bootloader_signed_polls import _denial_headers, _make_keypair
 
 
 # ---------------------------------------------------------------------------
@@ -168,18 +169,23 @@ def revdev_server(tmp_path: Path, operator_keypair):
     from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.hazmat.primitives import serialization
 
+    poll_privs: dict[str, Any] = {}
+
     def _make_phone(label: str) -> tuple[PhoneRegistration, Any]:
         ed_priv = ed25519.Ed25519PrivateKey.generate()
         ed_pub_bytes = ed_priv.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
+        poll_priv, poll_pub_b64u = _make_keypair()
         phone = PhoneRegistration.new(
             public_key_b64u=_b64u_encode(ed_pub_bytes),
             supported_algorithms=("ed25519",),
             device_label=label,
+            poll_public_key_b64u=poll_pub_b64u,
         )
         state.register_phone(phone)
+        poll_privs[phone.phone_id] = poll_priv
         return phone, ed_priv
 
     master_phone, master_ed_priv = _make_phone("test-master-phone")
@@ -239,6 +245,7 @@ def revdev_server(tmp_path: Path, operator_keypair):
             "pub_bytes": pub_bytes,
             "master_phone_id": master_phone.phone_id,
             "master_ed_priv": master_ed_priv,
+            "poll_privs": poll_privs,
             "laptop_phone_id": laptop_phone.phone_id,
             "pixel_phone_id": pixel_phone.phone_id,
             "other_phone_id": other_phone.phone_id,
@@ -570,9 +577,11 @@ def test_full_denial_does_not_modify_device_ids(revdev_server):
         headers=_agent_headers(),
     )
     request_id = post_body["request_id"]
+    path = f"/v0.4/respond/{request_id}"
     code, _ = _http_post(
-        f"{ctx['base_url']}/v0.4/respond/{request_id}",
+        f"{ctx['base_url']}{path}",
         {"decision": "denied", "reason": "operator declined"},
+        headers=_denial_headers(ctx["poll_privs"][ctx["master_phone_id"]], ctx["master_phone_id"], path),
     )
     assert code == 200
 

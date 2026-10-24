@@ -35,6 +35,7 @@ from recto.bootloader.state import (
     PhoneRegistration,
     StateStore,
 )
+from tests.test_bootloader_signed_polls import _denial_headers, _make_keypair
 
 
 # Canonical 34-char T-prefixed TRON address from the secp256k1
@@ -246,11 +247,13 @@ def signing_pair():
 @pytest.fixture
 def live_server(tmp_path: Path, signing_pair):
     priv, pub_b64u = signing_pair
+    poll_priv, poll_pub_b64u = _make_keypair()
     state = StateStore(state_dir=tmp_path)
     phone = PhoneRegistration.new(
         device_label="Test Phone",
         public_key_b64u=pub_b64u,
         supported_algorithms=("ed25519",),
+        poll_public_key_b64u=poll_pub_b64u,
     )
     state.register_phone(phone)
 
@@ -291,6 +294,7 @@ def live_server(tmp_path: Path, signing_pair):
             "state": state,
             "phone": phone,
             "priv": priv,
+            "poll_priv": poll_priv,
             "base_url": base_url,
             "captured": captured,
         }
@@ -327,11 +331,14 @@ def _envelope_signature(priv, payload_hash_b64u: str) -> str:
     return _b64u_encode(sig_bytes)
 
 
-def _post_respond(base_url: str, request_id: str, body: dict[str, Any]) -> Any:
+def _post_respond(
+    base_url: str, request_id: str, body: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> Any:
     req = urlrequest.Request(
         f"{base_url}/v0.4/respond/{request_id}",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
         method="POST",
     )
     try:
@@ -378,6 +385,8 @@ class TestRespondLiveServerTron:
         status, body = _post_respond(
             info["base_url"], req.request_id,
             {"decision": "denied", "reason": "operator declined"},
+            headers=_denial_headers(info["poll_priv"], info["phone"].phone_id,
+                                    f"/v0.4/respond/{req.request_id}"),
         )
         assert status == 200
         ev = info["captured"][0]

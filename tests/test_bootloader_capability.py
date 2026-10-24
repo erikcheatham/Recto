@@ -53,6 +53,7 @@ from recto.bootloader.state import (
     PhoneRegistration,
     StateStore,
 )
+from tests.test_bootloader_signed_polls import _denial_headers, _make_keypair
 from recto.capability.jwt import (
     _b64url_encode,
     _canonical_json,
@@ -405,11 +406,13 @@ def live_server(tmp_path: Path, signing_pair, request):
     posture to be restated, and the two only agree until one moves.
     """
     priv, pub_b64u = signing_pair
+    poll_priv, poll_pub_b64u = _make_keypair()
     state = StateStore(state_dir=tmp_path)
     phone = PhoneRegistration.new(
         device_label="Test Phone",
         public_key_b64u=pub_b64u,
         supported_algorithms=("ed25519",),
+        poll_public_key_b64u=poll_pub_b64u,
     )
     state.register_phone(phone)
 
@@ -474,6 +477,7 @@ def live_server(tmp_path: Path, signing_pair, request):
             "state": state,
             "phone_id": phone.phone_id,
             "phone_priv": priv,
+            "poll_priv": poll_priv,
             "phone_pub_b64u": pub_b64u,
             "captured": captured,
             "agent_id": agent_id,
@@ -862,12 +866,14 @@ class TestCapabilityRequestEndToEnd:
     ) -> None:
         ctx = live_server
         queued = self._queue(ctx)
+        path = f"/v0.4/respond/{queued['request_id']}"
         status, resp = _http_post_json(
-            f"{ctx['base_url']}/v0.4/respond/{queued['request_id']}",
+            f"{ctx['base_url']}{path}",
             {
                 "decision": "denied",
                 "reason": "operator declined this scope",
             },
+            headers=_denial_headers(ctx["poll_priv"], ctx["phone_id"], path),
         )
         assert status == 200
         # Agent fetches result — sees denied.

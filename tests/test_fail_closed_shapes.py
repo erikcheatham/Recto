@@ -572,7 +572,7 @@ class TestRule15uARevokedGrantNeverGrantsAgain:
     it never displaces the newer one. Only the bound phone revokes; an unknown grant is refused by name."""
 
     def test_a_replaced_grant_replayed_is_refused_and_the_newer_stays(self, uv_ctx) -> None:
-        """hecate 72fe: grant A (90 days), then grant B (7 days) for the same slot, then A re-sent - refused."""
+        """Grant A (90 days), then grant B (7 days) for the same slot, then A re-sent - refused."""
         a, s = _bound(uv_ctx)
         rec_a = _grant_dict(s, not_after=int(time.time()) + 90 * 86400)
         status, body = _grant(uv_ctx, a, rec_a)
@@ -700,10 +700,18 @@ def _list_grants(ctx, phone, *, signer=None, issued_at: int | None = None) -> tu
     return _post_body(ctx, "grants", {"request": req, "signature_b64u": sig})
 
 
-def _post_body(ctx, verb: str, body: dict) -> tuple[int, dict]:
+def _post_body(ctx, verb: str, body: dict, *, headers: dict[str, str] | None = None) -> tuple[int, dict]:
     from tests.test_bootloader_slots import _http
 
-    return _http("POST", f"{ctx['base_url']}/v0.4/user-vault/{verb}", body)
+    return _http("POST", f"{ctx['base_url']}/v0.4/user-vault/{verb}", body, headers=headers)
+
+
+def _deny_request(ctx, phone, request_id: str) -> tuple[int, dict]:
+    """The phone's Deny: its poll key signs the deny's path."""
+    from tests.test_bootloader_signed_polls import _denial_headers
+
+    return _post_body(ctx, "grant-request/deny", {"request_id": request_id},
+                      headers=_denial_headers(phone.poll, phone.ref, "/v0.4/user-vault/grant-request/deny"))
 
 
 def _revoke_key(ctx, phone, subject: str, key: str = "user-ai-xai", *, window: int = 300) -> tuple[int, dict, dict]:
@@ -802,9 +810,51 @@ class TestRule15zAGrantRequestRingsOnlyTheBoundPhone:
     def test_deny_takes_the_card_off_the_phone(self, uv_ctx) -> None:
         a, s = _bound(uv_ctx)
         rid = _raise(uv_ctx, s)[1]["request_id"]
-        assert _post_body(uv_ctx, "grant-request/deny", {"request_id": rid})[0] == 200
+        assert _deny_request(uv_ctx, a, rid)[0] == 200
         assert _status(uv_ctx, s, rid)[1]["status"] == "denied"
         assert _uv_cards(uv_ctx, a) == []
+
+    def test_a_deny_with_no_credential_leaves_the_card(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        status, body = _post_body(uv_ctx, "grant-request/deny", {"request_id": rid})
+        assert status == 401 and body["error"] == "response_signature_required", body
+        assert _status(uv_ctx, s, rid)[1]["status"] == "open"
+        assert [c["request_id"] for c in _uv_cards(uv_ctx, a)] == [rid]
+
+    def test_another_phones_signature_does_not_deny(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        b, _ = _bound(uv_ctx, "b", member="member-2")
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        status, body = _deny_request(uv_ctx, b, rid)
+        assert status == 401 and body["error"] == "response_signature_invalid", body
+        assert _status(uv_ctx, s, rid)[1]["status"] == "open"
+        assert [c["request_id"] for c in _uv_cards(uv_ctx, a)] == [rid]
+
+    def test_the_raising_platform_withdraws_its_own_request(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        status, body = _post_body(uv_ctx, "grant-request/deny", {"request_id": rid}, headers=_uv_headers(s))
+        assert status == 200 and body == {"denied": True}, body
+        assert _status(uv_ctx, s, rid)[1]["status"] == "denied"
+        assert _uv_cards(uv_ctx, a) == []
+
+    def test_a_platform_cannot_withdraw_another_subjects_request(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx, "a")
+        _, other = _bound(uv_ctx, "b", member="member-2")
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        status, body = _post_body(uv_ctx, "grant-request/deny", {"request_id": rid}, headers=_uv_headers(other))
+        assert status == 404 and body["error"] == "grant_request_unknown", body
+        assert _status(uv_ctx, s, rid)[1]["status"] == "open"
+        assert [c["request_id"] for c in _uv_cards(uv_ctx, a)] == [rid]
+
+    def test_a_bad_agent_token_does_not_withdraw(self, uv_ctx) -> None:
+        a, s = _bound(uv_ctx)
+        rid = _raise(uv_ctx, s)[1]["request_id"]
+        headers = {**_uv_headers(s), "X-Recto-Agent-Token": "wrong-token-" + "z" * 16}
+        status, body = _post_body(uv_ctx, "grant-request/deny", {"request_id": rid}, headers=headers)
+        assert status == 401 and body["error"] == "agent_auth_invalid", body
+        assert _status(uv_ctx, s, rid)[1]["status"] == "open"
 
     def test_another_subjects_request_reads_as_unknown(self, uv_ctx) -> None:
         _, s = _bound(uv_ctx, "a")

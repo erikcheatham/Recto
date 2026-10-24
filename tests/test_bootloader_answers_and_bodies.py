@@ -1,8 +1,9 @@
 """An answer takes a card only when it holds up; a request body has a ceiling; a quiet connection closes.
 
 - ``POST /v0.4/respond/<id>`` reads the card and takes it only for a known decision that holds up: a decision
-  that is neither ``approved`` nor ``denied``, or an approval whose signature does not verify against the paired
-  phone's key, leaves the card on the queue and resolves nothing.
+  that is neither ``approved`` nor ``denied``, an approval whose signature does not verify against the paired
+  phone's key, or a denial without a fresh signature by the phone's delegated poll key over its path (in every
+  poll mode), leaves the card on the queue and resolves nothing.
 - A JSON body may declare at most ``MAX_JSON_BODY_BYTES``: a larger one is refused with 413 before it is read,
   and a Content-Length that is not a number is a client error.
 - A connection that sends nothing closes after the handler's timeout instead of holding its thread.
@@ -21,10 +22,11 @@ import pytest
 from recto.bootloader.server import (
     MAX_JSON_BODY_BYTES,
     REQUEST_SOCKET_TIMEOUT_SECONDS,
+    SIGNED_POLL_MODES,
     BootloaderHandler,
 )
 from recto.bootloader.state import PendingRequest
-from tests.test_bootloader_signed_polls import _b64u, _http, _spawn
+from tests.test_bootloader_signed_polls import _b64u, _http, _make_keypair, _signed_headers, _spawn
 
 
 @pytest.fixture
@@ -66,12 +68,80 @@ def test_an_approval_that_does_not_verify_leaves_the_card(boot):
     assert boot["state"].peek_pending(req.request_id) is not None
 
 
+def _deny(ctx, req, headers: dict | None):
+    return _http(f"{ctx['base_url']}/v0.4/respond/{req.request_id}", method="POST", headers=headers,
+                 body={"decision": "denied", "reason": "no"})
+
+
+def test_an_unsigned_denial_leaves_the_card(boot):
+    req = _card(boot)
+    status, body = _deny(boot, req, None)
+    assert status == HTTPStatus.UNAUTHORIZED
+    assert body["error"] == "response_signature_required"
+    assert boot["state"].peek_pending(req.request_id) is not None
+
+
+@pytest.mark.parametrize("mode", SIGNED_POLL_MODES)
+def test_the_poll_mode_does_not_relax_a_denial(tmp_path, mode):
+    ctx = _spawn(tmp_path, mode)
+    try:
+        req = _card(ctx)
+        assert _deny(ctx, req, None)[0] == HTTPStatus.UNAUTHORIZED
+        assert ctx["state"].peek_pending(req.request_id) is not None
+        assert _deny(ctx, req, _signed_headers(ctx, f"/v0.4/respond/{req.request_id}"))[0] == HTTPStatus.OK
+    finally:
+        ctx["server"].shutdown()
+
+
+def test_a_denial_whose_signature_does_not_verify_leaves_the_card(boot):
+    req = _card(boot)
+    status, body = _deny(boot, req, _signed_headers(boot, f"/v0.4/respond/{req.request_id}",
+                                                    sig=_b64u(b"\x00" * 64)))
+    assert status == HTTPStatus.UNAUTHORIZED
+    assert body["error"] == "response_signature_invalid"
+    assert boot["state"].peek_pending(req.request_id) is not None
+
+
+def test_a_denial_signed_by_another_key_leaves_the_card(boot):
+    req = _card(boot)
+    stranger, _ = _make_keypair()
+    status, body = _deny(boot, req, _signed_headers(boot, f"/v0.4/respond/{req.request_id}", priv=stranger))
+    assert status == HTTPStatus.UNAUTHORIZED
+    assert body["error"] == "response_signature_invalid"
+    assert boot["state"].peek_pending(req.request_id) is not None
+
+
+def test_a_read_signature_does_not_deny(boot):
+    # The phone's signature over its pending read names that path, not this card's.
+    req = _card(boot)
+    status, body = _deny(boot, req, _signed_headers(boot, "/v0.4/pending"))
+    assert status == HTTPStatus.UNAUTHORIZED
+    assert body["error"] == "response_signature_invalid"
+    assert boot["state"].peek_pending(req.request_id) is not None
+
+
+def test_a_stale_denial_signature_leaves_the_card(boot):
+    req = _card(boot)
+    stale = int(time.time()) - 10 * 60
+    status, body = _deny(boot, req, _signed_headers(boot, f"/v0.4/respond/{req.request_id}", ts=stale))
+    assert status == HTTPStatus.UNAUTHORIZED
+    assert body["error"] == "response_signature_invalid"
+    assert boot["state"].peek_pending(req.request_id) is not None
+
+
+def test_a_signed_denial_resolves_the_card(boot):
+    req = _card(boot)
+    status, body = _deny(boot, req, _signed_headers(boot, f"/v0.4/respond/{req.request_id}"))
+    assert status == HTTPStatus.OK and body == {"resolved": True}, body
+    assert boot["state"].peek_pending(req.request_id) is None
+
+
 def test_a_card_answered_twice_is_taken_once(boot):
     req = _card(boot)
-    url = f"{boot['base_url']}/v0.4/respond/{req.request_id}"
-    assert _http(url, method="POST", body={"decision": "denied", "reason": "no"})[0] == HTTPStatus.OK
+    headers = _signed_headers(boot, f"/v0.4/respond/{req.request_id}")
+    assert _deny(boot, req, headers)[0] == HTTPStatus.OK
     assert boot["state"].peek_pending(req.request_id) is None
-    status, body = _http(url, method="POST", body={"decision": "denied", "reason": "no"})
+    status, body = _deny(boot, req, headers)
     assert status == HTTPStatus.BAD_REQUEST
     assert "not found" in body["detail"]
 

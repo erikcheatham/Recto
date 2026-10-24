@@ -50,6 +50,7 @@ from recto.bootloader.state import (
     PhoneRegistration,
     StateStore,
 )
+from tests.test_bootloader_signed_polls import _denial_headers, _make_keypair
 
 
 def _b64u_encode(b: bytes) -> str:
@@ -321,12 +322,14 @@ def live_server(tmp_path: Path, signing_pair):
     Cleanup: server is shut down on teardown.
     """
     priv, pub_b64u = signing_pair
+    poll_priv, poll_pub_b64u = _make_keypair()
     state = StateStore(state_dir=tmp_path)
     # Pre-register one phone so the queue endpoints can find it.
     phone = PhoneRegistration.new(
         device_label="Test Phone",
         public_key_b64u=pub_b64u,
         supported_algorithms=("ed25519",),
+        poll_public_key_b64u=poll_pub_b64u,
     )
     state.register_phone(phone)
 
@@ -362,6 +365,7 @@ def live_server(tmp_path: Path, signing_pair):
             "state": state,
             "phone_id": phone.phone_id,
             "phone_priv": priv,
+            "poll_priv": poll_priv,
             "phone_pub_b64u": pub_b64u,
             "captured": captured,
         }
@@ -376,12 +380,14 @@ def _http_get_json(url: str) -> dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_post_json(url: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+def _http_post_json(
+    url: str, body: dict[str, Any], headers: dict[str, str] | None = None
+) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode("utf-8")
     req = urlrequest.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
         method="POST",
     )
     try:
@@ -468,9 +474,11 @@ class TestEthEndToEnd:
     ) -> None:
         ctx = live_server
         req = self._queue_eth_personal_sign(ctx)
+        path = f"/v0.4/respond/{req.request_id}"
         status, resp = _http_post_json(
-            f"{ctx['base_url']}/v0.4/respond/{req.request_id}",
+            f"{ctx['base_url']}{path}",
             {"decision": "denied", "reason": "operator declined"},
+            headers=_denial_headers(ctx["poll_priv"], ctx["phone_id"], path),
         )
         assert status == 200
         assert resp == {"resolved": True}

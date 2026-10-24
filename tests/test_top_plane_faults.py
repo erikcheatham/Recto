@@ -28,6 +28,7 @@ from recto.profile.passphrase_member import derive_passphrase_member
 from tests.test_bootloader_owner_slots import _approve, _enroll_approved, _enroll_genesis, _signed_cards, serving
 from tests.test_bootloader_owner_slots import _start as _start_server
 from tests.test_bootloader_owner_slots import _stop
+from tests.test_bootloader_signed_polls import _denial_headers
 from tests.test_bootloader_slots import Phone, _http
 from tests.test_top_plane_e2e import (  # noqa: F401 - `plane` is the fixture
     PHRASE, _arm, _chain, _host, _op_key, _seed_chain, _top_cards, plane,
@@ -527,8 +528,9 @@ class TestAnUnreadableTopPlaneFile:
                                   child_pid=0, child_argv0="(test)", ttl_seconds=300)
         plane["state"].add_pending(card)
         (Path(plane["tmp"]) / "top_plane.json").write_text("{not json", encoding="utf-8")
-        status, body = _http("POST", f"{plane['base_url']}/v0.4/respond/{card.request_id}",
-                             {"decision": "denied", "reason": "test"})
+        path = f"/v0.4/respond/{card.request_id}"
+        status, body = _http("POST", f"{plane['base_url']}{path}", {"decision": "denied", "reason": "test"},
+                             headers=_denial_headers(plane["r"].poll, plane["r"].ref, path))
         assert status == 200, body
         status, body = _http("GET", f"{plane['base_url']}/v0.4/owner/reset?intent_id=reset-x")
         assert status == 503 and body["error"] == "top_plane_records_unreadable", body

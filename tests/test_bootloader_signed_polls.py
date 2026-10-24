@@ -73,6 +73,12 @@ def _sign_poll(priv, phone_id: str, ts: int, path: str) -> str:
     return _b64u(priv.sign(payload))
 
 
+def _denial_headers(poll_priv, phone_id: str, path: str) -> dict:
+    """A denial's headers: a fresh signature by the phone's delegated poll key over the request path."""
+    ts = int(time.time())
+    return {POLL_SIG_HEADER: _sign_poll(poll_priv, phone_id, ts, path), POLL_SIG_TS_HEADER: str(ts)}
+
+
 def _http(url: str, *, method: str = "GET", headers: dict | None = None,
           body: dict | None = None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
