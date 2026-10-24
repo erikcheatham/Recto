@@ -20,9 +20,10 @@ namespace Recto.Shared.Tests.Services;
 /// THE DEFECT this closes: <see cref="PollSigning"/> shipped in 1.1.0 with a
 /// payload test and NO caller, so every read the phone made was bare and the
 /// bootloader's evidence window could only ever read <c>unsigned</c>. These
-/// tests prove the headers are ATTACHED, at the three read surfaces and at no
-/// other, and that the delegation the identity key signs is byte-identical to
-/// what the server reconstructs.
+/// tests prove the headers are ATTACHED at the three read surfaces and the two
+/// denials (a respond with decision "denied", a grant-request deny), never on
+/// registration or an approval, and that the delegation the identity key signs
+/// is byte-identical to what the server reconstructs.
 /// </para>
 /// </summary>
 public class PollKeyReadSigningTests
@@ -69,6 +70,42 @@ public class PollKeyReadSigningTests
     }
 
     [Fact]
+    public async Task ADenial_CarriesThePollSignatureHeaders()
+    {
+        // A denial has no identity-key signature in its body; the poll key signs its path.
+        var (sut, handler, signer) = Make(Json("{\"accepted\":true,\"detail\":\"ok\"}"));
+
+        await sut.RespondAsync("http://h", "r1",
+            new RespondRequest(PhoneId, "denied", Reason: "operator declined"), CancellationToken.None);
+
+        AssertSigned(Assert.Single(handler.Requests), "sig-for-/v0.4/respond/r1");
+        Assert.Equal(new[] { (PhoneId, "/v0.4/respond/r1") }, signer.Calls);
+    }
+
+    [Fact]
+    public async Task AGrantRequestDeny_CarriesThePollSignatureHeaders()
+    {
+        var (sut, handler, signer) = Make(Json("{\"denied\":true}"));
+
+        await sut.DenyUserVaultGrantRequestAsync("http://h", PhoneId, "uvreq-1", CancellationToken.None);
+
+        AssertSigned(Assert.Single(handler.Requests), "sig-for-/v0.4/user-vault/grant-request/deny");
+        Assert.Equal(new[] { (PhoneId, "/v0.4/user-vault/grant-request/deny") }, signer.Calls);
+    }
+
+    [Fact]
+    public async Task AGrantRequestDeny_WithoutAPhoneId_IsRefusedBeforeAnyCall()
+    {
+        var (sut, handler, signer) = Make(Json("{\"denied\":true}"));
+
+        var result = await sut.DenyUserVaultGrantRequestAsync("http://h", "", "uvreq-1", CancellationToken.None);
+
+        Assert.True(result.IsFailure);
+        Assert.Empty(handler.Requests);
+        Assert.Empty(signer.Calls);
+    }
+
+    [Fact]
     public async Task ThePathSignedIsTheUrlPathOnly_NeverTheQuery()
     {
         // The server reconstructs recto-poll-v1|{id}|{ts}|{path} with path =
@@ -81,7 +118,7 @@ public class PollKeyReadSigningTests
     }
 
     // ------------------------------------------------------------------
-    // 2. and on no other surface
+    // 2. and never on registration or an approval
     // ------------------------------------------------------------------
 
     [Fact]
@@ -101,7 +138,7 @@ public class PollKeyReadSigningTests
     }
 
     [Fact]
-    public async Task Respond_IsNotSignedByThePollKey()
+    public async Task AnApproval_IsNotSignedByThePollKey()
     {
         // An approval carries its own identity-key signature in the body. The
         // poll key must never appear on it -- it is a device key.

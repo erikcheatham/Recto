@@ -149,7 +149,8 @@ public interface IBootloaderClient
     Task<Result<UserVaultGrantsListResponse>> ListUserVaultGrantsAsync(
         string bootloaderUrl, UserVaultGrantsListRequest request, CancellationToken ct);
 
-    /// <summary>POST <c>/v0.4/user-vault/grant-request/deny</c>: Deny takes the card off the phone; nothing is signed.</summary>
+    /// <summary>POST <c>/v0.4/user-vault/grant-request/deny</c>: Deny takes the card off the phone, its path signed
+    /// by <paramref name="phoneId"/>'s delegated poll key.</summary>
     Task<Result<UserVaultDenyResponse>> DenyUserVaultGrantRequestAsync(
-        string bootloaderUrl, string requestId, CancellationToken ct);
+        string bootloaderUrl, string phoneId, string requestId, CancellationToken ct);
 }

@@ -147,6 +147,8 @@ else
 @code {
     [Parameter, EditorRequired] public PendingRequest Request { get; set; } = default!;
     [Parameter, EditorRequired] public string BootloaderUrl { get; set; } = string.Empty;
+    /// <summary>This phone's id: its delegated poll key signs the Deny.</summary>
+    [Parameter, EditorRequired] public string PhoneId { get; set; } = string.Empty;
     /// <summary>The bootloader this phone is paired to: a card naming another one is refused.</summary>
     [Parameter, EditorRequired] public string PairedBootloaderId { get; set; } = string.Empty;
     /// <summary>The phone's identity key alias (the biometric-gated key the grant verifies against).</summary>
@@ -258,8 +260,9 @@ else
         StateHasChanged();
         try
         {
-            // Deny signs nothing: the request leaves the phone and expires on its own if the vault is unreachable.
-            await BootloaderClient.DenyUserVaultGrantRequestAsync(BootloaderUrl, Request.RequestId, CancellationToken.None);
+            // The poll key signs the Deny (no biometric prompt); the request leaves the phone, and expires on its
+            // own if the vault is unreachable.
+            await BootloaderClient.DenyUserVaultGrantRequestAsync(BootloaderUrl, PhoneId, Request.RequestId, CancellationToken.None);
             _model?.Drop();
             await OnResolved.InvokeAsync(null);
         }

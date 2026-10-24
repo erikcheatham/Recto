@@ -51,9 +51,10 @@ public sealed class BootloaderClient : IBootloaderClient
     /// and two constructors that both accept the given <c>HttpClient</c> are an
     /// ambiguity it may refuse at startup -- which surfaces as the WebView
     /// stuck on "Loading..." with no error on screen (2026-09-21, a sideloaded Android build).
-    /// <paramref name="readSigner"/> (hard rule 14.2) signs the
-    /// phone's READS -- pending, manage/phones, manage/push_token -- with the
-    /// delegated poll key; the optional default lets tests construct without DI.
+    /// <paramref name="readSigner"/> (hard rule 14.2) signs, with the delegated
+    /// poll key, the phone's READS -- pending, manage/phones, manage/push_token --
+    /// and its two denials (a respond with decision "denied", a grant-request
+    /// deny), never an approval; the optional default lets tests construct without DI.
     /// </summary>
     public BootloaderClient(HttpClient http, ILogger<BootloaderClient> log, IReadSigner? readSigner = null)
     {
@@ -182,8 +183,14 @@ public sealed class BootloaderClient : IBootloaderClient
                 Error.Validation([new ValidationErrors("requestId", "Request ID is required.")])));
         }
 
-        var url = $"{bootloaderUrl.TrimEnd('/')}/v0.4/respond/{Uri.EscapeDataString(requestId)}";
-        return SendAsync<RespondResponse>(HttpMethod.Post, url, request, ct);
+        var path = $"/v0.4/respond/{Uri.EscapeDataString(requestId)}";
+        var url = $"{bootloaderUrl.TrimEnd('/')}{path}";
+        // A denial carries no identity-key signature in its body, so the delegated poll key signs its
+        // path (hard rule 14.2: the poll key authenticates the device). An approval is signed by the
+        // identity key in its body and carries no poll signature: the poll key never signs an approval.
+        return string.Equals(request.Decision, "denied", StringComparison.Ordinal)
+            ? SendSignedReadAsync<RespondResponse>(HttpMethod.Post, url, request, request.PhoneId, path, ct)
+            : SendAsync<RespondResponse>(HttpMethod.Post, url, request, ct);
     }
 
     public Task<Result<RegisteredPhonesResponse>> ListRegisteredPhonesAsync(
@@ -316,15 +323,27 @@ public sealed class BootloaderClient : IBootloaderClient
         => PostUserVaultAsync<UserVaultGrantsListResponse>(bootloaderUrl, "grants", request, ct);
 
     public Task<Result<UserVaultDenyResponse>> DenyUserVaultGrantRequestAsync(
-        string bootloaderUrl, string requestId, CancellationToken ct)
+        string bootloaderUrl, string phoneId, string requestId, CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(bootloaderUrl))
+        {
+            return Task.FromResult(Result.Failure<UserVaultDenyResponse>(
+                Error.Validation([new ValidationErrors("bootloaderUrl", "Bootloader URL is required.")])));
+        }
+        if (string.IsNullOrWhiteSpace(phoneId))
+        {
+            return Task.FromResult(Result.Failure<UserVaultDenyResponse>(
+                Error.Validation([new ValidationErrors("phoneId", "Phone ID is required.")])));
+        }
         if (string.IsNullOrWhiteSpace(requestId))
         {
             return Task.FromResult(Result.Failure<UserVaultDenyResponse>(
                 Error.Validation([new ValidationErrors("requestId", "Request id is required.")])));
         }
-        return PostUserVaultAsync<UserVaultDenyResponse>(
-            bootloaderUrl, "grant-request/deny", new { request_id = requestId }, ct);
+        // The delegated poll key signs the deny's path, as it does a denial of an approval card.
+        const string path = "/v0.4/user-vault/grant-request/deny";
+        return SendSignedReadAsync<UserVaultDenyResponse>(
+            HttpMethod.Post, $"{bootloaderUrl.TrimEnd('/')}{path}", new { request_id = requestId }, phoneId, path, ct);
     }
 
     private Task<Result<T>> PostUserVaultAsync<T>(string bootloaderUrl, string verb, object request, CancellationToken ct)

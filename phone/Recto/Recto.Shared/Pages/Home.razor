@@ -766,6 +766,7 @@
                                                buttons (hard rules 15.x, 15.y); nothing here signs for it. *@
                                             <UserVaultCardView Request="req"
                                                                BootloaderUrl="@ActiveBootloaderUrl"
+                                                               PhoneId="@(_paired?.PhoneId ?? string.Empty)"
                                                                PairedBootloaderId="@(_paired?.BootloaderId ?? string.Empty)"
                                                                IdentityKeyAlias="@KeyAlias"
                                                                OnResolved="OnUserVaultResolvedAsync" />
