@@ -2915,7 +2915,7 @@
         // re-tick it between prompts (measured 2026-09-21, iOS 17.1.1).
         var slot = _pairAsRecovery ? "recovery" : "primary";
         // The TOFU window opens here, for this bootloader's host only, and
-        // closes in the finally below (recurve 2026-09-25, fail-open-pinning).
+        // closes in the finally below (the 2026-09-25 review, fail-open-pinning).
         try { Pinning.BeginPairing(new Uri(_bootloaderUrl).Host); } catch { /* a bad URL fails at the first request */ }
         try
         {

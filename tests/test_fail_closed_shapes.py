@@ -1,6 +1,6 @@
-"""Hard rule 15 - the fail-closed shapes recurve tried to call defects (2026-09-25).
+"""Hard rule 15 - the fail-closed shapes a review tried to call defects (2026-09-25).
 
-The first whole-tree recurve pass over Recto (run e410, 140 modules, an
+The first whole-tree review of Recto (140 modules, an
 independent refuter) raised 24 findings at or above high. Twenty-three were the
 DESIGN, read back to the reader as a defect. Each accepted design is a decision
 this tree stands on; this file pins the ones a unit test can hold, so a future
@@ -68,7 +68,7 @@ class TestRule15cTimeBoundsAreUpstream:
     """15.c - verify_pair_grant's window CEILING sits on top of verify_jws's
     standard bounds (nbf <= now < exp). A future nbf is refused BEFORE the
     grant is ever read; the grant check does not re-check what verify_jws
-    already refused. (recurve: missing-nbf-check, pair_record.py:173)"""
+    already refused. (review finding: missing-nbf-check, pair_record.py:173)"""
 
     def test_verify_jws_refuses_a_future_nbf(self) -> None:
         now = int(time.time())
@@ -91,7 +91,7 @@ class TestRule15cTimeBoundsAreUpstream:
 class TestRule15dMasterRevocation:
     """15.d - "while children exist" means ACTIVE children. A master whose
     children are all revoked has nothing left to orphan; revoking it then is
-    the intended end state. (recurve: master-revocation-without-children-check)"""
+    the intended end state. (review finding: master-revocation-without-children-check)"""
 
     def test_master_refuses_while_an_active_child_exists(self, tmp_path: Path) -> None:
         mi = bootstrap_master(master_pubkey_hex=bytes(range(64)).hex(), display_name="m", state_dir=tmp_path)
@@ -112,7 +112,7 @@ class TestRule15dMasterRevocation:
 class TestRule15gInMemoryChallengeStoreIsStillAGate:
     """15.g - ChallengeStore(state=None) is the legacy/test construction; what
     it loses without a store is cross-replica persistence, never single-use or
-    the TTL. (recurve: fail-open-on-missing-state-store, server.py:632)"""
+    the TTL. (review finding: fail-open-on-missing-state-store, server.py:632)"""
 
     def test_challenge_is_single_use(self) -> None:
         store = ChallengeStore()

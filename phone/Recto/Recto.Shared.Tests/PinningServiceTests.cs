@@ -12,7 +12,7 @@ public class PinningServiceTests
     [Fact]
     public void Validate_NoPinNoObservation_OutsidePairing_Refuses()
     {
-        // Recurve 2026-09-25 (fail-open-pinning): with no pin and no system
+        // The 2026-09-25 review (fail-open-pinning): with no pin and no system
         // trust, and NO pairing in flight, an unknown certificate is refused.
         // The observed SPKI is still recorded (HasDrifted needs it).
         var sut = new PinningService();
@@ -169,7 +169,7 @@ public class PinningServiceTests
 
         Assert.Null(sut.GetPin(Host));
         // No pin is not a window: an untrusted cert is refused until a
-        // pairing opens the window for this host (recurve 2026-09-25).
+        // pairing opens the window for this host (the 2026-09-25 review).
         Assert.False(sut.Validate(Host, PinB, systemTrustOk: false));
         sut.BeginPairing(Host);
         Assert.True(sut.Validate(Host, PinB, systemTrustOk: false));

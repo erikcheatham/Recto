@@ -192,7 +192,7 @@ def poll_key_delegation_payload(public_key_b64u: str, poll_public_key_b64u: str)
 # brick the shipped app (Hard Rule #1 back-compat). Advisory allows
 # every poll and logs the per-poll verdict (signed-valid /
 # signed-invalid / unsigned) so an operator can watch the evidence
-# window before flipping to "required" (the RECURVE ceremony:
+# window before flipping to "required" (the flip ceremony:
 # advisory -> evidence window -> flip -> single redeploy).
 SIGNED_POLL_MODES = ("off", "advisory", "required")
 
@@ -736,7 +736,7 @@ class BootloaderConfig:
     # Default is advisory, NOT required: Build 12 phones in both stores
     # poll bare (Hard Rule #1 back-compat) -- the flip to required is an
     # operator ceremony after the advisory evidence window shows every
-    # live phone signing (RECURVE pattern).
+    # live phone signing (the flip ceremony at SIGNED_POLL_MODES).
     signed_poll_mode: str = "advisory"
     # THE OWNER SLOTS (hard rule 14.4, amended). The agents allowed to mint OWNER pairing codes (an agent entry's
     # "may_mint_owner_codes": true); every other agent mints member codes only. How long an approval, once given,

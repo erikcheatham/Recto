@@ -62,7 +62,7 @@ public sealed record BootloaderIdentityInfo(
 
 /// <summary>
 /// A secret this phone GATES, by name: which service, which secret name, which
-/// algorithm. The value never crosses this wire (recurve 2026-09-25 renamed the
+/// algorithm. The value never crosses this wire (the 2026-09-25 review renamed the
 /// field from <c>secret</c> so the shape says so; the bootloader emits an empty
 /// list until the launcher side wires services to phones).
 /// </summary>

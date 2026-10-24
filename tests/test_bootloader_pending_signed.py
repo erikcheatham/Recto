@@ -137,7 +137,7 @@ class TestSignedPendingEnvelope:
         assert claims.iss == "bootloader:pending-signed-test"
         assert claims.sub == f"phone:{phone_id}"
         assert claims.cap.allow_actions == [PENDING_ACTION]
-        # Hard rule 15.b (recurve 2026-09-25): the envelope is a READ of the
+        # Hard rule 15.b (the 2026-09-25 review): the envelope is a READ of the
         # list, never an approval - one action, tier 0, single use, pinned to
         # the list bytes. Approvals mint per record, against that record's
         # own fingerprint (pair_record.verify_pair_grant).

@@ -87,7 +87,7 @@ public sealed class PinningService : IPinningService
         // BeginPairing(host) and EndPairing() - the user-initiated pairing
         // operation - and only for THAT host; SetPin locks the anchor once
         // pairing succeeds. Any other host, or any time outside the window,
-        // is refused (recurve 2026-09-25: the comment promised this scope,
+        // is refused (the 2026-09-25 review: the comment promised this scope,
         // the code did not keep it).
         return string.Equals(_pairingHost, host, StringComparison.OrdinalIgnoreCase);
     }

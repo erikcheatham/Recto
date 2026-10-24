@@ -568,7 +568,7 @@ class TestBootloaderAttest:
 
 
 class TestRule15PairRecordCarriesAHandle:
-    """Hard rules 15.m and 15.q on devices/pair (named in tests/test_recurve_acceptances.py): the record's `subject`
+    """Hard rules 15.m and 15.q on devices/pair (named in tests/test_fail_closed_shapes.py): the record's `subject`
     field carries the consumer's OPAQUE subject handle - a user id in it is refused before anything is relayed - and
     a consumer's HTTP error is logged by its status alone, never its headers or body."""
 
