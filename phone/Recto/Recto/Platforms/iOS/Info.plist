@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Recto uses Face ID to confirm that you authorize each cryptographic signing operation against your services' secrets. Your private key never leaves the Secure Enclave.</string>
+    <!--
+      Build 6 (2026-06-02): NSCameraUsageDescription retired with the
+      in-app QR scanner. OS Camera (system-controlled) handles QR
+      scanning off-app; the recto:// URL-scheme deep-link picks the
+      payload back up via AppDelegate.OpenUrl when the user taps the
+      system-generated "open in Recto Agentic" banner that iOS surfaces
+      below a scanned recto:// URL. No in-app camera access remains.
+    -->
+    <!--
+      App Transport Security: deny arbitrary cleartext but allow it to
+      localhost-style hosts so the dev workflow (mock bootloader reachable
+      via the simulator's host-loopback alias) works without opening
+      cleartext to the public internet. Production bootloaders are HTTPS;
+      this exemption only matters during local development.
+    -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <!--
+      iPhone-only for v1. UIDeviceFamily = [1] (iPhone/iPod), NOT [1, 2]
+      (which would mark the bundle as universal iPhone + iPad). Submitting
+      universal iPhone+iPad to App Store Connect triggers a hard requirement
+      for iPad screenshots at 13-inch and 12.9-inch sizes — and shipping a
+      build claiming iPad compatibility without dedicated iPad layouts
+      (Recto's pages were authored phone-first) would be a false claim
+      that App Review may flag.
+
+      v1.x (or v2 banked) will add proper iPad-native UI + the
+      `UISupportedInterfaceOrientations~ipad` block back below it, and
+      flip UIDeviceFamily back to [1, 2]. Until then, iPhone-only is the
+      honest declaration.
+    -->
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+    </array>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>XSAppIconAssets</key>
+    <string>Assets.xcassets/appicon.appiconset</string>
+    <!--
+      Background modes for APNs remote-notification wakeup. Required so
+      iOS will deliver a push to the app even when it's in the background;
+      foreground delivery works without this flag but background does not.
+    -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>remote-notification</string>
+    </array>
+    <!--
+      URL-scheme intent registration (Task #22 Phase 1, banked 2026-05-31).
+      Registers recto:// as a custom URL scheme so other apps + the OS
+      can deep-link into Recto Phone at recto://pair?code=X&bootloader=Y.
+      AppDelegate.OpenUrl: receives the URL and routes to
+      PairDeepLinkParser + InMemoryPairDeepLinkState.SetGlobal,
+      Home.razor consumes on next render.
+
+      CFBundleURLName is a reverse-DNS string identifying the URL type
+      group; CFBundleURLSchemes is the array of schemes claimed under
+      that group. Only one scheme today; future kinds (recto://approve,
+      recto://revoke) would be additional CFBundleURLSchemes entries OR
+      separate CFBundleURLTypes entries depending on whether they share
+      handler logic with pair.
+
+      CFBundleTypeRole = "Editor" because Recto handles the URL action
+      (vs "Viewer" which is for read-only handling). Per Apple's
+      Foundation Programming Guide.
+    -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>app.recto.phone.pair</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>recto</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

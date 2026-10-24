@@ -1,0 +1,174 @@
+# Prove the GitHub Pages allowlist actually holds.
+#
+# docs/_config.yml is an ALLOWLIST: `exclude: ["*"]` plus a named
+# `include`. That is a strictly better shape than the denylist it
+# replaced -- but it is also a shape whose correctness depends on a
+# subtlety of Jekyll's entry filter (include is consulted before
+# exclude), and the previous config carried a comment saying the
+# inversion was OWED but "untested here". A one-time local `jekyll
+# build` would have retired that comment without retiring the risk: the
+# thing that can regress is not today's file list, it is the RULE.
+#
+# So this job does two different checks, and only the second one is
+# interesting:
+#
+#   1. the built site is exactly the pages we meant to publish;
+#   2. a file that NOBODY allowlisted, created during the build, does
+#      not appear in the output.
+#
+# (2) is the falsifier. It tests the mechanism rather than the current
+# contents, so it keeps working when the contents change. If someone
+# reverts to a denylist, or fat-fingers the include, this job goes red
+# on the next push instead of publishing an internal document.
+#
+# THIS DOES NOT DEPLOY. GitHub Pages builds and publishes on its own
+# from main/docs; this is a check that runs alongside it. Deliberately
+# separate: a checker that also deploys has an incentive to pass.
+
+name: Pages allowlist
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages-build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The set of pages this site is allowed to publish, as OUTPUT paths.
+# Kept here rather than derived from _config.yml on purpose: a checker
+# that reads its expectations from the file under test cannot fail.
+env:
+  EXPECTED_PAGES: |
+    index.html
+    privacy/index.html
+    support/index.html
+
+jobs:
+  allowlist:
+    name: build docs/ and prove nothing else published
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Plant a canary that nobody allowlisted
+        # A markdown file with front matter -- i.e. something Jekyll
+        # would absolutely render if it were allowed to see it. If the
+        # allowlist is working this produces no output at all.
+        #
+        # Named with a leading double underscore so that even if this
+        # step's cleanup were skipped, the file is obviously machinery.
+        # It is created HERE and never committed: a canary that lives in
+        # the tree is a file someone eventually allowlists "to make the
+        # build green".
+        run: |
+          cat > docs/__canary-internal.md <<'EOF'
+          ---
+          layout: default
+          title: CANARY
+          ---
+          CANARY_MUST_NOT_PUBLISH
+          EOF
+          echo "planted docs/__canary-internal.md"
+
+      - name: Build the site
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: The canary must not have published
+        # Two independent checks, because they fail for different
+        # reasons. A rendered page proves the allowlist let it through;
+        # the string appearing ANYWHERE (a feed, a sitemap, a search
+        # index, an SEO tag) proves it leaked without rendering.
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ -e _site/__canary-internal.html ] || [ -e _site/__canary-internal/index.html ]; then
+            echo "::error::the canary RENDERED -- docs/_config.yml is not an allowlist"
+            fail=1
+          fi
+          if grep -rqI 'CANARY_MUST_NOT_PUBLISH' _site 2>/dev/null; then
+            echo "::error::canary content reached the build output:"
+            grep -rlI 'CANARY_MUST_NOT_PUBLISH' _site || true
+            fail=1
+          fi
+          if [ "$fail" -eq 0 ]; then
+            echo "canary did not publish -- the allowlist blocks unlisted files"
+          fi
+          exit "$fail"
+
+      - name: The output is exactly the pages we meant to publish
+        # Theme assets (cayman ships CSS from the gem) live under
+        # assets/ and are not enumerated -- they are not authored in
+        # this repo and cannot leak anything from it. What IS enumerated
+        # is every rendered HTML page, because a page is the only thing
+        # that can carry prose out of docs/.
+        run: |
+          set -euo pipefail
+          actual="$(cd _site && find . -name '*.html' -type f | sed 's|^\./||' | sort)"
+          expected="$(echo "$EXPECTED_PAGES" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//' | sort)"
+          echo "--- built pages ---"; echo "$actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::the built page set does not match the allowlist"
+            diff <(echo "$expected") <(echo "$actual") || true
+            echo "If you added a public page, add it to EXPECTED_PAGES in this"
+            echo "workflow AND to include: in docs/_config.yml. If you did not,"
+            echo "an internal document just published."
+            exit 1
+          fi
+          echo "built page set matches exactly"
+
+      - name: The badges still resolve
+        # index.md links two SVGs by absolute path. Excluding everything
+        # and re-including them is the one part of the allowlist that
+        # silently degrades rather than failing -- the page renders fine
+        # with two broken images, and nobody notices from CI logs.
+        #
+        # THE MESSAGE SAYS "DID NOT PUBLISH", NEVER "MISSING". The first
+        # version said `missing assets/badge-app-store.svg`, which reads as
+        # "the file is gone from the repo" -- and on 2026-08-20 it sent the
+        # operator looking for a deletion that had never happened, while the
+        # actual fault was an include rule. The check reads _site, so it can
+        # only ever speak about the BUILD OUTPUT; a message that sounds like
+        # it is speaking about the source points at the wrong tree.
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in assets/badge-app-store.svg assets/badge-google-play.svg; do
+            if [ ! -f "_site/$f" ]; then
+              echo "::error::$f DID NOT PUBLISH -- present in the repo, absent from the build."
+              echo "This is an include rule, not a missing file. Jekyll 3.9 matches"
+              echo "include entries by BASENAME inside a subdirectory and exclude"
+              echo "entries by full relative path -- see docs/_config.yml."
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            # Say what DID land, so the next failure diagnoses itself instead
+            # of needing someone to reconstruct the build from a one-line error.
+            echo "--- what the build actually produced under assets/ ---"
+            find _site/assets -type f 2>/dev/null | sed 's|^_site/|  |' || echo "  (no _site/assets directory at all)"
+            echo "--- what the repo has ---"
+            find assets -type f 2>/dev/null | sed 's|^|  |'
+            exit 1
+          fi
+          echo "both badge assets published"
+
+      - name: Remove the canary
+        if: always()
+        run: rm -f docs/__canary-internal.md

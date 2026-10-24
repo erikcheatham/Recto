@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Release / App Store entitlements. Differs from Entitlements.plist by
+      one key: aps-environment (development vs production). The profile and
+      the entitlement must agree or the .ipa is rejected (MT7137).
+      Selected when Configuration=Release (Recto.csproj CodesignEntitlements).
+
+      The keychain access group is explicit so SecureStorage works on the
+      simulator; the team prefix is substituted at signing time.
+    -->
+    <key>aps-environment</key>
+    <string>production</string>
+
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)app.recto.phone</string>
+    </array>
+</dict>
+</plist>
