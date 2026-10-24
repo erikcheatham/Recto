@@ -3,8 +3,7 @@ r"""Folder-drop event bus for the bootloader.
 Substrate-side primitive for AI-to-AI peer communication via the
 filesystem. The bootloader emits state-change events as JSONL files
 to a configurable directory; application-host AIs on the same
-filesystem (peer Cowork instances, openclaw skills, log aggregators,
-audit watchers) tail-watch the daily files and react to events at
+filesystem tail-watch the daily files and react to events at
 their own cadence — without polling Recto's HTTP surface.
 
 Architectural posture

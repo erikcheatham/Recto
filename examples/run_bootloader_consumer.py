@@ -108,12 +108,11 @@ Signed polls (hard rule 14.2 -- the phone's reads are signed by its key):
                             every live phone signing. Any other value
                             refuses startup (exit 2) -- never coerced.
 
-Folder-drop event bus (RECTO_EVENTS_DIR, banked 2026-05-19 night):
+Folder-drop event bus (RECTO_EVENTS_DIR):
     When set + writable, the launcher constructs a FileEventEmitter
     that emits capability + sign lifecycle events as JSONL records
     to <events_dir>/<YYYY-MM-DD>.jsonl. Peer-AIs on the host
-    filesystem (Cowork instances, openclaw skills, audit watchers)
-    tail-watch the daily files without polling the bootloader's HTTP
+    filesystem tail-watch the daily files without polling the bootloader's HTTP
     surface. Substrate-level architectural primitive for AI-to-AI
     peer communication; complementary to HTTP capability_request
     (sync) — folder-drop is for async notifications. Unset = events
@@ -146,10 +145,8 @@ Phase H end-user device pairing relay (RECTO_DEVICES_PAIR_CONSUMERS_FILE):
       1. consumer.token_env (if set, read os.environ[that name])
       2. consumer.vault_service + consumer.vault_secret (dpapi-machine fetch)
     First non-empty wins. Default vault_secret is
-    "OPENCLAW_WEBHOOK_SECRET" -- v0 posture reuses the consumer's
-    existing Openclaw webhook secret as the devices-pair webhook
-    token (split into a dedicated secret later, likely alongside the
-    Hermes-cutover key rename per the 2026-05-19 architectural call).
+    "OPENCLAW_WEBHOOK_SECRET": the consumer's existing Agentic Harness
+    webhook secret serves as the credential.
 
 Connections substrate (RECTO_CONNECTIONS_FILE):
     For bootloaders that broker provider API-key management on behalf
@@ -1124,11 +1121,8 @@ def _resolve_token_for_consumer(consumer: dict) -> str:
     (token_env first, then dpapi-machine vault) -- with one
     difference: the default vault secret name is
     ``"OPENCLAW_WEBHOOK_SECRET"`` rather than
-    ``"RECTO_CAPABILITY_AGENT_TOKEN"``. v0 posture (2026-05-19)
-    reuses the consumer's existing Openclaw webhook secret as the
-    devices-pair webhook token; the dedicated-secret split lands
-    later (likely alongside the Hermes-cutover key rename per the
-    operator's 2026-05-19 architectural call).
+    ``"RECTO_CAPABILITY_AGENT_TOKEN"``: the consumer's existing
+    Agentic Harness webhook secret serves as the credential.
 
     Returns "" when neither source resolves; caller surfaces the
     error with consumer.base_url context. The token never transits
@@ -1453,7 +1447,7 @@ def main() -> int:
                 f"  (a) set $env:{token_env} directly (non-vault deployments), or\n"
                 f"  (b) ensure the consumer's vault carries the named secret\n"
                 "      (typical pattern: reuse the consumer's existing\n"
-                "      Openclaw webhook secret).",
+                "      Agentic Harness webhook secret).",
                 file=sys.stderr,
             )
             return 2
@@ -1572,13 +1566,11 @@ def main() -> int:
     # per-instance.)
     challenges = ChallengeStore(state=state)
 
-    # Folder-drop event bus (banked 2026-05-19 night alongside the
-    # Recto bootloader Docker abstraction). When RECTO_EVENTS_DIR is
+    # Folder-drop event bus. When RECTO_EVENTS_DIR is
     # set + writable, the launcher constructs a FileEventEmitter and
     # wires it as notify_resolved_fn so capability + sign lifecycle
     # events emit as JSONL records to the configured folder.
-    # Peer-AIs on the host filesystem (Cowork instances, openclaw
-    # skills, audit watchers) tail-watch the daily-rotated files
+    # Peer-AIs on the host filesystem tail-watch the daily-rotated files
     # without polling the bootloader's HTTP surface.
     #
     # When RECTO_EVENTS_DIR is unset, construct_events_emitter
