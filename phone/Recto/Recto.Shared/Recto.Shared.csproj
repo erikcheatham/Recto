@@ -59,5 +59,8 @@
 		<EmbeddedResource Include="Resources\KnownConsumer\known-consumer.json"
 		                  Condition="Exists('Resources\KnownConsumer\known-consumer.json')"
 		                  LogicalName="Recto.Shared.Resources.KnownConsumer.known-consumer.json" />
+		<!-- The app reads the embedded copy only; the SDK's default JSON glob would also copy both
+		     files into the bundle as content (the iOS build's bundle-copy warnings). -->
+		<Content Remove="Resources\KnownConsumer\*.json" />
 	</ItemGroup>
 </Project>

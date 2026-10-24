@@ -34,12 +34,11 @@ public class AppDelegate : MauiUIApplicationDelegate
     /// static state holder so <c>Home.razor.OnInitializedAsync</c> can
     /// consume it on first render.
     /// <para>
-    /// Wired via <c>[Export]</c> selector rather than <c>override</c>
-    /// because <see cref="MauiUIApplicationDelegate"/> doesn't expose
-    /// <c>application:openURL:options:</c> as a virtual method in
-    /// modern .NET MAUI bindings; the Objective-C runtime dispatches
-    /// by selector regardless of CLR inheritance. Sister of the APNs
-    /// callbacks below.
+    /// An <c>override</c>: <see cref="MauiUIApplicationDelegate"/> exports
+    /// <c>application:openURL:options:</c> as a virtual method, so a second
+    /// <c>[Export]</c> of the same selector here only hid it (CS0114) and
+    /// left which method the runtime dispatched to undefined. The base still
+    /// runs after the parse, for MAUI's own lifecycle handlers.
     /// </para>
     /// <para>
     /// Return TRUE so iOS knows we handled the URL. Returning FALSE
@@ -49,8 +48,7 @@ public class AppDelegate : MauiUIApplicationDelegate
     /// IPairDeepLinkState.cs's design rationale).
     /// </para>
     /// </summary>
-    [Export("application:openURL:options:")]
-    public bool OpenUrl(UIApplication app, NSUrl url, NSDictionary options)
+    public override bool OpenUrl(UIApplication app, NSUrl url, NSDictionary options)
     {
         // NSUrl.AbsoluteString is the canonical string form including
         // scheme + host + query. Pass through the shared parser; null
@@ -62,6 +60,7 @@ public class AppDelegate : MauiUIApplicationDelegate
         {
             InMemoryPairDeepLinkState.SetGlobal(payload);
         }
+        base.OpenUrl(app, url, options);
         // Return true regardless of whether the URL parsed cleanly —
         // we DID receive and process it (even if processing was "drop
         // it silently"). False would surface a "could not open" error

@@ -72,7 +72,10 @@
 		     (keep vault) in Settings, born from the CF cert-rotation-vs-
 		     TOFU-pin outage. New store version string required (1.0.7
 		     shipped as Build 12); Version + FileVersion derive. -->
-		<ApplicationDisplayVersion>1.1.2</ApplicationDisplayVersion>
+		<!-- 1.1.2 -> 1.2.0 (2026-10-24): the phone signs its denials with the delegated poll key (an
+		     approval stays identity-signed), the dead settings and screens leave, and the iOS deep-link
+		     handler overrides the base's instead of hiding it. -->
+		<ApplicationDisplayVersion>1.2.0</ApplicationDisplayVersion>
 		<!-- Build 5 (2026-06-02): explicit Version pin to fix NU1105.
 		     MAUI auto-derives PackageVersion from ApplicationDisplayVersion
 		     on some TFMs but leaves the default 1.0.0 on others, producing:
@@ -357,8 +360,9 @@
 		     both store lanes AND invalidates the WebView cache over the
 		     operator's sideloaded 13.
 		     16 -> 17 (2026-10-19): Build 17 (1.1.2), per Apple's same-build
-		     rule and Play's monotonic versionCode. -->
-		<ApplicationVersion>17</ApplicationVersion>
+		     rule and Play's monotonic versionCode.
+		     17 -> 18 (2026-10-24): Build 18 (1.2.0), the same two rules. -->
+		<ApplicationVersion>18</ApplicationVersion>
 		<!-- Mirror ApplicationDisplayVersion + ApplicationVersion into the
 		     .NET assembly metadata so System.Reflection at runtime can
 		     read the build number. MAUI's <ApplicationVersion> ONLY
