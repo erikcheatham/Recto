@@ -430,7 +430,7 @@ public sealed class BootloaderClient : IBootloaderClient
         }
         catch (JsonException ex)
         {
-            _log.LogWarning(ex, "Bootloader {Method} {Url} malformed JSON", method, url);
+            _log.LogWarning("Bootloader {Method} {Route} malformed JSON", method, RouteOf(url));
             return Result.Failure<T>(Error.Failure($"Bootloader returned malformed JSON: {ex.Message}"));
         }
     }
@@ -452,7 +452,7 @@ public sealed class BootloaderClient : IBootloaderClient
             {
                 var json = JsonSerializer.Serialize(body, body.GetType(), _serializerOptions);
                 request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-                _log.LogInformation("Bootloader {Method} {Url} body: {Json}", method, url, LoggableBody(body, json));
+                _log.LogInformation("Bootloader {Method} {Route} request, {Bytes} bytes", method, RouteOf(url), Encoding.UTF8.GetByteCount(json));
             }
 
             using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
@@ -471,8 +471,8 @@ public sealed class BootloaderClient : IBootloaderClient
                     return Result.Success(errorBody);
                 }
                 _log.LogWarning(
-                    "Bootloader {Method} {Url} returned {Status}: {Body}",
-                    method, url, (int)response.StatusCode, Truncate(errorBody, 500));
+                    "Bootloader {Method} {Route} returned {Status} {Code}",
+                    method, RouteOf(url), (int)response.StatusCode, LoggableErrorCode(errorBody));
 
                 // Try to surface the bootloader's own error message if it
                 // returned a JSON body with an "error" field. Falls back to
@@ -510,34 +510,59 @@ public sealed class BootloaderClient : IBootloaderClient
         }
         catch (HttpRequestException ex)
         {
-            _log.LogWarning(ex, "Bootloader {Method} {Url} network error", method, url);
+            // The exception rides out by its kind only: its message is a lower layer's text, which may quote the url.
+            _log.LogWarning("Bootloader {Method} {Route} network error {Kind} ({Error})",
+                method, RouteOf(url), ex.GetType().Name, ex.HttpRequestError);
             return Result.Failure<string>(Error.Failure($"{UnreachablePrefix}: {ex.Message}"));
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Bootloader {Method} {Url} unexpected error", method, url);
+            _log.LogError("Bootloader {Method} {Route} unexpected error {Kind}", method, RouteOf(url), ex.GetType().Name);
             return Result.Failure<string>(Error.Failure(
                 $"Unexpected error contacting bootloader: {ex.GetType().Name}: {ex.Message}"));
         }
     }
 
-    private static string Truncate(string s, int max) =>
-        string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "...";
+    // THE LOG NAMES A ROUTE, NEVER A URL OR A BODY (2026-10-27, an outside review; hard rule 2). A url carries the
+    // pairing code, the attestation nonce and the phone id in its query, and a body carries TOTP codes, session
+    // tokens, signatures and user-vault records. So a log line names the route from this fixed list (the path from
+    // /v0.4/ on, the query dropped, the request id templated), the body by its size, and a refusal by the server's
+    // error code. The list is an allowlist: a route not on it logs as unlisted.
+    private const string UnlistedRoute = "/v0.4/(unlisted)";
 
-    /// <summary>
-    /// The request body as the log may show it. A push token is named by its
-    /// length only; the wire body is unchanged.
-    /// </summary>
-    private static string LoggableBody(object body, string json) => body switch
+    private static readonly HashSet<string> LoggedRoutes = new(StringComparer.Ordinal)
     {
-        PushTokenUpdateRequest p => JsonSerializer.Serialize(
-            p with { PushToken = TokenLength(p.PushToken) }, _serializerOptions),
-        RegistrationRequest { PushToken: { } token } r => JsonSerializer.Serialize(
-            r with { PushToken = TokenLength(token) }, _serializerOptions),
-        _ => json,
+        "/v0.4/registration_challenge", "/v0.4/register", "/v0.4/attest", "/v0.4/pending", "/v0.4/respond/{id}",
+        "/v0.4/manage/phones", "/v0.4/manage/phones/revoke", "/v0.4/manage/push_token",
+        "/v0.4/devices/pair", "/v0.4/devices/unpair",
+        "/v0.4/user-vault/grant", "/v0.4/user-vault/revoke", "/v0.4/user-vault/revoke-key",
+        "/v0.4/user-vault/grants", "/v0.4/user-vault/grant-request/deny",
     };
 
-    private static string TokenLength(string token) => $"[{token.Length} chars]";
+    /// <summary>The route a log line names for <paramref name="url"/>: one of <see cref="LoggedRoutes"/>, or
+    /// <see cref="UnlistedRoute"/>.</summary>
+    private static string RouteOf(string url)
+    {
+        var path = Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.AbsolutePath : string.Empty;
+        var at = path.IndexOf("/v0.4/", StringComparison.Ordinal);
+        if (at < 0) return UnlistedRoute;
+        var route = path[at..];
+        if (route.StartsWith("/v0.4/respond/", StringComparison.Ordinal)) route = "/v0.4/respond/{id}";
+        return LoggedRoutes.Contains(route) ? route : UnlistedRoute;
+    }
+
+    /// <summary>A refusal as the log may show it: the server's <c>error</c> code when it is shaped like a code
+    /// (lowercase letters, digits, <c>_ - .</c>, at most 64), never the body and never its <c>detail</c>.</summary>
+    private static string LoggableErrorCode(string body)
+    {
+        var code = TryExtractServerErrorCode(body);
+        if (code is null || code.Length is 0 or > 64) return "(no error code)";
+        foreach (var c in code)
+        {
+            if (c is not ((>= 'a' and <= 'z') or (>= '0' and <= '9') or '_' or '-' or '.')) return "(no error code)";
+        }
+        return code;
+    }
 
     /// <summary>
     /// Tries to parse the bootloader's error-response body as JSON and
@@ -550,10 +575,12 @@ public sealed class BootloaderClient : IBootloaderClient
     /// <summary>The bootloader's machine-readable <c>error</c> code, or null.</summary>
     private static string? TryExtractServerErrorCode(string body)
     {
+        if (string.IsNullOrWhiteSpace(body)) return null;
         try
         {
             using var doc = JsonDocument.Parse(body);
-            return doc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String
                 ? e.GetString()
                 : null;
         }

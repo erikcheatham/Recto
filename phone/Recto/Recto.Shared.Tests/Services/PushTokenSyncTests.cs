@@ -319,7 +319,7 @@ public class PushTokenSyncTests
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task ThePushTokenUpdate_LogsTheTokenByLengthOnly()
+    public async Task ThePushTokenUpdate_NeverLogsTheToken()
     {
         var log = new CapturingLogger();
         var http = new FakeBootloader();
@@ -330,11 +330,11 @@ public class PushTokenSyncTests
         Assert.Contains(TokenA, Assert.Single(http.Bodies));
         Assert.NotEmpty(log.Lines);
         Assert.All(log.Lines, line => Assert.DoesNotContain(TokenA, line));
-        Assert.Contains(log.Lines, line => line.Contains($"[{TokenA.Length} chars]"));
+        Assert.Contains(log.Lines, line => line.Contains("/v0.4/manage/push_token request,"));
     }
 
     [Fact]
-    public async Task ARegistrationCarryingAToken_LogsTheTokenByLengthOnly()
+    public async Task ARegistrationCarryingAToken_NeverLogsTheToken()
     {
         var log = new CapturingLogger();
         var http = new FakeBootloader
