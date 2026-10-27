@@ -6,7 +6,7 @@ permalink: /privacy/
 
 # Privacy Policy — Recto Agentic
 
-**Last updated: 2026-08-17**
+**Last updated: 2026-10-27**
 
 Recto Agentic is a public open-source application (Apache 2.0) that
 serves as an operator-phone-as-root-of-trust authenticator. This
@@ -29,12 +29,12 @@ Recto Agentic collects **no personally identifying information**. Specifically:
 
 Recto Agentic stores the following data locally on your device only:
 
-- A cryptographic keypair (one per paired service). The private key is stored in your device's Secure Enclave (iOS) or StrongBox keystore (Android). **The private key never leaves your device** and is never transmitted to any server, including the Recto developers.
+- Your keys and your recovery phrase, protected by your device's secure hardware. The app shows the recovery phrase only after a biometric check, so that you can write it down. **Your keys and your recovery phrase are never transmitted to any server**, including the Recto developers.
 - The URLs of bootloaders you have paired with.
 - Per-pairing metadata required for signing operations (paired service identifier, public-facing branding the service supplied during pairing, the agent identities authorized to send you requests through that pairing).
 - A local history of signing requests you have approved or denied (for your reference; never transmitted off-device).
 
-You may delete any pairing at any time from within the app. Deleting a pairing destroys the associated keypair locally; the deletion is irreversible.
+You may delete any pairing at any time from within the app.
 
 ---
 
@@ -42,7 +42,7 @@ You may delete any pairing at any time from within the app. Deleting a pairing d
 
 When you approve a signing request, Recto Agentic transmits the following to the bootloader you paired with:
 
-- A cryptographic signature over the request payload, signed by the private key stored in your device's secure hardware.
+- A cryptographic signature over the request payload, made with your keys.
 - The pairing identifier (so the bootloader knows which paired device sent the response).
 
 Recto Agentic transmits nothing else. **No analytics. No usage statistics. No location. No device-fingerprinting beacons.**

@@ -8,10 +8,8 @@ permalink: /
 
 **The phone signing vault for agents — your phone as the root of trust for cryptographic signing.**
 
-Multi-tenant authenticator app — like Authy for OTP, but for cryptographic
-signing operations. One Recto Agentic install on your device, paired with as
-many services as you use, each authorizing its own actions through your
-operator approval.
+One app, paired with every service you use. Each service asks before it acts,
+and you approve on your phone.
 
 ---
 
@@ -27,27 +25,25 @@ operator approval.
 
 ## How it works
 
-Recto Agentic is the operator-side authenticator for any service that
-integrates with the **Recto substrate**. When a paired service needs you
-to authorize a sensitive operation — approve a deployment, release a
-stored credential, authorize a configuration change — its bootloader
-sends Recto a structured request, you read what's being asked, and you
-approve via Face ID / Touch ID / fingerprint.
+Recto Agentic is the phone side of the **Recto substrate**. When a paired
+service needs your approval — a deployment, a stored credential, a
+configuration change — it sends your phone a request. You read it and
+approve with Face ID, Touch ID or your fingerprint, and the service checks
+your phone's signature before it acts.
 
-The private key gating the signature lives in your device's Secure
-Enclave (iOS) or StrongBox keystore (Android) and never leaves your
-device.
+Your keys are created on your phone and protected by its secure hardware. A
+recovery phrase that you write down restores your signing keys on a new
+phone.
 
 ---
 
 ## Security posture
 
-- Private keys never leave the Secure Enclave / StrongBox
-- Biometric is hardware-bound and never leaves your device
+- Every approval needs your biometric, checked on your phone
+- Your keys and your biometric data are never sent to a server
 - Zero analytics, advertising, or third-party data-collection SDKs
 - Open-source under Apache 2.0 — auditable end-to-end
-- Cross-device verification of trust artifacts via QR codes
-- Pairing is local-network or HTTPS only — no central Recto cloud
+- No central Recto cloud
 
 ---
 
@@ -60,13 +56,10 @@ device.
 
 ## For developers
 
-**Recto Agentic** is the mobile app. **Recto** is the codebase it pairs
-with — a public OSS project (Apache 2.0) implementing
-operator-phone-as-root-of-trust authorization.
-
-Integration documentation is available to integrators on request —
-[open an issue](https://github.com/erikcheatham/Recto/issues) or contact
-Recto LLC.
+**Recto Agentic** is the mobile app. **Recto** is the open-source substrate
+it pairs with (Apache 2.0). The
+[README](https://github.com/erikcheatham/Recto#readme) shows how to
+integrate a service.
 
 ---
 
@@ -74,6 +67,9 @@ Recto LLC.
 
 For privacy questions or app support: [open an issue](https://github.com/erikcheatham/Recto/issues) on the GitHub repository.
 
+To report a vulnerability, do it privately, never in an issue:
+[SECURITY.md](https://github.com/erikcheatham/Recto/blob/main/SECURITY.md).
+
 ---
 
-*Recto Agentic — transitioning to Recto LLC (in formation).*
+*Recto Agentic is operated by Recto LLC.*
