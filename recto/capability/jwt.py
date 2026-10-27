@@ -164,7 +164,9 @@ def parse_jws(token: str) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes]
     signing_input_bytes is `header_b64url + "." + payload_b64url` as bytes
     — this is the input that gets hashed and signed.
 
-    Raises ValueError on malformed JWS.
+    Raises ValueError on malformed JWS: a part that does not decode, JSON
+    nested past the parser's depth, or a header or payload that is not a
+    JSON object.
     """
     parts = token.split(".")
     if len(parts) != 3:
@@ -177,8 +179,10 @@ def parse_jws(token: str) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes]
         header = json.loads(_b64url_decode(header_b64))
         payload = json.loads(_b64url_decode(payload_b64))
         signature = _b64url_decode(sig_b64)
-    except (ValueError, json.JSONDecodeError) as e:
+    except (ValueError, RecursionError) as e:
         raise ValueError(f"Malformed JWS: {e}") from e
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ValueError("Malformed JWS: the header and the payload must be JSON objects")
 
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
     return header, payload, signature, signing_input
@@ -204,6 +208,7 @@ def verify_jws(
            profile's derived key, NOT the operator's master root)
          - `expected_pubkey` otherwise (v1.x / v2.0.B behavior —
            JWS was minted under the operator's master key)
+      3a. The claims have the types of the README's claim table
       4. Standard claims time bounds (nbf <= now < exp) using the supplied
          `now` (or current time if None)
       5. If expected_aud is provided, verify it appears in claims.aud
@@ -376,6 +381,9 @@ def verify_jws(
             f"signing input may have drifted between mint + verify)"
         )
 
+    # 3a. Claim types
+    _require_claim_types(payload)
+
     # 4. Time bounds
     if now is None:
         now = int(time.time())
@@ -396,6 +404,50 @@ def verify_jws(
 
     # 6. Convert to typed claims
     return _dict_to_claims(payload)
+
+
+def _require_claim_types(payload: dict[str, Any]) -> None:
+    """Raise ValueError ("claims:") unless the payload's claims have the
+    types of the README's claim table.
+
+    A malformed payload is then a refusal like every other (hard rule 15),
+    and verify_jws returns each claim as it was signed.
+    """
+
+    def is_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    def is_str_list(value: Any) -> bool:
+        return isinstance(value, list) and all(isinstance(x, str) for x in value)
+
+    for name in ("iss", "sub", "jti", "purpose"):
+        if not isinstance(payload.get(name), str):
+            raise ValueError(f"claims: {name} must be a string")
+    if not is_str_list(payload.get("aud")):
+        raise ValueError("claims: aud must be a list of strings")
+    for name in ("iat", "nbf", "exp"):
+        if not is_int(payload.get(name)):
+            raise ValueError(f"claims: {name} must be a whole number of seconds")
+    cap = payload.get("cap")
+    if not isinstance(cap, dict):
+        raise ValueError("claims: cap must be an object")
+    if not is_int(cap.get("tier")) or not isinstance(cap.get("registry_version"), str):
+        raise ValueError("claims: cap needs an integer tier and a string registry_version")
+    for name in ("groups", "allow_actions", "deny_actions"):
+        if name in cap and not is_str_list(cap[name]):
+            raise ValueError(f"claims: cap.{name} must be a list of strings")
+    scope = cap.get("scope", {})
+    if not isinstance(scope, dict):
+        raise ValueError("claims: cap.scope must be an object")
+    for name in ("env", "services", "repos"):
+        if name in scope and not is_str_list(scope[name]):
+            raise ValueError(f"claims: cap.scope.{name} must be a list of strings")
+    limits = cap.get("limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("claims: cap.limits must be an object")
+    for name in ("per_hour", "per_day", "per_session"):
+        if not isinstance(limits.get(name, {}), dict):
+            raise ValueError(f"claims: cap.limits.{name} must be an object")
 
 
 def build_signing_input(claims: CapabilityClaims) -> tuple[bytes, str, str]:

@@ -550,6 +550,101 @@ def test_parse_jws_succeeds_on_well_formed_input():
     assert signing_input == f"{header_b64}.{payload_b64}".encode("ascii")
 
 
+def test_parse_jws_rejects_a_header_that_is_not_an_object():
+    """A header that decodes to JSON other than an object raises ValueError."""
+    with pytest.raises(ValueError, match="JSON objects"):
+        parse_jws("W10.e30.AA")  # header [], payload {}
+
+
+def test_parse_jws_rejects_a_payload_that_is_not_an_object():
+    """A payload that decodes to JSON other than an object raises ValueError."""
+    with pytest.raises(ValueError, match="JSON objects"):
+        parse_jws("e30.IjEi.AA")  # header {}, payload "1"
+
+
+def test_parse_jws_rejects_json_nested_past_the_parser_depth():
+    """A segment nested deeper than the JSON parser goes raises ValueError."""
+    header_b64 = _b64url_encode(b"[" * 5000)
+    with pytest.raises(ValueError, match="Malformed JWS"):
+        parse_jws(f"{header_b64}.e30.AA")
+
+
+# ---------------------------------------------------------------------------
+# JWS claim types: a signed payload with mistyped claims is a refusal
+# ---------------------------------------------------------------------------
+
+_TYPES_KEY = bytes.fromhex("5" * 64)
+
+
+def _token_over(payload: dict) -> str:
+    """An ES256K token over any payload, well-formed or not, signed by _TYPES_KEY."""
+    import hashlib
+
+    from recto.capability.signing import sign_digest
+
+    header_b64 = _b64url_encode(_canonical_json({"alg": "ES256K", "typ": "JWT"}))
+    payload_b64 = _b64url_encode(_canonical_json(payload))
+    digest = hashlib.sha256(f"{header_b64}.{payload_b64}".encode("ascii")).digest()
+    return assemble_jws(header_b64, payload_b64, sign_digest(digest, _TYPES_KEY))
+
+
+def _verify_types_token(payload: dict) -> CapabilityClaims:
+    from recto.capability.jwt import verify_jws
+    from recto.capability.signing import public_key_hex
+
+    return verify_jws(_token_over(payload), bytes.fromhex(public_key_hex(_TYPES_KEY)), now=1_500)
+
+
+def _well_typed_payload() -> dict:
+    return {
+        "iss": "phone:operator:enclave",
+        "sub": "agent:a@user:h",
+        "aud": ["recto-phone"],
+        "iat": 1_000,
+        "nbf": 1_000,
+        "exp": 2_000,
+        "jti": "types-1",
+        "purpose": "Restart the service",
+        "cap": {"tier": 1, "registry_version": "1", "allow_actions": ["service:restart"]},
+    }
+
+
+def test_verify_jws_accepts_the_well_typed_payload():
+    claims = _verify_types_token(_well_typed_payload())
+    assert claims.aud == ["recto-phone"]
+    assert claims.cap.allow_actions == ["service:restart"]
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("iss",), 5),
+        (("aud",), "recto-phone"),
+        (("aud",), ["recto-phone", 7]),
+        (("nbf",), []),
+        (("exp",), 2_000.5),
+        (("iat",), True),
+        (("cap",), "tier-1"),
+        (("cap", "tier"), "1"),
+        (("cap", "registry_version"), 1),
+        (("cap", "allow_actions"), "service:restart"),
+        (("cap", "scope"), []),
+        (("cap", "scope", "env"), "prod"),
+        (("cap", "limits", "per_hour"), []),
+    ],
+)
+def test_verify_jws_refuses_a_signed_payload_with_a_mistyped_claim(path, value):
+    """A validly signed payload whose claims differ from the README's claim
+    table raises ValueError with the "claims:" prefix."""
+    payload = _well_typed_payload()
+    target = payload
+    for key in path[:-1]:
+        target = target.setdefault(key, {})
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match="^claims:"):
+        _verify_types_token(payload)
+
+
 # ---------------------------------------------------------------------------
 # Mint helpers — pre-sign signing input + final assembly
 # ---------------------------------------------------------------------------
